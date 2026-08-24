@@ -145,9 +145,10 @@ stored: nothing in the cache remembers what a previous run cost.
 
 Not everything `collect` fetches is windowed. Pull-request, review, and direct-commit facts are historical and
 accumulate in the cache.
-Repository metadata and merge-gate state are *current-state* sources: GitHub cannot report what branch protection was
-three months ago, and the question is whether the gate protects merges now. They are therefore always fetched fresh and
-stored as one latest row per repository, replacing the previous one. So `collect --from X --to Y` means: fetch windowed
+Repository metadata, merge-gate state, CODEOWNERS presence and default-branch maintenance instants are *current-state*
+sources: GitHub cannot report what branch protection was three months ago, and the question is whether the gate protects
+merges now. They are therefore always fetched fresh and stored as one latest row per repository, replacing the previous
+one. So `collect --from X --to Y` means: fetch windowed
 sources for `[X, Y)`, and refresh current state as of now.
 
 Open security-alert counts are the one exception to "replacing the previous one". They are current state too, but the
@@ -312,6 +313,45 @@ Collection costs one call per family plus one more per additional hundred open a
 hmcts/cath-service on 2026-08-14: three calls, against a whole-repository collection of roughly fourteen. Like the merge
 gate the block is display only — nothing scores it, because no open-alert threshold has an owner — and it appears in the
 practice report rather than in a `--metric` drill-down.
+
+Each repository also carries a `codeowners` and a `maintenance` block, answering the gov.uk minimum standard for
+publicly accessible systems: is there a named owner, and is the repository maintained. Both are **current state**,
+collected by `collect` in one bundled GraphQL query per repository, stored latest-only beside the merge gate, and
+served with the `fetched_at` instant they were read, so `--offline` shows the last collection's answer. Both are
+**report-only and ungraded**: the readiness assessment reads neither, per the standing rule that a signal becoming
+visible is not a reason to grade it.
+
+`codeowners` lists every CODEOWNERS file found, with its path and byte size — an empty file is found-but-empty, never
+silently passing. Six locations are checked: `.github/CODEOWNERS`, `CODEOWNERS`, `docs/CODEOWNERS`, and their `.md`
+variants. Each file carries `recognised_by_github`, and only the first three locations qualify: a `CODEOWNERS.md`
+satisfies the letter of the minimum standard while doing nothing on GitHub, so the report keeps the two apart rather
+than counting them the same. An empty list means checked everywhere and absent — an observation, never a collection
+failure — and a repository whose state was stored before this source existed reports that reason instead.
+
+`maintenance` reports when the default branch last received a commit, and when it last received one from a human.
+`last_commit_at` is the newest commit on the default branch — deliberately not the repository's `pushed_at` or
+`updated_at`, which move whenever a bot pushes a pull-request branch that never merges. `last_human_commit_at` is the
+newest commit whose author passes the human predicate: a commit counts as automation when its linked account is a bot
+(GitHub type `Bot`, or a `[bot]` login suffix) or its login matches `cohort.excluded_authors` under the usual
+normalisation; where GitHub links no account, the git author name is tested the same two ways and otherwise counts as
+human; a commit carrying neither a linked account nor an author name is nobody and does not count as a human commit.
+All bot accounts fail the predicate, not just Renovate and Dependabot — an agent-authored commit is work the
+cohort keeps, but it is not a person maintaining the repository, the same distinction `active-contributors` draws.
+
+The human search is bounded, because a bot-dominated repository is exactly where the answer is interesting and exactly
+where "page until a human appears" is unbounded. Pagination stops when a human commit is found, when the 24-month
+cutoff is passed, or at a page cap — 100 commits per page, 10 pages, a cost limit rather than a policy threshold.
+Whenever no human commit was found, `searched_back_to` records the oldest instant examined, which keeps two different
+absences apart: "none within 24 months" (the search reached the cutoff, or exhausted the history) and "unknown beyond
+the commits examined" (the cap stopped it first). Three window rows — 6, 12 and 24 months, as 183, 365 and 730 days
+against `fetched_at` — each report two answers: whether *any* commit fell within the window, always decidable once
+`last_commit_at` is known, and whether a *human* commit did — yes, no, or unknown with its reason. Unavailable data
+never becomes zero, and here it never becomes "no" either. The rows are derived at report assembly from the stored
+instants against `fetched_at`, so the JSON reproduces offline; `--format report` renders them as a table with the
+unknown reasons spelled out beneath it.
+
+If the bundled query fails, both blocks report the shared reason, one failure is recorded per block, and the run exits
+`3` — the same shape as a refused alert family. A missing CODEOWNERS file is never a failure.
 
 ### Readiness assessment
 
@@ -629,8 +669,10 @@ The report prints, per repository: a header with the resolved window and its pro
 **every** condition behind it, blocking, caution and clear alike; the cohort, the direct commits, the total merges
 those two add up to, and who was excluded; the merge gate
 with the instant it was read; the open security alerts by family and severity, or the reason a family could not be
-read; the open pull-request counts with the instant they were fetched, or the reason they are
-unavailable; one row per metric; the cohort's review events counted by state; and the `unreviewed-merge`
+read; the CODEOWNERS files found with their sizes and whether GitHub recognises the location, or `absent`, or the reason
+the state is unavailable; the maintenance instants (last commit, last human commit, search bound) with the 6/12/24-month
+window table and the reason beneath any `unknown`; the open pull-request counts with the instant they were fetched, or
+the reason they are unavailable; one row per metric; the cohort's review events counted by state; and the `unreviewed-merge`
 findings split into one column per observed size class. A `--metric` drill-down renders instead as that metric's
 aggregate and the classification counts behind it.
 

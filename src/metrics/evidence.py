@@ -3,7 +3,7 @@
 from collections import Counter
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from metrics.analysis import excluded_authors, in_cohort
 from metrics.assessment import ReadinessPolicy
@@ -11,11 +11,16 @@ from metrics.behaviour import collect_open_pull_request_state, requested_coverag
 from metrics.behaviour_metrics.base import BehaviourMetric
 from metrics.config import Configuration
 from metrics.domain import (
+    MAINTENANCE_WINDOWS,
     BehaviourEvidenceReport,
     CachedBehaviourFacts,
+    CodeownersReport,
     CohortSummary,
     EvidenceSource,
     EvidenceUnavailable,
+    MaintenanceEvidence,
+    MaintenanceReport,
+    MaintenanceWindowStatus,
     MergeGateReport,
     Merges,
     OpenPullRequestReport,
@@ -75,11 +80,15 @@ class RepositoryEvidence(CachedBehaviourFacts):
         policy: ReadinessPolicy,
         open_pull_requests: OpenPullRequestReport,
         security: SecurityAlertReport,
+        codeowners: CodeownersReport,
+        maintenance: MaintenanceReport,
     ) -> RepositoryPracticeEvidence:
         """Assess readiness and evaluate every enabled practice rule beside the collected merge gate.
 
         `security` is reported but grades nothing: no open-alert threshold has an owner, and the same
         reasoning keeps description quality out of the label (architecture.md, "Readiness assessment").
+        `codeowners` and `maintenance` are reported and ungraded for the same reason: a signal
+        becoming visible is not a reason to grade it.
         """
         return RepositoryPracticeEvidence(
             repository=self.repository,
@@ -91,6 +100,8 @@ class RepositoryEvidence(CachedBehaviourFacts):
             merge_gate=merge_gate,
             open_pull_requests=open_pull_requests,
             security=security,
+            codeowners=codeowners,
+            maintenance=maintenance,
             behaviour=tuple(finding for rule in rules if rule.enabled for finding in rule.findings(self)),
         )
 
@@ -194,6 +205,83 @@ def stored_security_alerts(stored: StoredState) -> SecurityAlertReport:
             detail="security alerts were not collected when repository state was stored; run metrics collect",
         )
     return SecurityAlertReport(fetched_at=stored.latest.fetched_at, alerts=stored.latest.state.security)
+
+
+def stored_codeowners(stored: StoredState) -> CodeownersReport:
+    """Report the CODEOWNERS presence the last collection stored, or state why there is none.
+
+    A row stored by a build predating this source has no `codeowners` field, and reporting that as
+    checked-and-absent would invent an observation nobody made.
+    """
+    if stored.unreadable is not None:
+        return CodeownersReport(detail=stored.unreadable)
+    if stored.latest is None:
+        return CodeownersReport(detail="no repository state has been collected; run metrics collect")
+    if stored.latest.state.codeowners is None:
+        return CodeownersReport(
+            fetched_at=stored.latest.fetched_at,
+            detail="CODEOWNERS presence was not collected when repository state was stored; run metrics collect",
+        )
+    return CodeownersReport(fetched_at=stored.latest.fetched_at, codeowners=stored.latest.state.codeowners)
+
+
+def human_window_answer(evidence: MaintenanceEvidence, cutoff: datetime) -> tuple[bool | None, str | None]:
+    """Answer whether a human commit fell inside one window, or say why that is unknown.
+
+    A found human commit decides every window either way. An absent one decides False only where
+    the search is known to have examined everything after the window's cutoff: an empty branch
+    (nothing exists to find), or `searched_back_to` at or past the cutoff. Otherwise the page cap
+    stopped the search short of this window and the answer is unknown with its reason — unavailable
+    data never becomes zero, and here it never becomes False either.
+    """
+    if evidence.last_human_commit_at is not None:
+        return evidence.last_human_commit_at >= cutoff, None
+    searched_back_to = evidence.searched_back_to
+    if searched_back_to is None or searched_back_to <= cutoff:
+        return False, None
+    return None, (
+        f"the bounded search examined commits no older than {searched_back_to:%Y-%m-%dT%H:%MZ}, "
+        f"which does not reach this window's cutoff"
+    )
+
+
+def maintenance_windows(evidence: MaintenanceEvidence, fetched_at: datetime) -> tuple[MaintenanceWindowStatus, ...]:
+    """Derive the 6/12/24-month window rows from the stored instants against the observation instant."""
+    rows = []
+    for months, days in MAINTENANCE_WINDOWS:
+        cutoff = fetched_at - timedelta(days=days)
+        human_committed_within, human_detail = human_window_answer(evidence, cutoff)
+        rows.append(
+            MaintenanceWindowStatus(
+                months=months,
+                committed_within=evidence.last_commit_at is not None and evidence.last_commit_at >= cutoff,
+                human_committed_within=human_committed_within,
+                human_detail=human_detail,
+            ),
+        )
+    return tuple(rows)
+
+
+def stored_maintenance(stored: StoredState) -> MaintenanceReport:
+    """Report the maintenance instants the last collection stored, or state why there are none.
+
+    The window rows are derived here — at report assembly, not at collection and not in rendering —
+    against the stored `fetched_at`, so the same stored row always yields the same report.
+    """
+    if stored.unreadable is not None:
+        return MaintenanceReport(detail=stored.unreadable)
+    if stored.latest is None:
+        return MaintenanceReport(detail="no repository state has been collected; run metrics collect")
+    if stored.latest.state.maintenance is None:
+        return MaintenanceReport(
+            fetched_at=stored.latest.fetched_at,
+            detail="maintenance state was not collected when repository state was stored; run metrics collect",
+        )
+    return MaintenanceReport(
+        fetched_at=stored.latest.fetched_at,
+        maintenance=stored.latest.state.maintenance,
+        windows=maintenance_windows(stored.latest.state.maintenance, stored.latest.fetched_at),
+    )
 
 
 def open_pull_request_report(

@@ -9,10 +9,16 @@ from metrics.domain import (
     AlertFamily,
     AlertObservation,
     AlertSeverity,
+    CodeownersEvidence,
+    CodeownersFile,
+    CodeownersReport,
     CohortSummary,
     DeltaBasis,
     DistributionObservation,
     EvidenceSource,
+    MaintenanceEvidence,
+    MaintenanceReport,
+    MaintenanceWindowStatus,
     MergeGateEvidence,
     MergeGateReport,
     ObservationStatus,
@@ -21,6 +27,7 @@ from metrics.domain import (
     OpenPullRequestSummary,
     RateObservation,
     RepositoryInventoryIssue,
+    RepositoryInventoryItem,
     RepositoryTrend,
     SecurityAlertEvidence,
     SecurityAlertReport,
@@ -273,6 +280,186 @@ def test_a_repository_reporting_why_it_has_no_delta_cannot_carry_one() -> None:
             periods=(period,),
             delta_detail="the baseline window is not comparable, so no delta was computed: nothing was observed",
         )
+
+
+MAINTENANCE_INSTANT = datetime(2026, 8, 1, tzinfo=UTC)
+
+
+def observed_maintenance() -> MaintenanceEvidence:
+    """Describe a branch whose newest commit was authored by a person."""
+    return MaintenanceEvidence(
+        branch="main",
+        last_commit_at=MAINTENANCE_INSTANT,
+        last_human_commit_at=MAINTENANCE_INSTANT,
+        searched_back_to=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {
+            "codeowners": CodeownersEvidence(files=()),
+            "detail": "no repository state has been collected; run metrics collect",
+        },
+    ],
+)
+def test_codeowners_report_requires_evidence_or_the_reason_there_is_none(fields: dict[str, object]) -> None:
+    """Refuse a CODEOWNERS block that is silently empty, or that both reports and disclaims one."""
+    with pytest.raises(ValidationError, match="either its evidence or the reason it is unavailable"):
+        CodeownersReport.model_validate(fields)
+
+
+def test_a_codeowners_report_keeps_an_unrecognised_file_visible_as_one() -> None:
+    """Report a `.md` variant as found and not read by GitHub, so the letter and the effect stay apart."""
+    report = CodeownersReport(
+        fetched_at=MAINTENANCE_INSTANT,
+        codeowners=CodeownersEvidence(
+            files=(CodeownersFile(path="CODEOWNERS.md", size_bytes=120, recognised_by_github=False),),
+        ),
+    )
+
+    assert report.codeowners is not None
+    assert report.codeowners.files[0].recognised_by_github is False
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        (
+            {"last_commit_at": None, "last_human_commit_at": MAINTENANCE_INSTANT, "searched_back_to": None},
+            "nothing to have searched",
+        ),
+        (
+            {"last_commit_at": None, "last_human_commit_at": None, "searched_back_to": MAINTENANCE_INSTANT},
+            "nothing to have searched",
+        ),
+        (
+            {"last_commit_at": MAINTENANCE_INSTANT, "last_human_commit_at": None, "searched_back_to": None},
+            "how far back the search examined",
+        ),
+        (
+            {
+                "last_commit_at": MAINTENANCE_INSTANT,
+                "last_human_commit_at": MAINTENANCE_INSTANT,
+                "searched_back_to": MAINTENANCE_INSTANT,
+            },
+            "a found human commit carries no search bound",
+        ),
+    ],
+)
+def test_maintenance_evidence_rejects_shapes_the_search_cannot_produce(
+    fields: dict[str, object],
+    match: str,
+) -> None:
+    """Refuse instants no run of the bounded search could have recorded together."""
+    with pytest.raises(ValidationError, match=match):
+        MaintenanceEvidence.model_validate({"branch": "main"} | fields)
+
+
+def test_maintenance_evidence_accepts_each_shape_the_search_produces() -> None:
+    """Accept an empty branch, a search that found nobody, and a found human commit."""
+    empty_branch = MaintenanceEvidence(
+        branch="main",
+        last_commit_at=None,
+        last_human_commit_at=None,
+        searched_back_to=None,
+    )
+    nobody_found = MaintenanceEvidence(
+        branch="main",
+        last_commit_at=MAINTENANCE_INSTANT,
+        last_human_commit_at=None,
+        searched_back_to=MAINTENANCE_INSTANT - timedelta(days=730),
+    )
+
+    assert empty_branch.last_commit_at is None
+    assert nobody_found.searched_back_to is not None
+    assert observed_maintenance().last_human_commit_at == MAINTENANCE_INSTANT
+
+
+@pytest.mark.parametrize(
+    "added",
+    [{}, {"human_committed_within": True, "human_detail": "the search examined commits back to 2026-05-01"}],
+)
+def test_a_window_human_answer_is_decided_or_carries_its_reason(added: dict[str, object]) -> None:
+    """Refuse an unknown human answer with no reason, and a decided one that carries one anyway."""
+    with pytest.raises(ValidationError, match="either decided or carries the reason it is unknown"):
+        MaintenanceWindowStatus.model_validate({"months": 6, "committed_within": True} | added)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {
+            "maintenance": observed_maintenance(),
+            "windows": (MaintenanceWindowStatus(months=6, committed_within=True, human_committed_within=True),),
+            "detail": "no repository state has been collected; run metrics collect",
+        },
+    ],
+)
+def test_maintenance_report_requires_evidence_or_the_reason_there_is_none(fields: dict[str, object]) -> None:
+    """Refuse a maintenance block that is silently empty, or that both reports and disclaims one."""
+    with pytest.raises(ValidationError, match="either its evidence or the reason it is unavailable"):
+        MaintenanceReport.model_validate(fields)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"maintenance": observed_maintenance()},
+        {
+            "detail": "no repository state has been collected; run metrics collect",
+            "windows": (MaintenanceWindowStatus(months=6, committed_within=True, human_committed_within=True),),
+        },
+    ],
+)
+def test_maintenance_window_rows_accompany_evidence_and_never_a_reason(fields: dict[str, object]) -> None:
+    """Refuse evidence with no derived window rows, and window rows derived from nothing."""
+    with pytest.raises(ValidationError, match="window rows accompany maintenance evidence"):
+        MaintenanceReport.model_validate(fields)
+
+
+def test_a_maintenance_report_carries_its_window_rows_beside_its_evidence() -> None:
+    """Report the derived 6/12/24-month answers beside the instants they were derived from."""
+    report = MaintenanceReport(
+        fetched_at=MAINTENANCE_INSTANT,
+        maintenance=observed_maintenance(),
+        windows=(
+            MaintenanceWindowStatus(months=6, committed_within=True, human_committed_within=True),
+            MaintenanceWindowStatus(
+                months=12,
+                committed_within=True,
+                human_detail="the search examined commits back to 2026-05-01, short of the 12-month cutoff",
+            ),
+        ),
+    )
+
+    assert report.windows[0].human_committed_within is True
+    assert report.windows[1].human_committed_within is None
+
+
+def test_a_repository_state_row_stored_before_the_minimum_standards_blocks_still_parses() -> None:
+    """Read an old stored row back as "not collected", never as an absent file or an empty branch."""
+    item = RepositoryInventoryItem.model_validate(
+        {
+            "team_identifier": "jwt",
+            "repository": {
+                "name": "cath-service",
+                "default_branch": "master",
+                "archived": False,
+                "fork": False,
+                "disabled": False,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2026-08-01T00:00:00Z",
+                "pushed_at": None,
+            },
+        },
+    )
+
+    assert item.codeowners is None
+    assert item.maintenance is None
 
 
 def test_distribution_rejects_negative_percentiles() -> None:

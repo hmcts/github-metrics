@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
-from metrics.analysis import contributor_logins, review_state_counts
+from metrics.analysis import contributor_logins, excluded_authors, is_human_commit_author, review_state_counts
 from metrics.behaviour_metrics import behaviour_metrics
 from metrics.behaviour_metrics.approval_coverage import ApprovalCoverage
 from metrics.behaviour_metrics.checks_passing_at_merge import ChecksPassingAtMerge
@@ -623,3 +623,32 @@ def test_bot_accounts_are_not_contributors_however_github_marks_them() -> None:
 def test_a_window_authored_entirely_by_bots_has_no_contributors() -> None:
     """Report nobody rather than falling back to a merge count: the merges happened, the people did not."""
     assert contributor_logins((authored(1, "renovate[bot]", "Bot"),)) == frozenset()
+
+
+def test_commit_author_predicate_judges_the_linked_account_first() -> None:
+    """Settle authorship on the linked account when GitHub matched one, whatever the git name says.
+
+    All bot accounts fail, not just dependency automation: an agent-authored commit is work the
+    cohort keeps, but it is not a person maintaining the repository.
+    """
+    excluded = excluded_authors(("renovate", "dependabot"))
+
+    assert is_human_commit_author("alice", "User", None, excluded)
+    # The account settles it even when the git name looks like automation.
+    assert is_human_commit_author("alice", "User", "renovate[bot]", excluded)
+    assert not is_human_commit_author("some-agent", "Bot", "Alice Smith", excluded)
+    assert not is_human_commit_author("legacy-ci[bot]", "User", None, excluded)
+    # The cohort's exclusions apply under the same normalisation as cohort membership.
+    assert not is_human_commit_author("Renovate[bot]", "Bot", None, excluded)
+    assert not is_human_commit_author("dependabot", "User", None, excluded)
+
+
+def test_commit_author_predicate_tests_the_git_name_when_no_account_is_linked() -> None:
+    """Fall back to the git author name, which otherwise counts as human — a stated limitation."""
+    excluded = excluded_authors(("renovate", "dependabot"))
+
+    assert is_human_commit_author(None, None, "Alice Smith", excluded)
+    assert not is_human_commit_author(None, None, "renovate[bot]", excluded)
+    assert not is_human_commit_author(None, None, "Dependabot", excluded)
+    # A commit with no linked account and no name is nobody, not a person.
+    assert not is_human_commit_author(None, None, None, excluded)

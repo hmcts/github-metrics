@@ -1,7 +1,7 @@
 """Test configured repository inventory collection."""
 
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -14,8 +14,11 @@ from metrics.config import Configuration, TeamConfiguration
 from metrics.domain import (
     AlertSeverity,
     AvailabilityReason,
+    CodeownersEvidence,
+    CodeownersFile,
     CollectionStatus,
     EvidenceKind,
+    MaintenanceEvidence,
     MergeGateEvidence,
     OpenAlertCount,
     ReportingWindow,
@@ -24,18 +27,26 @@ from metrics.domain import (
 )
 from metrics.github import GitHubClient, GitHubError
 from metrics.inventory import (
+    MAINTENANCE_HISTORY_PAGE_LIMIT,
+    MAINTENANCE_HISTORY_PAGE_SIZE,
     BypassActor,
+    HistoryPage,
+    RepositoryStandardsResult,
     Ruleset,
     binds_administrators,
     bypasses_as_administrator,
     collect_inventory,
     collect_merge_gate,
     collect_repository,
+    collect_repository_standards,
     collect_rulesets,
     collect_security_alerts,
+    continue_history,
     count_by_severity,
     enforcing_rules,
     fetch_ruleset,
+    find_human_commit,
+    repository_standards_query,
 )
 from metrics.inventory import RepositoryRule as InventoryRule
 
@@ -46,6 +57,67 @@ def collection_window() -> ReportingWindow:
         starts_at=datetime(2026, 5, 1, tzinfo=UTC),
         ends_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
+
+
+def commit_node(
+    committed_at: str,
+    login: str | None = None,
+    typename: str = "User",
+    name: str | None = None,
+) -> dict[str, object]:
+    """Build one history commit node, linked to an account only when a login is given."""
+    return {
+        "committedDate": committed_at,
+        "author": {
+            "name": name,
+            "user": {"login": login, "__typename": typename} if login is not None else None,
+        },
+    }
+
+
+def history_page(
+    nodes: list[dict[str, object]],
+    *,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> dict[str, object]:
+    """Build one default-branch history connection."""
+    return {
+        "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+        "nodes": nodes,
+    }
+
+
+def standards_data(
+    files: dict[str, object] | None = None,
+    nodes: list[dict[str, object]] | None = None,
+    *,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> dict[str, object]:
+    """Build one repository-standards GraphQL data object."""
+    repository: dict[str, object] = dict(files or {})
+    repository["defaultBranchRef"] = {
+        "target": {"history": history_page(nodes or [], has_next_page=has_next_page, end_cursor=end_cursor)},
+    }
+    return {"repository": repository}
+
+
+def history_data(
+    nodes: list[dict[str, object]],
+    *,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> dict[str, object]:
+    """Build one maintenance-history continuation data object."""
+    return standards_data(nodes=nodes, has_next_page=has_next_page, end_cursor=end_cursor)
+
+
+def standards_response(data: dict[str, object] | None = None) -> MagicMock:
+    """Answer one posted standards query with a GraphQL response."""
+    response = MagicMock(status_code=200, headers={})
+    response.json.return_value = {"data": data if data is not None else standards_data()}
+    return response
 
 
 def test_collect_repository_preserves_unavailable_reason() -> None:
@@ -294,6 +366,7 @@ def test_collect_inventory_reports_permission_limited_branch_protection(
         patch.object(client, "get_repository", return_value=repository_response),
         patch.object(client, "get_paginated", return_value=()),
         patch.object(client, "get", side_effect=[permission_error, branch_response]),
+        patch.object(client, "graphql", return_value=standards_data()),
     ):
         inventory = collect_inventory(configuration, client, collection_window())
 
@@ -550,6 +623,7 @@ def test_collect_inventory_derives_incomplete_status(status: CollectionStatus) -
     with (
         patch.object(client, "get_repository", side_effect=side_effects),
         patch.object(client, "get_paginated", return_value=()),
+        patch.object(client, "graphql", return_value=standards_data()),
         patch.object(
             client,
             "get",
@@ -875,6 +949,7 @@ def test_collect_inventory_reports_what_each_repository_cost() -> None:
     responses = unprotected_repository_responses("nfdiv-case-api") + unprotected_repository_responses("nfdiv-frontend")
     with (
         patch.object(session, "get", side_effect=responses),
+        patch.object(session, "post", side_effect=[standards_response(), standards_response()]),
         patch("metrics.cost.monotonic", measured_clock(100.0, 101.5, 200.0, 209.0)),
     ):
         inventory = collect_inventory(two_repository_configuration(), client, collection_window())
@@ -884,9 +959,10 @@ def test_collect_inventory_reports_what_each_repository_cost() -> None:
     # repository that dominates a run.
     assert tuple(cost.repository for cost in inventory.costs) == ("nfdiv-frontend", "nfdiv-case-api")
     assert tuple(cost.elapsed_seconds for cost in inventory.costs) == (9.0, 1.5)
-    # One repository read, one rules page, one protection read and one page per alert family.
-    assert tuple(cost.requests for cost in inventory.costs) == (6, 6)
-    assert client.requests_issued == 12
+    # One repository read, one standards query, one rules page, one protection read and one page
+    # per alert family.
+    assert tuple(cost.requests for cost in inventory.costs) == (7, 7)
+    assert client.requests_issued == 14
 
 
 def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_answered_with() -> None:
@@ -911,6 +987,7 @@ def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_a
     )
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response()]),
         patch("metrics.cost.monotonic", measured_clock(0.0, 2.0)),
     ):
         inventory = collect_inventory(configuration, client, collection_window())
@@ -927,6 +1004,7 @@ def test_collect_inventory_reports_the_cost_of_a_repository_that_failed() -> Non
     responses = [*unprotected_repository_responses("nfdiv-case-api"), refused]
     with (
         patch.object(session, "get", side_effect=responses),
+        patch.object(session, "post", side_effect=[standards_response()]),
         patch("metrics.cost.monotonic", measured_clock(0.0, 4.0, 10.0, 11.0)),
     ):
         inventory = collect_inventory(two_repository_configuration(), client, collection_window())
@@ -1205,4 +1283,518 @@ def test_collect_merge_gate_falls_back_to_classic_when_every_ruleset_only_evalua
     assert result.evidence.applies_to_administrators is True
     assert get.call_args_list[-1] == call(
         "https://api.github.com/repos/agilezebra/nfdiv-case-api/branches/master/protection"
+    )
+
+
+EXCLUDED_MAINTAINERS = frozenset({"renovate", "dependabot"})
+"""The comparable form of the default `cohort.excluded_authors`."""
+
+
+def standards_client(*payloads: object) -> MagicMock:
+    """Build a client answering each GraphQL query with the next payload, or raising it."""
+    client = MagicMock(spec=GitHubClient)
+    client.graphql.side_effect = list(payloads)
+    return client
+
+
+def collect_standards(client: MagicMock) -> RepositoryStandardsResult:
+    """Collect one repository's standards with the shared test identifiers."""
+    return collect_repository_standards(client, "hmcts", "divorce", repository_metadata(), EXCLUDED_MAINTAINERS)
+
+
+def parsed_page(
+    nodes: list[dict[str, object]],
+    *,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> HistoryPage:
+    """Parse one fabricated history page for driving the search directly."""
+    return HistoryPage.model_validate(history_page(nodes, has_next_page=has_next_page, end_cursor=end_cursor))
+
+
+SEARCH_CUTOFF = datetime(2024, 8, 1, tzinfo=UTC)
+"""A fixed 24-month cutoff for driving `find_human_commit` deterministically."""
+
+COLLECTION_INSTANT = datetime(2026, 8, 10, tzinfo=UTC)
+"""The frozen instant `collect_repository_standards` reads its clock at under `frozen_clock`."""
+
+
+@pytest.fixture
+def frozen_clock() -> Iterator[None]:
+    """Pin the collector's clock so the 24-month cutoff stays fixed relative to the fabricated commits.
+
+    Without this the cutoff walks forward with the wall clock, and commits dated in 2026 would one
+    day fall past it, turning "found a human" tests into cutoff-stop tests without a code change.
+    """
+    clock = MagicMock(wraps=datetime)
+    clock.now.return_value = COLLECTION_INSTANT
+    with patch("metrics.inventory.datetime", clock):
+        yield
+
+
+def test_repository_standards_query_checks_the_six_locations_in_one_bundled_call() -> None:
+    """Pin the six checked paths and the bundled history page, which nothing else constrains.
+
+    A mistyped path would read as that location never holding a CODEOWNERS file, for every
+    repository, and would be diagnosed as absent files rather than found as a defect.
+    """
+    query = repository_standards_query()
+
+    for path in (
+        ".github/CODEOWNERS",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+        ".github/CODEOWNERS.md",
+        "CODEOWNERS.md",
+        "docs/CODEOWNERS.md",
+    ):
+        assert f'object(expression: "HEAD:{path}")' in query
+    assert f"history(first: {MAINTENANCE_HISTORY_PAGE_SIZE}, after: $cursor)" in query
+
+
+def test_collect_repository_standards_lists_every_codeowners_location_found() -> None:
+    """Report each found file with its size and whether GitHub reads a file at that path."""
+    client = standards_client(
+        standards_data(
+            files={"githubCodeowners": {"byteSize": 120}, "docsCodeownersMd": {"byteSize": 34}},
+            nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.failures == ()
+    assert result.codeowners == CodeownersEvidence(
+        files=(
+            CodeownersFile(path=".github/CODEOWNERS", size_bytes=120, recognised_by_github=True),
+            CodeownersFile(path="docs/CODEOWNERS.md", size_bytes=34, recognised_by_github=False),
+        ),
+    )
+    assert client.graphql.call_args.args == (
+        repository_standards_query(),
+        {"organization": "hmcts", "repository": "nfdiv-case-api", "cursor": None},
+    )
+
+
+def test_collect_repository_standards_reports_a_markdown_only_codeowners_as_unrecognised() -> None:
+    """Keep a `.md`-only CODEOWNERS visible as satisfying the letter while doing nothing on GitHub."""
+    client = standards_client(
+        standards_data(
+            files={"rootCodeownersMd": {"byteSize": 51}},
+            nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.codeowners == CodeownersEvidence(
+        files=(CodeownersFile(path="CODEOWNERS.md", size_bytes=51, recognised_by_github=False),),
+    )
+
+
+def test_collect_repository_standards_reports_an_empty_codeowners_as_found_but_empty() -> None:
+    """Keep a zero-byte CODEOWNERS visible rather than letting it silently pass."""
+    client = standards_client(
+        standards_data(
+            files={"rootCodeowners": {"byteSize": 0}},
+            nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.codeowners == CodeownersEvidence(
+        files=(CodeownersFile(path="CODEOWNERS", size_bytes=0, recognised_by_github=True),),
+    )
+
+
+def test_collect_repository_standards_reports_codeowners_absent_everywhere_as_an_observation() -> None:
+    """Record checked-and-absent as evidence, never as a failure — and a directory is not a file."""
+    client = standards_client(
+        standards_data(
+            # A tree named CODEOWNERS answers the selection without a byteSize, and is not a file.
+            files={"rootCodeowners": {}},
+            nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.failures == ()
+    assert result.codeowners == CodeownersEvidence(files=())
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_collect_repository_standards_finds_a_human_commit_on_the_first_page() -> None:
+    """Answer both maintenance instants from the bundled call when a person authored recently."""
+    client = standards_client(
+        standards_data(
+            nodes=[
+                commit_node("2026-08-01T00:00:00Z", login="renovate[bot]", typename="Bot"),
+                commit_node("2026-07-20T00:00:00Z", login="alice"),
+            ],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.maintenance == MaintenanceEvidence(
+        branch="master",
+        last_commit_at=datetime(2026, 8, 1, tzinfo=UTC),
+        last_human_commit_at=datetime(2026, 7, 20, tzinfo=UTC),
+        searched_back_to=None,
+    )
+    assert client.graphql.call_count == 1
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_collect_repository_standards_follows_pages_until_a_human_commit() -> None:
+    """Continue past a bot-dominated first page, and count an unlinked ordinary name as a person."""
+    client = standards_client(
+        standards_data(
+            nodes=[commit_node("2026-08-01T00:00:00Z", login="renovate[bot]", typename="Bot")],
+            has_next_page=True,
+            end_cursor="CURSOR-1",
+        ),
+        history_data(
+            [
+                commit_node("2026-07-01T00:00:00Z", login="dependabot", typename="Bot"),
+                commit_node("2026-06-01T00:00:00Z", name="Alice Smith"),
+            ],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.maintenance is not None
+    assert result.maintenance.last_commit_at == datetime(2026, 8, 1, tzinfo=UTC)
+    assert result.maintenance.last_human_commit_at == datetime(2026, 6, 1, tzinfo=UTC)
+    assert result.maintenance.searched_back_to is None
+    assert client.graphql.call_args_list[1].args[1] == {
+        "organization": "hmcts",
+        "repository": "nfdiv-case-api",
+        "cursor": "CURSOR-1",
+    }
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_collect_repository_standards_tests_an_unlinked_author_name_against_the_bot_checks() -> None:
+    """Judge a commit GitHub links to no account by its git author name, exhausting the history.
+
+    The exhausted search records the cutoff itself as `searched_back_to`: every commit after the
+    cutoff was examined, so each reported window can decide there was no human commit within it.
+    """
+    client = standards_client(
+        standards_data(
+            nodes=[
+                commit_node("2026-08-01T00:00:00Z", name="renovate[bot]"),
+                commit_node("2026-07-01T00:00:00Z", name="Dependabot"),
+            ],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.maintenance is not None
+    assert result.maintenance.last_commit_at == datetime(2026, 8, 1, tzinfo=UTC)
+    assert result.maintenance.last_human_commit_at is None
+    assert result.maintenance.searched_back_to == COLLECTION_INSTANT - timedelta(days=730)
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_collect_repository_standards_keeps_codeowners_when_a_continuation_page_fails() -> None:
+    """Lose only the maintenance block when the search's second page fails: the first call was paid for.
+
+    The CODEOWNERS answer and the last commit were fully observed by the bundled call, so a rate
+    limit on a deep page of a bot-heavy history must not erase them, and the single failure it
+    records names the maintenance block alone.
+    """
+    client = standards_client(
+        standards_data(
+            files={"rootCodeowners": {"byteSize": 12}},
+            nodes=[commit_node("2026-08-01T00:00:00Z", login="renovate[bot]", typename="Bot")],
+            has_next_page=True,
+            end_cursor="CURSOR-1",
+        ),
+        GitHubError("GitHub rate limit exhausted", AvailabilityReason.RATE_LIMITED),
+    )
+
+    result = collect_standards(client)
+
+    assert result.codeowners == CodeownersEvidence(
+        files=(CodeownersFile(path="CODEOWNERS", size_bytes=12, recognised_by_github=True),),
+    )
+    assert result.maintenance is None
+    assert [(failure.evidence, failure.reason, failure.detail) for failure in result.failures] == [
+        (EvidenceKind.MAINTENANCE, AvailabilityReason.RATE_LIMITED, "GitHub rate limit exhausted"),
+    ]
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_collect_repository_standards_classifies_an_invalid_continuation_page() -> None:
+    """Attribute a continuation page that does not parse to the maintenance block alone."""
+    client = standards_client(
+        standards_data(
+            nodes=[commit_node("2026-08-01T00:00:00Z", login="renovate[bot]", typename="Bot")],
+            has_next_page=True,
+            end_cursor="CURSOR-1",
+        ),
+        history_data([{"committedDate": "not-an-instant", "author": None}]),
+    )
+
+    result = collect_standards(client)
+
+    assert result.codeowners == CodeownersEvidence(files=())
+    assert result.maintenance is None
+    assert [failure.evidence for failure in result.failures] == [EvidenceKind.MAINTENANCE]
+    assert result.failures[0].reason is AvailabilityReason.COLLECTION_FAILED
+    assert "invalid repository-standards response" in result.failures[0].detail
+
+
+@pytest.mark.parametrize(
+    "repository_payload",
+    [
+        {"defaultBranchRef": None},
+        {"defaultBranchRef": {"target": None}},
+        {
+            "defaultBranchRef": {
+                "target": {"history": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}
+            }
+        },
+    ],
+)
+def test_collect_repository_standards_reports_an_empty_default_branch(repository_payload: dict[str, object]) -> None:
+    """Record a branch with nothing on it as all-None evidence: nothing was searched, nothing failed."""
+    client = standards_client({"repository": repository_payload})
+
+    result = collect_standards(client)
+
+    assert result.failures == ()
+    assert result.maintenance == MaintenanceEvidence(
+        branch="master",
+        last_commit_at=None,
+        last_human_commit_at=None,
+        searched_back_to=None,
+    )
+
+
+def test_find_human_commit_stops_at_the_cutoff_and_records_how_far_it_looked() -> None:
+    """Stop once a commit predates the cutoff, so cost never grows with the failure being measured."""
+    client = MagicMock(spec=GitHubClient)
+    page = parsed_page(
+        [
+            commit_node("2026-07-01T00:00:00Z", login="renovate[bot]", typename="Bot"),
+            commit_node("2024-07-01T00:00:00Z", login="dependabot", typename="Bot"),
+            commit_node("2023-01-01T00:00:00Z", login="alice"),
+        ],
+    )
+
+    found, searched = find_human_commit(client, "hmcts", "nfdiv-case-api", page, SEARCH_CUTOFF, EXCLUDED_MAINTAINERS)
+
+    assert found is None
+    # The commit past the cutoff was examined; the human commit beyond it was not.
+    assert searched == datetime(2024, 7, 1, tzinfo=UTC)
+    client.graphql.assert_not_called()
+
+
+def test_find_human_commit_examines_a_commit_exactly_at_the_cutoff() -> None:
+    """Treat the window as half-open: a commit exactly at the cutoff is inside it, not past it."""
+    client = MagicMock(spec=GitHubClient)
+    page = parsed_page(
+        [
+            commit_node("2024-08-01T00:00:00Z", login="renovate[bot]", typename="Bot"),
+            commit_node("2024-07-31T23:59:59Z", login="alice"),
+        ],
+    )
+
+    found, searched = find_human_commit(client, "hmcts", "nfdiv-case-api", page, SEARCH_CUTOFF, EXCLUDED_MAINTAINERS)
+
+    assert found == datetime(2024, 7, 31, 23, 59, 59, tzinfo=UTC)
+    assert searched is None
+    client.graphql.assert_not_called()
+
+
+def test_find_human_commit_keeps_a_human_commit_found_past_the_cutoff() -> None:
+    """Return a human commit already paid for, even when it predates the cutoff."""
+    client = MagicMock(spec=GitHubClient)
+    page = parsed_page(
+        [
+            commit_node("2026-07-01T00:00:00Z", login="renovate[bot]", typename="Bot"),
+            commit_node("2024-07-01T00:00:00Z", login="alice"),
+        ],
+    )
+
+    found, searched = find_human_commit(client, "hmcts", "nfdiv-case-api", page, SEARCH_CUTOFF, EXCLUDED_MAINTAINERS)
+
+    assert found == datetime(2024, 7, 1, tzinfo=UTC)
+    assert searched is None
+
+
+def test_find_human_commit_does_not_blame_an_anonymous_commit_on_a_person() -> None:
+    """Count a commit with no author identity at all as nobody, not as a person."""
+    client = MagicMock(spec=GitHubClient)
+    page = parsed_page([{"committedDate": "2026-07-01T00:00:00Z", "author": None}])
+
+    found, searched = find_human_commit(client, "hmcts", "nfdiv-case-api", page, SEARCH_CUTOFF, EXCLUDED_MAINTAINERS)
+
+    assert found is None
+    assert searched == SEARCH_CUTOFF
+
+
+def test_find_human_commit_stops_at_the_page_cap_and_reports_how_far_it_examined() -> None:
+    """Stop at the cap with the oldest instant examined, keeping "unknown" apart from "none".
+
+    The cap is the cost bound: every continuation page here still shows more history, and the
+    search must give up rather than page until a human appears.
+    """
+    client = MagicMock(spec=GitHubClient)
+    client.graphql.return_value = history_data(
+        [commit_node("2026-06-01T00:00:00Z", login="renovate[bot]", typename="Bot")],
+        has_next_page=True,
+        end_cursor="NEXT",
+    )
+    first = parsed_page(
+        [commit_node("2026-07-01T00:00:00Z", login="renovate[bot]", typename="Bot")],
+        has_next_page=True,
+        end_cursor="NEXT",
+    )
+
+    found, searched = find_human_commit(client, "hmcts", "nfdiv-case-api", first, SEARCH_CUTOFF, EXCLUDED_MAINTAINERS)
+
+    assert found is None
+    assert searched == datetime(2026, 6, 1, tzinfo=UTC)
+    assert client.graphql.call_count == MAINTENANCE_HISTORY_PAGE_LIMIT - 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"repository": None}, "no repository"),
+        ({"repository": {"defaultBranchRef": None}}, "no default-branch history"),
+    ],
+)
+def test_continue_history_reports_a_history_that_vanished_between_pages(
+    payload: dict[str, object],
+    detail: str,
+) -> None:
+    """Fail one search rather than guessing when a continuation page loses its history."""
+    client = MagicMock(spec=GitHubClient)
+    client.graphql.return_value = payload
+
+    with pytest.raises(GitHubError, match=detail):
+        continue_history(client, "hmcts", "nfdiv-case-api", "CURSOR-1")
+
+
+def test_collect_repository_standards_records_one_failure_per_evidence_kind() -> None:
+    """Record the bundled query failing once per new evidence kind, with the shared reason."""
+    client = standards_client(GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED))
+
+    result = collect_standards(client)
+
+    assert result.codeowners is None
+    assert result.maintenance is None
+    assert [failure.evidence for failure in result.failures] == [EvidenceKind.CODEOWNERS, EvidenceKind.MAINTENANCE]
+    for failure in result.failures:
+        assert failure.reason is AvailabilityReason.PERMISSION_DENIED
+        assert failure.detail == "GitHub permission denied"
+
+
+def test_collect_repository_standards_reports_a_repository_the_query_could_not_see() -> None:
+    """Classify a response naming no repository, which REST metadata moments earlier contradicts."""
+    client = standards_client({"repository": None})
+
+    result = collect_standards(client)
+
+    assert [failure.reason for failure in result.failures] == [
+        AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+        AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+    ]
+    assert "no repository for the standards query" in result.failures[0].detail
+
+
+def test_collect_repository_standards_reports_an_invalid_response() -> None:
+    """Classify a malformed response as a collection failure carrying what did not parse."""
+    client = standards_client(
+        standards_data(nodes=[{"committedDate": "not-an-instant", "author": None}]),
+    )
+
+    result = collect_standards(client)
+
+    assert result.codeowners is None
+    assert result.maintenance is None
+    assert [failure.evidence for failure in result.failures] == [EvidenceKind.CODEOWNERS, EvidenceKind.MAINTENANCE]
+    assert result.failures[0].reason is AvailabilityReason.COLLECTION_FAILED
+    assert "invalid repository-standards response" in result.failures[0].detail
+
+
+def test_collect_inventory_is_partial_when_only_the_standards_query_failed() -> None:
+    """Exit-status consequence: a repository that reports with the standards withheld records failures."""
+    configuration = two_repository_configuration().model_copy(
+        update={
+            "teams": (
+                TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=("nfdiv-case-api",)),
+            ),
+        },
+    )
+    client = GitHubClient("secret", Session())
+    repository_response = MagicMock()
+    repository_response.json.return_value = repository_metadata().model_dump(mode="json")
+    with (
+        patch.object(client, "get_repository", return_value=repository_response),
+        patch.object(
+            client, "graphql", side_effect=GitHubError("GitHub rate limited", AvailabilityReason.RATE_LIMITED)
+        ),
+        patch.object(client, "get_paginated", return_value=()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window())
+
+    assert inventory.status is CollectionStatus.PARTIAL
+    assert [failure.evidence for failure in inventory.failures] == [EvidenceKind.CODEOWNERS, EvidenceKind.MAINTENANCE]
+    # Both item fields stay None: unavailable data never becomes an empty block.
+    assert inventory.repositories[0].codeowners is None
+    assert inventory.repositories[0].maintenance is None
+
+
+def test_collect_inventory_carries_standards_evidence_onto_the_item() -> None:
+    """Carry both blocks onto the stored item, applying the configured author exclusions."""
+    configuration = two_repository_configuration().model_copy(
+        update={
+            "teams": (
+                TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=("nfdiv-case-api",)),
+            ),
+        },
+    )
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    payload = standards_data(
+        files={"rootCodeowners": {"byteSize": 42}},
+        nodes=[
+            commit_node("2026-08-01T00:00:00Z", login="renovate[bot]", typename="Bot"),
+            commit_node("2026-07-01T00:00:00Z", login="alice"),
+        ],
+    )
+    with (
+        patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response(payload)]),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window())
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    item = inventory.repositories[0]
+    assert item.codeowners == CodeownersEvidence(
+        files=(CodeownersFile(path="CODEOWNERS", size_bytes=42, recognised_by_github=True),),
+    )
+    assert item.maintenance == MaintenanceEvidence(
+        branch="master",
+        last_commit_at=datetime(2026, 8, 1, tzinfo=UTC),
+        last_human_commit_at=datetime(2026, 7, 1, tzinfo=UTC),
+        searched_back_to=None,
     )

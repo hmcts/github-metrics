@@ -15,10 +15,13 @@ from metrics.domain import (
     AvailabilityReason,
     BehaviourProvenance,
     CacheStatus,
+    CodeownersEvidence,
+    CodeownersFile,
     CollectionStatus,
     DirectCommitFact,
     EvidenceKind,
     EvidenceSource,
+    MaintenanceEvidence,
     MergeGateEvidence,
     OpenAlertCount,
     PullRequestFact,
@@ -99,6 +102,15 @@ def inventory() -> RepositoryInventory:
                     ),
                     restricts_deletions=True,
                     blocks_force_pushes=True,
+                ),
+                codeowners=CodeownersEvidence(
+                    files=(CodeownersFile(path=".github/CODEOWNERS", size_bytes=64, recognised_by_github=True),),
+                ),
+                maintenance=MaintenanceEvidence(
+                    branch="master",
+                    last_commit_at=datetime(2026, 8, 3, 15, 24, tzinfo=UTC),
+                    last_human_commit_at=datetime(2026, 7, 30, 11, 0, tzinfo=UTC),
+                    searched_back_to=None,
                 ),
                 collection=BehaviourProvenance(
                     stable_history=CacheStatus.FETCHED,
@@ -191,6 +203,50 @@ def test_load_repository_state_returns_the_stored_gate_and_when_it_was_observed(
     assert stored.state.repository.default_branch == "master"
     # Provenance describes one run and is excluded from the payload, so it cannot be read back.
     assert stored.state.collection is None
+
+
+def test_load_repository_state_round_trips_codeowners_and_maintenance(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Round-trip the CODEOWNERS and maintenance blocks through the stored JSON payload.
+
+    The maintenance instants are timezone-aware datetimes and the CODEOWNERS flag a boolean, so a
+    round trip that quietly stringified either would still typecheck while changing the report.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    record_repository_state(path, inventory)
+
+    stored = load_repository_state(path, "hmcts", "nfdiv-case-api")
+
+    assert stored is not None
+    assert stored.state.codeowners == inventory.repositories[0].codeowners
+    assert stored.state.maintenance == inventory.repositories[0].maintenance
+    assert stored.state.maintenance is not None
+    assert stored.state.maintenance.last_commit_at == datetime(2026, 8, 3, 15, 24, tzinfo=UTC)
+
+
+def test_load_repository_state_reads_a_row_stored_before_the_standards_checks(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Read a row stored by a build predating the standards checks back with both blocks None.
+
+    None means "not collected when repository state was stored" — never an absent file or an empty
+    branch, which is why the projection layer turns it into a reason rather than an observation.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    record_repository_state(path, inventory)
+    with closing(connect(path)) as connection, connection:
+        (payload,) = connection.execute("SELECT payload FROM repository_state").fetchone()
+        aged = {key: value for key, value in json.loads(payload).items() if key not in ("codeowners", "maintenance")}
+        connection.execute("UPDATE repository_state SET payload = ?", (json.dumps(aged),))
+
+    stored = load_repository_state(path, "hmcts", "nfdiv-case-api")
+
+    assert stored is not None
+    assert stored.state.codeowners is None
+    assert stored.state.maintenance is None
 
 
 def test_load_repository_state_reports_a_repository_that_was_never_collected(tmp_path: Path) -> None:
