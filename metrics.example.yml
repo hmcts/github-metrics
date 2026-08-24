@@ -1,0 +1,58 @@
+version: 1
+organization: hmcts
+database: .metrics/metrics.sqlite3
+lookback:
+  operational_days: 90
+  maximum_days: 365
+  stale_open_days: 14
+triviality:
+  maximum_lines: 10
+  maximum_files: 1
+assessment:
+  enabled: true
+  minimum_merges: 10
+  independent-review-coverage:
+    green_percentage: 90
+    amber_percentage: 70
+  approval-coverage:
+    green_percentage: 90
+    amber_percentage: 70
+  checks-passing-at-merge:
+    green_percentage: 90
+    amber_percentage: 70
+  # Flow signals are graded by cost rather than compliance, so the boundary is a maximum, not a
+  # minimum — and each caps at amber, because a cost is never evidence that anything ungoverned merged.
+  pull-request-size:
+    maximum: 400
+  merge-cycle-time:
+    maximum: 24
+  time-to-first-review:
+    maximum: 8
+  # Two allowances, and a repository is within the policy when either forgives it: the percentage
+  # carries the judgement because two unreviewed merges out of 246 is a pair of lapses and two out
+  # of 20 is a habit, and the count is the absolute floor beneath it for a thin cohort.
+  unreviewed-substantial-merges:
+    maximum_count: 0
+    maximum_percentage: 1
+  # A caution boundary rather than a green/amber pair: a shallow review rate is weighed, never
+  # allowed to hold the readiness label down.
+  review-depth-minimum-percentage: 50
+# Neither number enters the readiness label. `reference_patterns` is a list because HMCTS traces work
+# through both a GitHub issue and a Jira key; the defaults below match those two.
+traceability:
+  minimum_description: 30
+  reference_patterns:
+    - '#\d+'
+    - '[A-Z][A-Z0-9]+-\d+'
+excluded_repositories: []
+teams:
+  - identifier: example
+    display_name: Example Team
+    repositories:
+      - example-service
+# When agentic tooling was turned on for each repository, which the tool cannot observe. It anchors
+# the `trend` baseline and periods, and parses exactly as a window edge does: a bare date is UTC
+# midnight, a naive datetime is UTC, an offset is honoured. Every name must be a configured
+# repository; a repository listed here gets a series, one omitted reports that it has no date.
+enablement:
+  example-service: 2026-06-01
