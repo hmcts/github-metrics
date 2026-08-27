@@ -38,10 +38,19 @@ from metrics.domain import (
     ReviewFact,
     ReviewState,
     SecurityAlertEvidence,
+    SonarProjectMapping,
+    SonarResolution,
+    StoredSonarMapping,
     WindowProvenance,
 )
 from metrics.evidence import RepositoryEvidence
-from metrics.storage import StorageError, record_repository_state
+from metrics.storage import (
+    StorageError,
+    load_sonar_mapping,
+    observation_database,
+    record_repository_state,
+    record_sonar_mapping,
+)
 
 
 @pytest.fixture
@@ -278,6 +287,26 @@ teams:
     )
 
 
+@pytest.mark.parametrize("command", ["collect", "doctor", "evidence", "trend"])
+def test_main_requires_a_cohort_for_the_commands_that_report_one(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+) -> None:
+    """Name the command and how to fix it when a policy file is loaded without its team file."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(content[: content.index("teams:")], encoding="utf-8")
+    with (
+        patch("sys.argv", ["metrics", command, "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        assert main() == 1
+
+    session_class.assert_not_called()
+    assert f"{command} reports the configured repositories, but no team is configured" in caplog.text
+
+
 def test_main_rejects_invalid_configuration(tmp_path: Path) -> None:
     """Return a failure before opening a session for invalid configuration."""
     path = tmp_path / "missing.yaml"
@@ -510,6 +539,537 @@ def test_prune_reports_storage_failure(configuration_path: Path, caplog: pytest.
     assert "Prune failed: database locked" in caplog.text
 
 
+def sonar_answers(
+    projects: list[dict[str, object]],
+    analyses: dict[str, list[dict[str, object]]] | None = None,
+    commits: dict[str, str] | None = None,
+    refusing: frozenset[str] = frozenset(),
+    exhausted: frozenset[str] = frozenset(),
+) -> Callable[..., MagicMock]:
+    """Answer the project listing, each project's analyses and each commit search from one responder.
+
+    One responder for both APIs, because `map-sonar` reads SonarCloud and GitHub over two sessions of
+    the same faked class and the URL says which of them a call belongs to. `refusing` names the
+    projects whose analyses SonarCloud rejects, and `exhausted` the revisions whose commit search
+    reports the per-minute limit spent.
+    """
+    analysed = analyses or {}
+    found = commits or {}
+
+    def respond(url: str, *, params: dict[str, object] | None = None, timeout: int = 30) -> MagicMock:
+        """Return the response belonging to one requested URL."""
+        _ = timeout
+        parameters = params or {}
+        if url.endswith("/api/components/search_projects"):
+            payload: object = {"paging": {"total": len(projects)}, "components": projects}
+        elif url.endswith("/api/project_analyses/search"):
+            project = str(parameters["project"])
+            if project in refusing:
+                return MagicMock(status_code=401)
+            payload = {"analyses": analysed.get(project, [])}
+        elif url.endswith("/search/commits"):
+            revision = str(parameters["q"]).rpartition("hash:")[2]
+            if revision in exhausted:
+                # A spent commit-search window: no reserve left and a reset instant already passed,
+                # so the client's own retries cost nothing and still end in a rate-limit failure.
+                return MagicMock(status_code=403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "0"})
+            full_name = found.get(revision)
+            payload = (
+                {"total_count": 0, "items": []}
+                if full_name is None
+                else {"total_count": 1, "items": [{"sha": revision, "repository": {"full_name": full_name}}]}
+            )
+        else:
+            message = f"unexpected request: {url}"
+            raise AssertionError(message)
+        response = MagicMock(status_code=200, headers={})
+        response.json.return_value = payload
+        return response
+
+    return respond
+
+
+def map_sonar_run(configuration_path: Path, respond: Callable[..., MagicMock]) -> tuple[int, MagicMock]:
+    """Run `map-sonar` over one faked session, returning its exit status and the session it read."""
+    with (
+        patch("sys.argv", ["metrics", "map-sonar", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        # The commit-search pacing is asserted in tests/test_sonar.py; a real pacer here would make
+        # every one of these tests wait two seconds per search for nothing.
+        patch("metrics.cli.CallPacer"),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = respond
+        status = main()
+        # Two sessions, not one: the GitHub client puts its bearer token on the session it is given,
+        # and a shared session would send a GitHub token to SonarCloud on every request.
+        assert session_class.call_count == 2
+    return status, session
+
+
+def sonar_map(configuration_path: Path, project_key: str) -> StoredSonarMapping | None:
+    """Read back what one `map-sonar` run stored for one project, from the observations file."""
+    return load_sonar_mapping(observation_database(configuration_path.parent / "metrics.sqlite3"), "hmcts", project_key)
+
+
+def searched_projects(session: MagicMock) -> list[str]:
+    """List the projects whose analyses were read, which is what a resolution actually costs."""
+    return [
+        str(call.kwargs["params"]["project"])
+        for call in session.get.call_args_list
+        if call.args[0].endswith("/api/project_analyses/search")
+    ]
+
+
+def test_map_sonar_resolves_every_listed_project_and_stores_what_it_learned(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resolve each project through its analysed commit, and store the answer even when there is none.
+
+    The duplicate pair is the case the map exists for: SonarCloud has no rename, so a re-created
+    project leaves its abandoned twin claiming the same repository, and both keys are reported so a
+    human can see the reverse lookup had a choice to make.
+    """
+    caplog.set_level(logging.INFO)
+    respond = sonar_answers(
+        projects=[
+            {"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+            {"key": "rpx-xui-webapp_2", "visibility": "public", "analysisDate": "2026-08-26T11:00:00+0000"},
+            {"key": "rpx-xui-webapp", "visibility": "public", "analysisDate": "2026-07-01T11:00:00+0000"},
+            {"key": "hmcts.never-analysed", "visibility": "public"},
+        ],
+        analyses={
+            "hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}],
+            "rpx-xui-webapp_2": [{"date": "2026-08-26T11:00:00+0000", "revision": "11ee0001"}],
+            "rpx-xui-webapp": [{"date": "2026-07-01T11:00:00+0000", "revision": "aba7d011"}],
+        },
+        commits={
+            "ce34e614": "hmcts/cath-service",
+            "11ee0001": "hmcts/nfdiv-case-api",
+            "aba7d011": "hmcts/nfdiv-case-api",
+        },
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    resolved = sonar_map(configuration_path, "hmcts.cath")
+    assert resolved is not None
+    assert resolved.mapping is not None
+    assert resolved.mapping.repository == "cath-service"
+    assert resolved.mapping.method is SonarResolution.ANALYSIS_REVISION
+    assert resolved.mapping.revision == "ce34e614"
+    assert resolved.mapping.analysis_at == datetime(2026, 8, 27, 9, 49, 35, tzinfo=UTC)
+    assert resolved.detail is None
+    # A never-analysed project is an ANSWER, stored with its reason so the next run spends nothing
+    # on it: 14 of the live organisation's 289 projects are in exactly this state.
+    never = sonar_map(configuration_path, "hmcts.never-analysed")
+    assert never is not None
+    assert never.mapping is None
+    assert never.detail is not None
+    assert "no analysis" in never.detail
+    assert searched_projects(session) == [
+        "hmcts.cath",
+        "rpx-xui-webapp_2",
+        "rpx-xui-webapp",
+        "hmcts.never-analysed",
+    ]
+    assert "3 resolved, 0 unchanged, 1 never analysed, 0 unresolvable, 0 failed; 2 repositories mapped" in caplog.text
+    assert "nfdiv-case-api is claimed by 2 projects: rpx-xui-webapp_2, rpx-xui-webapp" in caplog.text
+
+
+def test_map_sonar_skips_a_project_nothing_has_been_analysed_for_since_it_was_resolved(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spend no call on a project whose stored answer came from the analysis the listing still names.
+
+    The whole reason the command is separate is the 30-per-minute commit search, so a second run over
+    an organisation that has analysed one new project must cost one project's worth of calls.
+    """
+    caplog.set_level(logging.INFO)
+    analysis_at = datetime(2026, 8, 27, 9, 49, 35, tzinfo=UTC)
+    record_sonar_mapping(
+        observation_database(configuration_path.parent / "metrics.sqlite3"),
+        "hmcts",
+        StoredSonarMapping(
+            project_key="hmcts.cath",
+            resolved_at=datetime(2026, 8, 27, 12, 0, tzinfo=UTC),
+            mapping=SonarProjectMapping(
+                project_key="hmcts.cath",
+                repository="cath-service",
+                method=SonarResolution.ANALYSIS_REVISION,
+                analysis_at=analysis_at,
+                revision="ce34e614",
+            ),
+        ),
+    )
+    respond = sonar_answers(
+        projects=[
+            {"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+            {"key": "hmcts.newly-analysed", "visibility": "public", "analysisDate": "2026-08-28T09:00:00+0000"},
+        ],
+        analyses={"hmcts.newly-analysed": [{"date": "2026-08-28T09:00:00+0000", "revision": "f8e50011"}]},
+        commits={"f8e50011": "hmcts/nfdiv-case-api"},
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    assert searched_projects(session) == ["hmcts.newly-analysed"]
+    assert "SKIP   hmcts.cath" in caplog.text
+    assert "1 resolved, 1 unchanged" in caplog.text
+    # The skipped project still counts towards what the map holds, and its stored row is untouched.
+    stored = sonar_map(configuration_path, "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.analysis_at == analysis_at
+    assert "2 repositories mapped" in caplog.text
+
+
+def test_map_sonar_exits_incomplete_when_one_project_could_not_be_read(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep every project that answered, and still refuse to call the run complete."""
+    caplog.set_level(logging.INFO)
+    respond = sonar_answers(
+        projects=[
+            {"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+            {"key": "hmcts.refused", "visibility": "private", "analysisDate": "2026-08-27T09:49:35+0000"},
+        ],
+        analyses={"hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}]},
+        commits={"ce34e614": "hmcts/cath-service"},
+        refusing=frozenset({"hmcts.refused"}),
+    )
+
+    status, _ = map_sonar_run(configuration_path, respond)
+
+    assert status == INCOMPLETE_RUN
+    assert sonar_map(configuration_path, "hmcts.cath") is not None
+    # Nothing is written for a call that failed: a refusal is this run's problem, not the project's
+    # answer, and storing it would stop the next run from ever asking again.
+    assert sonar_map(configuration_path, "hmcts.refused") is None
+    assert "1 resolved, 0 unchanged, 0 never analysed, 0 unresolvable, 1 failed" in caplog.text
+
+
+def test_map_sonar_stops_at_a_spent_commit_search_quota_and_keeps_what_it_paid_for(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stop the run at an exhausted rate limit rather than writing it into every remaining project.
+
+    The limit applies to every project still to come exactly as it applied to this one, so a run that
+    carried on would record its own exhaustion as each project's dead end.
+    """
+    respond = sonar_answers(
+        projects=[
+            {"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+            {"key": "hmcts.limited", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+            {"key": "hmcts.unvisited", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"},
+        ],
+        analyses={
+            "hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}],
+            "hmcts.limited": [{"date": "2026-08-27T09:49:35+0000", "revision": "c0dee111"}],
+        },
+        commits={"ce34e614": "hmcts/cath-service"},
+        exhausted=frozenset({"c0dee111"}),
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == INCOMPLETE_RUN
+    assert sonar_map(configuration_path, "hmcts.cath") is not None
+    assert sonar_map(configuration_path, "hmcts.limited") is None
+    assert searched_projects(session) == ["hmcts.cath", "hmcts.limited"]
+    assert "stopping and keeping the 1 projects already resolved" in caplog.text
+
+
+def test_map_sonar_exits_one_when_the_organisation_lists_no_project(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refuse an organisation that lists nothing, rather than reporting an empty map as a success."""
+    status, session = map_sonar_run(configuration_path, sonar_answers(projects=[]))
+
+    assert status == 1
+    assert searched_projects(session) == []
+    assert "SonarCloud lists no project for organisation hmcts" in caplog.text
+
+
+def test_map_sonar_reports_an_unreadable_project_listing(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Say why nothing could be mapped when the listing itself is refused."""
+
+    def refuse(url: str, *, params: dict[str, object] | None = None, timeout: int = 30) -> MagicMock:
+        """Refuse every request, which is what an unreadable organisation looks like."""
+        _ = url, params, timeout
+        return MagicMock(status_code=401)
+
+    status, _ = map_sonar_run(configuration_path, refuse)
+
+    assert status == 1
+    assert "SonarCloud project listing failed for hmcts" in caplog.text
+
+
+def test_map_sonar_searches_github_under_the_github_organisation(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep the two organisation names apart: SonarCloud lists one, GitHub is searched for the other.
+
+    They are the same string at HMCTS and are allowed to differ anywhere else, so collapsing them
+    would qualify the commit search by an organisation that need not exist on GitHub at all — and
+    every project would then be stored as unresolvable, permanently, since that is an observation.
+    """
+    caplog.set_level(logging.INFO)
+    configuration_path = tmp_path / "metrics.yaml"
+    configuration_path.write_text(
+        """\
+version: 1
+organization: hmcts
+sonar_organization: hmcts-sonar
+database: metrics.sqlite3
+teams:
+  - identifier: divorce
+    display_name: Divorce
+    repositories:
+      - nfdiv-case-api
+""",
+        encoding="utf-8",
+    )
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+        analyses={"hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}]},
+        commits={"ce34e614": "hmcts/cath-service"},
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    searches = [
+        str(call.kwargs["params"]["q"])
+        for call in session.get.call_args_list
+        if call.args[0].endswith("/search/commits")
+    ]
+    assert searches == ["org:hmcts hash:ce34e614"]
+    listings = [
+        str(call.kwargs["params"]["organization"])
+        for call in session.get.call_args_list
+        if call.args[0].endswith("/api/components/search_projects")
+    ]
+    assert listings == ["hmcts-sonar"]
+    # Keyed under the SonarCloud organisation, which is what a later evidence run reads it back by.
+    database = observation_database(configuration_path.parent / "metrics.sqlite3")
+    assert load_sonar_mapping(database, "hmcts", "hmcts.cath") is None
+    stored = load_sonar_mapping(database, "hmcts-sonar", "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+
+
+def test_map_sonar_skips_an_unresolved_project_nothing_has_been_analysed_for_since(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Never re-ask a hopeless question: an unresolved row is an answer until a newer analysis exists."""
+    caplog.set_level(logging.INFO)
+    record_sonar_mapping(
+        observation_database(configuration_path.parent / "metrics.sqlite3"),
+        "hmcts",
+        StoredSonarMapping(
+            project_key="hmcts.unresolvable",
+            resolved_at=datetime(2026, 8, 27, 12, 0, tzinfo=UTC),
+            detail="no commit in hmcts matches any of the 5 most recently analysed revisions",
+        ),
+    )
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.unresolvable", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    assert searched_projects(session) == []
+    assert "0 resolved, 1 unchanged" in caplog.text
+
+
+def test_map_sonar_re_resolves_an_unresolved_project_that_has_since_been_analysed(
+    configuration_path: Path,
+) -> None:
+    """Ask again the moment there is something new to learn from, which is a newer analysis."""
+    record_sonar_mapping(
+        observation_database(configuration_path.parent / "metrics.sqlite3"),
+        "hmcts",
+        StoredSonarMapping(
+            project_key="hmcts.cath",
+            resolved_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+            detail="the project has no analysis to resolve from",
+        ),
+    )
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+        analyses={"hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}]},
+        commits={"ce34e614": "hmcts/cath-service"},
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    assert searched_projects(session) == ["hmcts.cath"]
+    stored = sonar_map(configuration_path, "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+
+
+def test_map_sonar_skips_a_project_resolved_from_an_older_analysis(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Converge on the projects resolution walks back for, rather than re-buying the same answer.
+
+    `sonar_to_github` records the instant of whichever analysis resolved, which is older than the one
+    the listing names whenever the newest commit is not findable. Keying the skip on that instant
+    would re-search the project every run and then have `record_sonar_mapping` refuse the identical
+    write — the exact quota the separate command exists to protect.
+    """
+    caplog.set_level(logging.INFO)
+    record_sonar_mapping(
+        observation_database(configuration_path.parent / "metrics.sqlite3"),
+        "hmcts",
+        StoredSonarMapping(
+            project_key="hmcts.cath",
+            resolved_at=datetime(2026, 8, 27, 12, 0, tzinfo=UTC),
+            mapping=SonarProjectMapping(
+                project_key="hmcts.cath",
+                repository="cath-service",
+                method=SonarResolution.ANALYSIS_REVISION,
+                # Resolved from the analysis UNDER the one the listing reports below.
+                analysis_at=datetime(2026, 8, 24, 9, 24, 56, tzinfo=UTC),
+                revision="ce34e614",
+            ),
+        ),
+    )
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+    )
+
+    status, session = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    assert searched_projects(session) == []
+    assert "1 unchanged" in caplog.text
+
+
+def test_map_sonar_keeps_a_stored_mapping_resolved_from_a_newer_analysis(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Never let a re-resolution from older evidence overwrite a mapping a newer analysis produced."""
+    caplog.set_level(logging.DEBUG)
+    newer = datetime(2026, 9, 2, 9, 0, tzinfo=UTC)
+    record_sonar_mapping(
+        observation_database(configuration_path.parent / "metrics.sqlite3"),
+        "hmcts",
+        StoredSonarMapping(
+            project_key="hmcts.cath",
+            # Written before the newer analysis was listed, so the skip does not answer for it.
+            resolved_at=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+            mapping=SonarProjectMapping(
+                project_key="hmcts.cath",
+                repository="cath-service",
+                method=SonarResolution.ANALYSIS_REVISION,
+                analysis_at=newer,
+                revision="ce34e614",
+            ),
+        ),
+    )
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+        analyses={"hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "0ldc0m1"}]},
+        commits={"0ldc0m1": "hmcts/moved-elsewhere"},
+    )
+
+    status, _ = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    stored = sonar_map(configuration_path, "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+    assert stored.mapping.analysis_at == newer
+    assert "kept the stored mapping for hmcts.cath" in caplog.text
+
+
+def test_map_sonar_exits_one_when_no_project_could_be_answered(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refuse a run that learned nothing at all, rather than reporting a partial run that has no part."""
+    caplog.set_level(logging.INFO)
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.refused", "visibility": "private", "analysisDate": "2026-08-27T09:49:35+0000"}],
+        refusing=frozenset({"hmcts.refused"}),
+    )
+
+    status, _ = map_sonar_run(configuration_path, respond)
+
+    assert status == 1
+    assert sonar_map(configuration_path, "hmcts.refused") is None
+    assert "0 resolved, 0 unchanged, 0 never analysed, 0 unresolvable, 1 failed" in caplog.text
+
+
+def test_map_sonar_reports_a_storage_failure(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Say why a run stopped when the file its whole output goes into cannot be read or written."""
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+    )
+    with patch("metrics.cli.load_sonar_mapping", side_effect=StorageError("database is locked")):
+        status, _ = map_sonar_run(configuration_path, respond)
+
+    assert status == 1
+    assert "Storage failed: database is locked" in caplog.text
+
+
+def test_map_sonar_requires_a_token(configuration_path: Path) -> None:
+    """Fail before opening a session: the commit search is the one call that cannot be anonymous here."""
+    with (
+        patch("sys.argv", ["metrics", "map-sonar", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        assert main() == 1
+
+    session_class.assert_not_called()
+
+
+def test_map_sonar_runs_without_a_configured_team(configuration_path: Path) -> None:
+    """Map the organisation from the policy file alone: no team, no repository list, is read here."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(content[: content.index("teams:")], encoding="utf-8")
+    respond = sonar_answers(
+        projects=[{"key": "hmcts.cath", "visibility": "public", "analysisDate": "2026-08-27T09:49:35+0000"}],
+        analyses={"hmcts.cath": [{"date": "2026-08-27T09:49:35+0000", "revision": "ce34e614"}]},
+        commits={"ce34e614": "hmcts/cath-service"},
+    )
+
+    status, _ = map_sonar_run(configuration_path, respond)
+
+    assert status == 0
+    stored = sonar_map(configuration_path, "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+
+
 def evidence_for(
     window: ReportingWindow,
     repository: str = "nfdiv-case-api",
@@ -648,7 +1208,7 @@ def test_evidence_renders_the_same_evidence_as_a_readable_report(
             ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--format", "report"],
         ),
         patch.dict("os.environ", {}, clear=True),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
     ):
         assert main() == 0
@@ -715,7 +1275,7 @@ def test_evidence_shows_the_collected_merge_gate_beside_observed_behaviour(
     with (
         patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
         patch.dict("os.environ", {}, clear=True),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
     ):
         assert main() == 0
@@ -1038,7 +1598,7 @@ def test_evidence_reports_open_pull_requests_as_unavailable_offline(
     with (
         patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
         patch.dict("os.environ", {}, clear=True),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
     ):
         assert main() == 0
@@ -1069,7 +1629,7 @@ def test_evidence_reports_open_pull_requests_fetched_fresh_when_collecting(
             "metrics.cli.collected_repository_evidence",
             side_effect=lambda *arguments: evidence_for(arguments[3]),
         ),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.open_pull_request_report", return_value=summary),
     ):
         assert main() == 0
@@ -1100,7 +1660,7 @@ def test_evidence_fetches_both_phases_over_one_client(configuration_path: Path) 
             "metrics.cli.collected_repository_evidence",
             side_effect=lambda *arguments: evidence_for(arguments[3]),
         ),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch(
             "metrics.cli.open_pull_request_report",
             return_value=OpenPullRequestReport(detail="not fetched by this test"),
@@ -1156,7 +1716,7 @@ teams:
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session"),
         patch("metrics.cli.collected_repository_evidence", side_effect=collected),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.open_pull_request_report", return_value=summary) as fetch,
     ):
         assert main() == 3
@@ -1197,7 +1757,7 @@ def test_evidence_omits_a_failed_repository_from_the_numbers_rather_than_zeroing
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session"),
         patch("metrics.cli.collected_repository_evidence", side_effect=collected),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.open_pull_request_report", return_value=offline_open_pull_requests()),
     ):
         assert main() == 3
@@ -1237,7 +1797,7 @@ def test_evidence_assesses_readiness_from_the_gate_and_observed_behaviour(
     with (
         patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
         patch.dict("os.environ", {}, clear=True),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
     ):
         assert main() == 0
@@ -1278,7 +1838,7 @@ def test_evidence_reds_a_repository_whose_gate_requires_no_review(
         patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
         patch.dict("os.environ", {}, clear=True),
         patch(
-            "metrics.cli.stored_merge_gate",
+            "metrics.evidence.stored_merge_gate",
             return_value=nominal.model_copy(
                 update={"gate": nominal.gate.model_copy(update={"pull_requests": ()})},
             ),
@@ -1420,7 +1980,7 @@ teams:
     with (
         patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
         patch.dict("os.environ", {}, clear=True),
-        patch("metrics.cli.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.cached_repository_evidence", side_effect=cached),
     ):
         assert main() == INCOMPLETE_RUN

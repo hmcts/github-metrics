@@ -43,6 +43,32 @@ def test_the_meter_reports_the_calls_and_the_seconds_one_stretch_used() -> None:
     )
 
 
+def test_the_meter_counts_both_clients_into_one_repository_figure() -> None:
+    """Keep a repository's collection one measurable unit when it spends two APIs, not two figures.
+
+    The unit is one repository's collection, and splitting it by API would answer a question about
+    quotas that this instrument does not track.
+    """
+    client = counting_client(17)
+    sonar = MagicMock(requests_issued=4)
+    meter = CostMeter(client, sonar)
+    with fake_clock(100.0, 103.0), meter.measure():
+        client.issued += 6
+        sonar.requests_issued = 7
+
+    assert meter.cost("cath-service").requests == 9
+
+
+def test_the_meter_counts_the_github_client_alone_when_no_sonarcloud_state_is_collected() -> None:
+    """Measure the window phase, and any run given no SonarCloud source, off the one counter it has."""
+    client = counting_client(3)
+    meter = CostMeter(client, None)
+    with fake_clock(0.0, 1.0), meter.measure():
+        client.issued += 2
+
+    assert meter.cost("cath-service").requests == 2
+
+
 def test_the_meter_adds_every_stretch_to_the_same_totals() -> None:
     """Accumulate the phases of one repository's collection rather than replacing them."""
     client = counting_client(0)

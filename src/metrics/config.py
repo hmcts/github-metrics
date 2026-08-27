@@ -13,6 +13,7 @@ from pydantic import (
     Field,
     NonNegativeInt,
     PositiveInt,
+    ValidationError,
     model_validator,
 )
 
@@ -261,11 +262,57 @@ class Configuration(ConfigurationModel):
     traceability: TraceabilityConfiguration = TraceabilityConfiguration()
     practices: PracticeConfiguration = PracticeConfiguration()
     excluded_repositories: tuple[str, ...] = ()
-    teams: Annotated[tuple[TeamConfiguration, ...], Field(min_length=1)]
+    # Optional at the schema, required by the commands whose subject is the cohort (see
+    # `COHORT_COMMANDS` in cli.py). `map-sonar` resolves every project a SonarCloud organisation
+    # lists and `prune` deletes stale cache rows: neither is about any repository a team owns, so
+    # neither should oblige a team file to be layered in to say something it never reads. A run that
+    # DOES report the cohort refuses an empty one there, where the message can name the command.
+    teams: tuple[TeamConfiguration, ...] = ()
     # When agentic tooling was turned on for a repository. The tool cannot observe it — GitHub cannot
     # be asked — so it is an input fact like every other policy input. See architecture.md
     # "Trend measurement": a repository with no date gets no series rather than a guessed anchor.
     enablement: dict[str, EnablementInstant] = Field(default_factory=dict)
+    # The SonarCloud organisation key, which is usually the GitHub organisation name and at HMCTS is
+    # exactly it. Left `None` rather than defaulted to the same text so the common case is not
+    # restated in every configuration file; read through `sonar_organization_name`.
+    sonar_organization: str | None = None
+    # The answer of last resort for a repository whose project the stored map cannot settle: an
+    # explicit configured repository name to SonarCloud project key. See architecture.md.
+    sonar_projects: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def sonar_organization_name(self) -> str:
+        """Return the SonarCloud organisation to read, falling back to the GitHub organisation."""
+        return self.sonar_organization or self.organization
+
+    @model_validator(mode="after")
+    def validate_sonar_projects(self) -> Self:
+        """Reject a project override that names no configured repository, or names no project.
+
+        The unconfigured-repository rule is `validate_enablement`'s, for its reason: a typo in a
+        repository name would otherwise resolve nothing and be reported as "no SonarCloud project
+        mapped" — indistinguishable from having forgotten the override entirely — so the mistake is
+        named at load time instead.
+
+        An empty key is rejected for the same reason from the other side. Resolution treats an
+        override as the answer that short-circuits every other step, so a blank one would silently
+        mean "unresolved" while reading as a decision somebody made.
+        """
+        blank = sorted(repository for repository, project in self.sonar_projects.items() if not project.strip())
+        if blank:
+            message = f"sonar project keys may not be empty: {', '.join(blank)}"
+            raise ValueError(message)
+
+        # The blank-key rule above holds whatever was configured: it is a fact about the override
+        # itself. Only the cross-check below is conditional, and only on there being a cohort to
+        # check against — see `validate_enablement` for the whole of that reasoning.
+        if not self.teams:
+            return self
+        unconfigured = sorted(set(self.sonar_projects) - set(configured_repositories(self)))
+        if unconfigured:
+            message = f"sonar projects must name a configured repository: {', '.join(unconfigured)}"
+            raise ValueError(message)
+        return self
 
     @model_validator(mode="after")
     def validate_enablement(self) -> Self:
@@ -274,7 +321,15 @@ class Configuration(ConfigurationModel):
         A typo in a repository name would otherwise anchor nothing and be reported as "no enablement
         date configured" — the same as having forgotten it entirely — so the mistake is named at load
         time instead.
+
+        Skipped where no team is configured, because the rule is a comparison and one side of it is
+        absent: a policy file read on its own for `map-sonar` or `prune` owns no repository, so every
+        name in it would be "unconfigured" and the load would fail over a key neither command reads.
+        Nothing is lost — an enablement date only ever affects a run that reports the cohort, and
+        every such run loads a team file and is checked here.
         """
+        if not self.teams:
+            return self
         unconfigured = sorted(set(self.enablement) - set(configured_repositories(self)))
         if unconfigured:
             message = f"enablement dates must name a configured repository: {', '.join(unconfigured)}"
@@ -341,6 +396,24 @@ def repository_owners(configuration: Configuration) -> dict[str, str]:
     return {repository: identifier for identifier, repository in owned_repositories(configuration)}
 
 
+def describe_validation_error(paths: tuple[Path, ...], exception: ValidationError) -> str:
+    """Report each rejected key as `location: problem`, naming the files the document was read from.
+
+    pydantic's own rendering prints the entire input document beside the first offending key and a
+    link to its error index, which buries the two things a reader needs: WHICH key, and where it was
+    looked for. The rendering is the one used for rejected GitHub responses in `inventory.py`.
+
+    The file list is part of the message because `--config` is repeatable and the files are read as
+    one document: a missing `teams:` almost always means the team file was not given, not that the
+    policy file naming it is wrong, and the message cannot say so without naming what was read.
+    """
+    problems = ", ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exception.errors(include_url=False, include_input=False)
+    )
+    return f"{problems} (read from {', '.join(str(path) for path in paths)})"
+
+
 def load_configuration(*paths: Path) -> Configuration:
     """Load a versioned metrics configuration from YAML held in one file or split across several.
 
@@ -359,10 +432,15 @@ def load_configuration(*paths: Path) -> Configuration:
         # newline would otherwise run into the next file's first line and change what both mean.
         document = "\n".join(path.read_text(encoding="utf-8") for path in paths)
         configuration = Configuration.model_validate(yaml.safe_load(document))
-    # `ValueError` covers pydantic's `ValidationError` and also PyYAML's own scalar constructors,
-    # which raise a bare `ValueError` for an impossible timestamp such as `2026-13-05` before
-    # pydantic ever sees the value. Both are invalid configuration and must be reported as such
-    # rather than escaping the loader as an unhandled exception.
+    # Caught before the `ValueError` clause below, which it would otherwise be swallowed by: a
+    # rejected key is the one invalid-configuration case with a location to report, and reporting it
+    # as `str(exception)` is what printed the whole input document instead of the key's name.
+    except ValidationError as exception:
+        raise ConfigurationError(describe_validation_error(paths, exception)) from exception
+    # `ValueError` still covers PyYAML's own scalar constructors, which raise a bare `ValueError`
+    # for an impossible timestamp such as `2026-13-05` before pydantic ever sees the value, and it
+    # is kept beside the unreadable file and the unparseable document: all three are invalid
+    # configuration and must be reported as such rather than escaping the loader as a crash.
     except (OSError, ValueError, yaml.YAMLError) as exception:
         raise ConfigurationError(str(exception)) from exception
 

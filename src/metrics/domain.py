@@ -51,6 +51,7 @@ class EvidenceKind(StrEnum):
     SECURITY = "security"
     CODEOWNERS = "codeowners"
     MAINTENANCE = "maintenance"
+    SONAR = "sonar"
 
 
 class EvidenceSource(StrEnum):
@@ -693,6 +694,247 @@ class MaintenanceReport(EvidenceModel):
         return self
 
 
+SONAR_RATING_LETTERS = "ABCDE"
+"""The A-to-E letters SonarCloud's 1.0-to-5.0 rating scale stands for, best first."""
+
+
+class SonarRating(EvidenceModel):
+    """Hold one SonarCloud rating as the number it was reported as, and the letter it names.
+
+    SonarCloud reports a rating as `1.0` to `5.0` and every human reads it as `A` to `E`, so the float is
+    stored — it is what the API said — and the letter is derived for rendering. `letter` is None for
+    any value outside the scale rather than clamped to an end of it: a rating this build does not
+    understand must not be reported as the best one, which is what defaulting to `A` would do.
+    """
+
+    value: float
+
+    @property
+    def letter(self) -> str | None:
+        """Return the `A` to `E` letter this rating names, or None when it is off the scale."""
+        if not self.value.is_integer() or not 1 <= self.value <= len(SONAR_RATING_LETTERS):
+            return None
+        return SONAR_RATING_LETTERS[int(self.value) - 1]
+
+
+class SonarGateLevel(StrEnum):
+    """Identify how one SonarCloud quality gate stands, using only the levels SonarCloud reports.
+
+    `NONE` is SonarCloud's own value for a project with no gate result — a project that has been
+    created and never analysed, of which 14 of the organisation's 289 were on 2026-08-27. It is a
+    third answer and not a failure: the project exists, and nothing has been measured against it.
+    """
+
+    OK = "OK"
+    ERROR = "ERROR"
+    NONE = "NONE"
+
+
+class SonarQualityGateCondition(EvidenceModel):
+    """State one condition behind a quality gate's level, as `quality_gate_details` reported it.
+
+    `threshold` and `actual` are kept as the strings SonarCloud returned. The two are not the same
+    kind of number from one condition to the next — `1` against a rating means "worse than A" while
+    `80` against new coverage means a percentage — so parsing them into floats here would invent a
+    type the wire does not have, and the block renders them beside the metric that gives them their
+    meaning. `actual` is None for a condition SonarCloud reported without a measured value.
+    """
+
+    metric: str
+    comparator: str
+    threshold: str | None = None
+    actual: str | None = None
+    level: SonarGateLevel
+
+
+class SonarQualityGate(EvidenceModel):
+    """Report one project's gate level together with every condition behind it.
+
+    The conditions are carried, not just the verdict, for the same reason the merge gate reports its
+    rules and the readiness assessment reports what it checked: "the gate failed" is an assertion,
+    and "new coverage 62.1% against a threshold of 80%" is evidence. An empty `conditions` tuple is
+    accepted — a never-analysed project has a level and nothing behind it.
+    """
+
+    level: SonarGateLevel
+    conditions: tuple[SonarQualityGateCondition, ...] = ()
+
+
+class SonarMeasures(EvidenceModel):
+    """Record what SonarCloud measured for one project at the instant of its latest analysis.
+
+    EVERY measure is optional, and an absent one means SonarCloud returned no value for it — never
+    zero. A project can be listed and never analysed, in which case there is nothing here but the
+    key; a project can also be analysed by a scanner that reported no coverage, and a rendered `0.0%`
+    would be a claim about the code rather than about the measurement.
+
+    `maintainability_rating` is named for what it measures. SonarCloud's metric key for it is
+    `sqale_rating`, and `maintainability_rating` IS NOT A VALID KEY — requesting it returns
+    `measures: null` for the whole call, discarding every other metric silently. The key set is a
+    single guarded constant in `metrics.sonar` for exactly that reason; this field name never reaches
+    the API.
+    """
+
+    project_key: str
+    analysis_at: AwareDatetime | None = None
+    gate: SonarQualityGate | None = None
+    coverage: NonNegativeFloat | None = None
+    duplicated_lines_density: NonNegativeFloat | None = None
+    lines_of_code: NonNegativeInt | None = None
+    violations: NonNegativeInt | None = None
+    reliability_issues: NonNegativeInt | None = None
+    maintainability_issues: NonNegativeInt | None = None
+    security_issues: NonNegativeInt | None = None
+    security_hotspots: NonNegativeInt | None = None
+    reliability_rating: SonarRating | None = None
+    maintainability_rating: SonarRating | None = None
+    security_rating: SonarRating | None = None
+    security_review_rating: SonarRating | None = None
+
+
+class SonarResolution(StrEnum):
+    """Say how one repository was attributed to one SonarCloud project.
+
+    Recorded on the evidence rather than inferred later, because every method here has a different
+    strength and a wrong mapping is diagnosable only if the report says which one answered. The
+    ladder that produces these is in `metrics.sonar`; a NAME RULE is deliberately not among them, and
+    architecture.md records the measurement that rejected it.
+    """
+
+    CONFIGURED = "configured"
+    DECLARED_CONFIRMED_BY_MAP = "declared_confirmed_by_map"
+    DECLARED_CONFIRMED_BY_COMMIT = "declared_confirmed_by_commit"
+    STORED_MAP = "stored_map"
+    ANALYSIS_REVISION = "analysis_revision"
+
+
+class SonarProjectMapping(EvidenceModel):
+    """Attribute one SonarCloud project to one GitHub repository, and say how.
+
+    `analysis_at` and `revision` are the evidence behind a resolution that used one: the commit an
+    analysis ran against, and when it ran. Both are absent for a configured override, which is an
+    instruction rather than an observation, and for a resolution that read neither.
+    """
+
+    project_key: str
+    repository: str
+    method: SonarResolution
+    analysis_at: AwareDatetime | None = None
+    revision: str | None = None
+
+
+class StoredSonarMapping(EvidenceModel):
+    """Pair one row of the stored `sonar → github` map with the instant it was resolved.
+
+    Either the mapping the resolution produced or the reason it produced none, never both: AN
+    UNRESOLVED PROJECT IS STORED WITH ITS REASON, because the alternative is spending the scarcest
+    quota there is re-asking the same hopeless question on every run.
+
+    `resolved_at` belongs to the resolution and not to the project, so it sits beside the mapping
+    rather than inside it, exactly as `StoredRepositoryState.fetched_at` does.
+    """
+
+    project_key: str
+    resolved_at: AwareDatetime
+    mapping: SonarProjectMapping | None = None
+    detail: str | None = None
+
+    @property
+    def analysis_at(self) -> AwareDatetime | None:
+        """Return the analysis instant this row was resolved from, or None when it had none."""
+        return None if self.mapping is None else self.mapping.analysis_at
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> StoredSonarMapping:
+        """Require either a resolved mapping or the reason the project could not be resolved."""
+        if (self.mapping is None) == (self.detail is None):
+            message = "a stored sonar mapping must carry either its mapping or the reason it has none"
+            raise ValueError(message)
+        if self.mapping is not None and self.mapping.project_key != self.project_key:
+            message = "a stored sonar mapping must be filed under the project key it names"
+            raise ValueError(message)
+        return self
+
+
+class SonarRepositoryProject(EvidenceModel):
+    """Name the SonarCloud project the stored map attributes to one repository, and how many claimed it.
+
+    THE REVERSE LOOKUP IS MANY-TO-ONE. SonarCloud has no rename, so a re-created project leaves its
+    abandoned twin behind under the old key — `rpx-xui-webapp` and `rpx-xui-webapp_2` both resolve to
+    one repository, and it is the suffixed one that is still being analysed. The winner is therefore
+    the most recently analysed candidate, and `candidates` reports how many there were so that a human
+    reading the block can see a choice was made rather than assuming there was only one.
+    """
+
+    mapping: SonarProjectMapping
+    candidates: PositiveInt = 1
+
+
+class SonarProjectResolution(EvidenceModel):
+    """Record the SonarCloud project one collection attributed to one repository, or why none was.
+
+    Stored beside the measures rather than recomputed when the report is assembled, because HOW a
+    project was chosen is not recoverable later: the configured override that answered may have been
+    edited since, the stored map may have moved the project, and an `--offline` report may contact
+    neither. The method is the thing that makes a wrong mapping diagnosable, so it is stored with the
+    evidence it produced.
+
+    It is also what keeps "NO SONARCLOUD PROJECT IS MAPPED TO THIS REPOSITORY" — an answer, and the
+    answer for most of the organisation — apart from "measures were not collected when this row was
+    stored", which is a gap. The first stores a resolution carrying its reason; the second stores
+    nothing at all, which is what a row written before this source existed holds.
+
+    `mapping` and `detail` may appear TOGETHER, unlike the report models' strict either-or: a project
+    can be named and its measures still be unreadable, and then the reason belongs beside the project
+    it is about. Only having neither is refused, because that would be a resolution that says nothing.
+    """
+
+    mapping: SonarProjectMapping | None = None
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> SonarProjectResolution:
+        """Require either the project this repository was attributed to or the reason it has none."""
+        if self.mapping is None and self.detail is None:
+            message = "a sonar project resolution must name a project or say why it names none"
+            raise ValueError(message)
+        return self
+
+
+class SonarReport(EvidenceModel):
+    """Report one repository's stored SonarCloud state, or why there is none to show.
+
+    Stored current state read at `fetched_at`, exactly like the merge gate beside it, and REPORT-ONLY
+    AND UNGRADED: `ReadinessPolicy` reads none of it, per the standing rule that a signal becoming
+    visible is not a reason to grade it. A repository with no SonarCloud project carries the reason,
+    which most of the organisation's repositories do — an absent block would read as a project whose
+    gate nobody has looked at.
+
+    `mapping` sits BESIDE the measures as readily as instead of them: a project can be resolved and
+    its measures still be unreadable — a failed call, or a row stored before this source existed — and
+    naming the project the reason is about is more useful than withholding it. Where both are
+    reported they must name the same project: a block headed by one project key reporting another
+    project's coverage would be worse than no block at all.
+    """
+
+    fetched_at: AwareDatetime | None = None
+    mapping: SonarProjectMapping | None = None
+    measures: SonarMeasures | None = None
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> SonarReport:
+        """Require either observed measures or the reason there are none, for one named project."""
+        if (self.measures is None) == (self.detail is None):
+            message = "a sonar report must carry either its evidence or the reason it is unavailable"
+            raise ValueError(message)
+        mapping, measures = self.mapping, self.measures
+        if mapping is not None and measures is not None and mapping.project_key != measures.project_key:
+            message = "sonar measures must be reported for the project the mapping names"
+            raise ValueError(message)
+        return self
+
+
 class ReadinessLabel(StrEnum):
     """Judge one repository's readiness for agentic tooling.
 
@@ -938,6 +1180,7 @@ class RepositoryPracticeEvidence(EvidenceModel):
     security: SecurityAlertReport
     codeowners: CodeownersReport
     maintenance: MaintenanceReport
+    sonar: SonarReport
     behaviour: tuple[PracticeFinding, ...]
 
 
@@ -1180,9 +1423,15 @@ class TrendReport(EvidenceModel):
 class RepositoryInventoryItem(EvidenceModel):
     """Associate observed repository state with its configured team.
 
-    `codeowners` and `maintenance` default to None so a row stored before they existed still parses,
-    read back as "not collected when repository state was stored" — never as an absent file or an
-    empty branch.
+    `codeowners`, `maintenance`, `sonar` and `sonar_project` default to None so a row stored before
+    they existed still parses, read back as "not collected when repository state was stored" — never
+    as an absent file, an empty branch or a project with nothing measured.
+
+    The two SonarCloud fields are a pair and are read as one: `sonar_project` says which project this
+    repository was attributed to and how, `sonar` says what was measured for it. A resolved project
+    whose measures could not be read carries the first without the second, and a repository no
+    project is mapped to carries a `sonar_project` holding only the reason — which is an answer, and
+    is what keeps it apart from a row collected before this source existed, where both are None.
     """
 
     team_identifier: str
@@ -1191,14 +1440,17 @@ class RepositoryInventoryItem(EvidenceModel):
     security: SecurityAlertEvidence | None = None
     codeowners: CodeownersEvidence | None = None
     maintenance: MaintenanceEvidence | None = None
+    sonar: SonarMeasures | None = None
+    sonar_project: SonarProjectResolution | None = None
     collection: BehaviourProvenance | None = None
 
 
 class RepositoryCollectionCost(EvidenceModel):
     """Report what collecting one repository cost ONE RUN.
 
-    A measurement of the run, not a property of the repository: `requests` counts the GitHub calls
-    issued for it and `elapsed_seconds` the monotonic time they took, so a second run over the same
+    A measurement of the run, not a property of the repository: `requests` counts every call issued
+    for it — GitHub and SonarCloud together, since one repository's collection is one unit of work —
+    and `elapsed_seconds` the monotonic time they took, so a second run over the same
     evidence reports smaller figures because the cache served most of it. That is why this appears in
     the collection report — a per-run summary — and deliberately nowhere in the evidence report,
     which is a reproducible contract.

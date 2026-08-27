@@ -20,8 +20,12 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryInventory,
     RepositoryInventoryItem,
+    SonarProjectMapping,
+    SonarRepositoryProject,
+    SonarResolution,
     SourceCoverage,
     StoredRepositoryState,
+    StoredSonarMapping,
 )
 
 
@@ -87,10 +91,31 @@ def initialize_observations(connection: Connection) -> None:
     """Create the observation history schema when needed.
 
     Its own database and its own initializer, so the cache's "no migrations, delete it and refetch"
-    rule keeps applying to the cache alone. Keyed on the observed instant as well as the family, so
-    one run's rows replace only themselves if it is stored twice — the instant carries microseconds,
-    so two runs never collide — and every earlier run's rows are untouched: appending, not replacing,
-    is the whole point of this file.
+    rule keeps applying to the cache alone. `alert_observations` is keyed on the observed instant as
+    well as the family, so one run's rows replace only themselves if it is stored twice — the instant
+    carries microseconds, so two runs never collide — and every earlier run's rows are untouched:
+    appending, not replacing, is the whole point of this file.
+
+    `sonar_project_map` IS HERE RATHER THAN IN THE CACHE BECAUSE IT IS NOT CHEAPLY REBUILDABLE.
+    Nothing on either side records which repository a SonarCloud project analyses, so each row is
+    resolved by searching GitHub for the commit an analysis ran against — and that search is limited
+    to 10 requests a minute unauthenticated, 30 authenticated. Rebuilding the organisation's 289
+    projects therefore costs something between ten minutes and half an hour of paced calls, so
+    `rm metrics.sqlite3` must not silently shrink the next evidence run's coverage to whichever
+    repositories happen to declare a properties file.
+
+    THIS STRETCHES THIS FILE PAST ITS ORIGINAL NAME: it holds an alert history, which cannot be
+    refetched at any price, and now a mapping which can be refetched but only slowly. The alternative
+    was a third SQLite file for expensive-but-recoverable state, which would have meant a third
+    lifecycle rule for a reader to learn and a third path for a backup to miss. One durable file
+    beside one disposable one is the distinction that actually matters — "deleting the cache is
+    always safe" holds either way — so the map lives with the observations. Both are keyed by
+    `sonar_organization` rather than the GitHub organisation because the two names can differ, and a
+    map built against one SonarCloud organisation says nothing about another's project keys.
+
+    A row whose `repository` is NULL is a project that could not be resolved, and its `detail` says
+    why. It is stored deliberately: a never-analysed project answers the same way every run, and
+    remembering the answer is what stops the next run paying the search quota to learn it again.
     """
     connection.executescript(
         """
@@ -101,6 +126,18 @@ def initialize_observations(connection: Connection) -> None:
             fetched_at TEXT NOT NULL,
             payload TEXT NOT NULL,
             PRIMARY KEY (organization, repository, family, fetched_at)
+        );
+        CREATE TABLE IF NOT EXISTS sonar_project_map (
+            sonar_organization TEXT NOT NULL,
+            project_key TEXT NOT NULL,
+            repository TEXT,
+            analysis_at TEXT,
+            revision TEXT,
+            method TEXT,
+            resolved_at TEXT NOT NULL,
+            detail TEXT,
+            PRIMARY KEY (sonar_organization, project_key),
+            CHECK ((repository IS NULL) <> (detail IS NULL))
         );
         """,
     )
@@ -539,6 +576,191 @@ def load_alert_observations(
     families = tuple(AlertFamily)
     observed = (AlertObservation.model_validate_json(payload) for (payload,) in rows)
     return tuple(sorted(observed, key=lambda item: (families.index(item.family), item.fetched_at)))
+
+
+def sonar_resolution(method: str | None) -> SonarResolution:
+    """Read one stored resolution method back as the enum it was written as.
+
+    A method this build does not know fails loudly rather than being carried through as free text: the
+    report's whole use for it is to say how a mapping was arrived at, and a value nobody can interpret
+    would make a wrong mapping less diagnosable than no mapping at all.
+    """
+    resolutions = {resolution.value: resolution for resolution in SonarResolution}
+    resolution = resolutions.get(method or "")
+    if resolution is None:
+        message = f"could not read the sonar project map: unknown resolution method {method!r}"
+        raise StorageError(message)
+    return resolution
+
+
+def sonar_mapping(
+    project_key: str,
+    repository: str,
+    analysis_at: str | None,
+    revision: str | None,
+    method: str | None,
+) -> SonarProjectMapping:
+    """Rebuild one resolved mapping from its stored columns."""
+    return SonarProjectMapping(
+        project_key=project_key,
+        repository=repository,
+        method=sonar_resolution(method),
+        analysis_at=None if analysis_at is None else datetime.fromisoformat(analysis_at),
+        revision=revision,
+    )
+
+
+StoredMappingRow = tuple[str, str | None, str | None, str | None, str | None, str, str | None]
+"""One `sonar_project_map` row, in the column order both of this module's queries select."""
+
+
+def sonar_mapping_row(row: StoredMappingRow) -> StoredSonarMapping:
+    """Project one `sonar_project_map` row into the mapping it resolved, or the reason it did not."""
+    project_key, repository, analysis_at, revision, method, resolved_at, detail = row
+    return StoredSonarMapping(
+        project_key=project_key,
+        resolved_at=datetime.fromisoformat(resolved_at),
+        mapping=None if repository is None else sonar_mapping(project_key, repository, analysis_at, revision, method),
+        detail=detail,
+    )
+
+
+def resolved_columns(mapping: SonarProjectMapping | None) -> tuple[str | None, str | None, str | None, str | None]:
+    """Flatten one resolution into its four stored columns, all NULL when nothing was resolved.
+
+    The columns of an unresolved project are empty rather than defaulted: a repository name invented
+    here would be read back as an answer by every later lookup.
+    """
+    if mapping is None:
+        return (None, None, None, None)
+    analysis_at = None if mapping.analysis_at is None else mapping.analysis_at.astimezone(UTC).isoformat()
+    return (mapping.repository, analysis_at, mapping.revision, mapping.method.value)
+
+
+def supersedes(stored: datetime | None, incoming: datetime | None) -> bool:
+    """Decide whether an incoming resolution's analysis instant beats the stored one's.
+
+    A stored row with no analysis instant has nothing to defend — it is either absent or a project
+    that could not be resolved — so anything replaces it, including a fresher reason. Otherwise only
+    a STRICTLY NEWER analysis wins: re-running the mapping over stale data must not be able to drag a
+    project that has moved between repositories back to the repository it left, and re-resolving from
+    the same analysis buys nothing to justify a write.
+    """
+    if stored is None:
+        return True
+    return incoming is not None and incoming > stored
+
+
+def record_sonar_mapping(path: Path, sonar_organization: str, resolution: StoredSonarMapping) -> bool:
+    """Upsert one project's mapping into the durable map, reporting whether it was written.
+
+    Written per project as each one resolves rather than once at the end of a run, because the run is
+    paced against a per-minute search quota and may be stopped by a rate limit or by a human at any
+    point: every row already paid for is kept.
+
+    A REFUSED WRITE STILL MOVES `resolved_at`, WHICH IS WHY THE REFUSAL IS NOT SILENT. The skip
+    watermark `already_answered` reads is when the row was last WRITTEN, so leaving it untouched here
+    would make the run that just asked the question look like it never asked: a project whose newest
+    analysis names no findable commit resolves from an older one, the write is refused as not
+    superseding, and the next run sees that same newer analysis still standing above the watermark
+    and re-runs the whole search — every run, forever, against the scarcest quota there is. Touching
+    the instant records "asked, and the stored answer stood", which converges. The answer itself is
+    left exactly as it was.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(connect(path)) as connection, connection:
+            initialize_observations(connection)
+            row = connection.execute(
+                "SELECT analysis_at FROM sonar_project_map WHERE sonar_organization = ? AND project_key = ?",
+                (sonar_organization, resolution.project_key),
+            ).fetchone()
+            stored_at = None if row is None or row[0] is None else datetime.fromisoformat(row[0])
+            if not supersedes(stored_at, resolution.analysis_at):
+                connection.execute(
+                    """
+                    UPDATE sonar_project_map
+                    SET resolved_at = ?
+                    WHERE sonar_organization = ? AND project_key = ?
+                    """,
+                    (
+                        resolution.resolved_at.astimezone(UTC).isoformat(),
+                        sonar_organization,
+                        resolution.project_key,
+                    ),
+                )
+                return False
+            connection.execute(
+                "INSERT OR REPLACE INTO sonar_project_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sonar_organization,
+                    resolution.project_key,
+                    *resolved_columns(resolution.mapping),
+                    resolution.resolved_at.astimezone(UTC).isoformat(),
+                    resolution.detail,
+                ),
+            )
+    except (Error, OSError) as exception:
+        message = f"could not store the sonar project map: {exception}"
+        raise StorageError(message) from exception
+    return True
+
+
+def load_sonar_mapping(path: Path, sonar_organization: str, project_key: str) -> StoredSonarMapping | None:
+    """Load what the map knows about one SonarCloud project, or None when it has never been resolved."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(connect(path)) as connection, connection:
+            initialize_observations(connection)
+            row = connection.execute(
+                """
+                SELECT project_key, repository, analysis_at, revision, method, resolved_at, detail
+                FROM sonar_project_map
+                WHERE sonar_organization = ? AND project_key = ?
+                """,
+                (sonar_organization, project_key),
+            ).fetchone()
+    except (Error, OSError) as exception:
+        message = f"could not read the sonar project map: {exception}"
+        raise StorageError(message) from exception
+    return None if row is None else sonar_mapping_row(row)
+
+
+def repository_project(path: Path, sonar_organization: str, repository: str) -> SonarRepositoryProject | None:
+    """Name the SonarCloud project the map attributes to one repository, with how many claimed it.
+
+    The reverse of `load_sonar_mapping`, and MANY-TO-ONE: the most recently analysed candidate wins,
+    which is what picks the live project out of a duplicate pair whose abandoned twin holds the
+    unsuffixed key. An undated candidate loses to every dated one and never wins on a tie, so the
+    order is total and a repeated call answers the same way.
+
+    The repository name is compared without regard to case, because one side of the comparison is a
+    name GitHub returned and the other is a name a human typed into the configuration file.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(connect(path)) as connection, connection:
+            initialize_observations(connection)
+            rows = connection.execute(
+                """
+                SELECT project_key, repository, analysis_at, revision, method, resolved_at, detail
+                FROM sonar_project_map
+                WHERE sonar_organization = ? AND repository = ? COLLATE NOCASE
+                ORDER BY analysis_at DESC, project_key
+                """,
+                (sonar_organization, repository),
+            ).fetchall()
+    except (Error, OSError) as exception:
+        message = f"could not read the sonar project map: {exception}"
+        raise StorageError(message) from exception
+    if not rows:
+        return None
+    project_key, stored_repository, analysis_at, revision, method, _, _ = rows[0]
+    return SonarRepositoryProject(
+        # The stored spelling, not the queried one: it is the name GitHub itself reported.
+        mapping=sonar_mapping(project_key, stored_repository, analysis_at, revision, method),
+        candidates=len(rows),
+    )
 
 
 def load_repository_state(path: Path, organization: str, repository: str) -> StoredRepositoryState | None:

@@ -56,3 +56,14 @@ teams:
 # repository; a repository listed here gets a series, one omitted reports that it has no date.
 enablement:
   example-service: 2026-06-01
+# The SonarCloud organisation key. Omit it when it matches `organization`, as it does at HMCTS; it is
+# here only because the two names are allowed to differ.
+sonar_organization: hmcts
+# The answer of last resort for a repository whose project the stored `map-sonar` map cannot settle,
+# and the only place a human decides a mapping. Ambiguity is real: `rpx-xui-icp-api` declares
+# `em-icp-api` in its `sonar-project.properties`, and so does `em-icp-api` itself, so at most one of
+# them owns the project and no evidence in either repository says which. Every name must be a
+# configured repository and no key may be empty, because an override silently meaning "unresolved"
+# would read as a decision somebody made.
+sonar_projects:
+  example-service: example-service

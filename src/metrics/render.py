@@ -33,6 +33,11 @@ from metrics.domain import (
     RepositoryPracticeEvidence,
     RepositoryTrend,
     SecurityAlertReport,
+    SonarMeasures,
+    SonarProjectMapping,
+    SonarQualityGate,
+    SonarRating,
+    SonarReport,
     TrendDelta,
     TrendMetric,
     TrendPeriod,
@@ -69,6 +74,24 @@ def instant(moment: datetime) -> str:
 def number(value: float | None) -> str:
     """Format one optional percentile, leaving an unmeasured value visibly absent."""
     return "-" if value is None else f"{value:g}"
+
+
+def percent(value: float | None) -> str:
+    """Format one optional percentage, leaving an unmeasured value visibly absent.
+
+    Absent is a dash and never `0%`: a project whose scanner reported no coverage measurement and one
+    measured at zero coverage are different findings, and only the second is a claim about the code.
+    """
+    return "-" if value is None else f"{value:g}%"
+
+
+def quantity(value: int | None) -> str:
+    """Format one optional count, leaving an uncounted value visibly absent.
+
+    Formatted as an integer rather than through `number`, whose `%g` turns a million lines of code
+    into `1e+06`.
+    """
+    return "-" if value is None else str(value)
 
 
 def yes_or_no(*, value: bool | None) -> str:
@@ -263,6 +286,112 @@ def render_security(report: SecurityAlertReport) -> tuple[str, ...]:
         ),
         *(f"  {family.value} not available: {count.detail}" for family, count in families if count.open is None),
         "  secret-scanning alerts carry no severity, so their severity columns are always zero",
+    )
+
+
+def rating_letter(rating: SonarRating | None) -> str:
+    """Render one SonarCloud rating as the `A`-to-E letter every human reads it as.
+
+    A value this build does not understand prints as the number SonarCloud sent under an explicit
+    "unknown", never as a letter: the domain refuses to derive one, and defaulting to either end of
+    the scale would report an unrecognised rating as the best or the worst there is.
+    """
+    if rating is None:
+        return "-"
+    letter = rating.letter
+    return f"unknown ({rating.value:g})" if letter is None else letter
+
+
+def sonar_project_rows(mapping: SonarProjectMapping | None) -> tuple[tuple[str, str], ...]:
+    """Name the project the block reports and how it was attributed, or nothing where none was.
+
+    The method is printed rather than left implicit because every rung of the resolution ladder has a
+    different strength: a configured override is an instruction, and a stored map's answer is an
+    inference from one commit. A wrong mapping is diagnosable only if the report says which answered.
+    """
+    if mapping is None:
+        return ()
+    return ("Project", mapping.project_key), ("Resolved by", mapping.method.value)
+
+
+def render_gate_conditions(gate: SonarQualityGate | None) -> tuple[str, ...]:
+    """Render every condition behind a gate level, saying in words where a gate reported none.
+
+    The conditions are what make the verdict arguable, exactly as the merge gate prints its rules and
+    the readiness assessment prints what it checked: "the gate failed" is an assertion, and "coverage
+    62.1 against a threshold of 80" is the evidence for it. Both numbers are printed as the strings
+    SonarCloud sent, beside the metric that gives them their meaning — a `1` against a rating and an
+    `80` against coverage are not the same kind of number.
+    """
+    if gate is None:
+        return ()
+    if not gate.conditions:
+        return ("  no gate conditions were reported for this project",)
+    rows = tuple(
+        (
+            condition.metric,
+            condition.comparator,
+            "-" if condition.threshold is None else condition.threshold,
+            "-" if condition.actual is None else condition.actual,
+            condition.level.value,
+        )
+        for condition in gate.conditions
+    )
+    return table(("Metric", "Comparator", "Threshold", "Actual", "Level"), rows)
+
+
+def sonar_measure_rows(measures: SonarMeasures) -> tuple[tuple[str, str], ...]:
+    """Render every measure the project reported, leaving each unreported one visibly absent.
+
+    Every row is printed even when its measure is absent, so the block says which measurements were
+    asked for as well as which came back: a missing row would read as a metric nobody requested.
+    """
+    return (
+        ("Coverage", percent(measures.coverage)),
+        ("Duplicated lines", percent(measures.duplicated_lines_density)),
+        ("Lines of code", quantity(measures.lines_of_code)),
+        ("Violations", quantity(measures.violations)),
+        ("Reliability issues", quantity(measures.reliability_issues)),
+        ("Maintainability issues", quantity(measures.maintainability_issues)),
+        ("Security issues", quantity(measures.security_issues)),
+        ("Security hotspots", quantity(measures.security_hotspots)),
+        ("Reliability rating", rating_letter(measures.reliability_rating)),
+        ("Maintainability rating", rating_letter(measures.maintainability_rating)),
+        ("Security rating", rating_letter(measures.security_rating)),
+        ("Security review rating", rating_letter(measures.security_review_rating)),
+    )
+
+
+def render_sonar(report: SonarReport) -> tuple[str, ...]:
+    """Render the stored SonarCloud state, or the reason there is none to show.
+
+    REPORT-ONLY AND UNGRADED. A failing quality gate imposes no readiness ceiling and carries no
+    label, per the standing rule that a signal becoming visible is not a reason to grade it; the
+    conditions are printed so the gate can be read and argued with rather than obeyed.
+
+    A project that resolved but whose measures could not be read is still NAMED above its reason,
+    because the project a refusal was about is the first thing needed to chase it. A repository no
+    project is mapped to says so — which most of the organisation's repositories do, and an absent
+    block would read as a project whose gate nobody has looked at.
+    """
+    read = "" if report.fetched_at is None else f", read {instant(report.fetched_at)}"
+    title = f"SonarCloud{read}"
+    mapping, measures = report.mapping, report.measures
+    if measures is None:
+        return *heading(title), *pairs(sonar_project_rows(mapping)), f"  not available: {report.detail}"
+    gate = measures.gate
+    analysed = "never" if measures.analysis_at is None else instant(measures.analysis_at)
+    return (
+        *heading(title),
+        *pairs(
+            (
+                *sonar_project_rows(mapping),
+                ("Analysed", analysed),
+                ("Quality gate", "not reported" if gate is None else gate.level.value),
+            ),
+        ),
+        *render_gate_conditions(gate),
+        *pairs(sonar_measure_rows(measures)),
     )
 
 
@@ -470,6 +599,7 @@ def render_repository(
         *render_cohort(evidence.cohort),
         *render_merge_gate(evidence.merge_gate),
         *render_security(evidence.security),
+        *render_sonar(evidence.sonar),
         *render_codeowners(evidence.codeowners),
         *render_maintenance(evidence.maintenance),
         *render_open_pull_requests(evidence.open_pull_requests),

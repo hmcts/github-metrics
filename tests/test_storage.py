@@ -34,9 +34,12 @@ from metrics.domain import (
     ReviewFact,
     ReviewState,
     SecurityAlertEvidence,
+    SonarProjectMapping,
+    SonarResolution,
     SourceCoverage,
     StatusCheck,
     StatusChecksRule,
+    StoredSonarMapping,
 )
 from metrics.storage import (
     StorageError,
@@ -51,12 +54,15 @@ from metrics.storage import (
     load_cached_direct_commit_facts,
     load_cached_pull_request_facts,
     load_repository_state,
+    load_sonar_mapping,
     observation_database,
     prune_cache,
     record_alert_observations,
     record_repository_state,
+    record_sonar_mapping,
     record_source_coverage,
     replace_pull_request_facts,
+    repository_project,
 )
 
 
@@ -422,6 +428,277 @@ def test_alert_observation_storage_translates_sqlite_failures(tmp_path: Path, in
         pytest.raises(StorageError, match="could not read alert observations"),
     ):
         load_alert_observations(path, "hmcts", "nfdiv-case-api", AUGUST)
+
+
+def resolved_mapping(
+    project_key: str,
+    repository: str,
+    day: int,
+    *,
+    method: SonarResolution = SonarResolution.ANALYSIS_REVISION,
+) -> StoredSonarMapping:
+    """Resolve one project to one repository from an analysis made on the given August day."""
+    return StoredSonarMapping(
+        project_key=project_key,
+        resolved_at=datetime(2026, 8, 27, 10, 0, tzinfo=UTC),
+        mapping=SonarProjectMapping(
+            project_key=project_key,
+            repository=repository,
+            method=method,
+            analysis_at=datetime(2026, 8, day, 9, 30, tzinfo=UTC),
+            revision=f"{project_key}-{day}",
+        ),
+    )
+
+
+def test_a_resolved_project_round_trips_through_the_durable_map(tmp_path: Path) -> None:
+    """Store one resolution with the evidence behind it, and read every column of it back."""
+    path = observation_database(tmp_path / "metrics.sqlite3")
+
+    assert record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26)) is True
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.detail is None
+    assert stored.resolved_at == datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+    assert stored.mapping.method is SonarResolution.ANALYSIS_REVISION
+    assert stored.mapping.analysis_at == datetime(2026, 8, 26, 9, 30, tzinfo=UTC)
+    assert stored.mapping.revision == "hmcts.cath-26"
+    # A map built against one SonarCloud organisation says nothing about another's project keys.
+    assert load_sonar_mapping(path, "another-org", "hmcts.cath") is None
+    assert load_sonar_mapping(path, "hmcts", "hmcts.never-resolved") is None
+
+
+def test_an_older_analysis_does_not_overwrite_what_a_newer_one_resolved(tmp_path: Path) -> None:
+    """Refuse a re-run carrying stale analyses, so a project cannot be dragged back where it was.
+
+    `map-sonar` is paced and interruptible, so two runs can overlap and the second can be reading an
+    older analysis than the first stored. Only a strictly newer analysis is allowed to move a project.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+
+    assert record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "old-repository", 20)) is False
+    # The same analysis teaches nothing new, so it is not a write either.
+    assert record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26)) is False
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+
+
+def test_a_refused_write_still_records_that_the_project_was_asked_about(tmp_path: Path) -> None:
+    """Move the skip watermark even when the stored answer stood, so the next run converges.
+
+    `already_answered` skips a project when nothing has been analysed since its row was written. A
+    project whose newest analysis names no findable commit resolves from an OLDER one, so the write
+    is refused — and if `resolved_at` stayed where it was, that newer analysis would still stand
+    above the watermark next run, and the search would be paid for again every run forever.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+    asked_again = StoredSonarMapping(
+        project_key="hmcts.cath",
+        resolved_at=datetime(2026, 8, 28, 11, 0, tzinfo=UTC),
+        mapping=None,
+        detail="no analysis of hmcts.cath names a commit any hmcts repository holds",
+    )
+
+    assert record_sonar_mapping(path, "hmcts", asked_again) is False
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.resolved_at == datetime(2026, 8, 28, 11, 0, tzinfo=UTC)
+    # The answer itself is untouched: only the instant it was last asked about has moved.
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+    assert stored.mapping.analysis_at == datetime(2026, 8, 26, 9, 30, tzinfo=UTC)
+    assert stored.detail is None
+
+
+def test_a_newer_analysis_follows_a_project_that_has_moved_repository(tmp_path: Path) -> None:
+    """Let a newer analysis move a project, because the project is what the analysis describes."""
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 20))
+
+    assert record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service-v2", 26)) is True
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service-v2"
+    assert repository_project(path, "hmcts", "cath-service") is None
+
+
+def test_the_reverse_lookup_prefers_the_live_project_of_a_duplicate_pair(tmp_path: Path) -> None:
+    """Answer a repository with its most recently analysed project, and say how many claimed it.
+
+    SonarCloud has no rename, so a re-created project leaves its abandoned twin behind: on 2026-08-27
+    `rpx-xui-webapp_2` had been analysed the day before while the unsuffixed `rpx-xui-webapp` went
+    quiet in July. The exact name is the wrong answer, and analysis recency is the right one.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("rpx-xui-webapp", "rpx-xui-webapp", 20))
+    record_sonar_mapping(path, "hmcts", resolved_mapping("rpx-xui-webapp_2", "rpx-xui-webapp", 26))
+
+    chosen = repository_project(path, "hmcts", "rpx-xui-webapp")
+
+    assert chosen is not None
+    assert chosen.mapping.project_key == "rpx-xui-webapp_2"
+    assert chosen.candidates == 2
+    # The name a human typed into the configuration file is compared as GitHub compares it.
+    matched = repository_project(path, "hmcts", "RPX-XUI-WebApp")
+    assert matched is not None
+    assert matched.mapping.repository == "rpx-xui-webapp"
+    assert repository_project(path, "hmcts", "nfdiv-case-api") is None
+
+
+def test_an_undated_candidate_never_outranks_an_analysed_one(tmp_path: Path) -> None:
+    """Order a configured override behind any analysed project rather than at random.
+
+    A mapping resolved without an analysis — a configured override — carries no instant to compare,
+    and SQLite would sort it either end depending on the direction. It must lose, so the answer is the
+    project something has actually been measured about.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    undated = StoredSonarMapping(
+        project_key="em-icp-api",
+        resolved_at=datetime(2026, 8, 27, 10, 0, tzinfo=UTC),
+        mapping=SonarProjectMapping(
+            project_key="em-icp-api",
+            repository="rpx-xui-icp-api",
+            method=SonarResolution.CONFIGURED,
+        ),
+    )
+    record_sonar_mapping(path, "hmcts", undated)
+    record_sonar_mapping(path, "hmcts", resolved_mapping("rpx-xui-icp-api", "rpx-xui-icp-api", 26))
+
+    chosen = repository_project(path, "hmcts", "rpx-xui-icp-api")
+
+    assert chosen is not None
+    assert chosen.mapping.project_key == "rpx-xui-icp-api"
+    assert chosen.candidates == 2
+
+
+def test_an_unresolvable_project_is_stored_with_its_reason_and_then_replaced_by_an_answer(tmp_path: Path) -> None:
+    """Remember that a project could not be resolved, so the next run does not pay to learn it again.
+
+    A never-analysed project answers the same way every run, and the search quota is 10 requests a
+    minute. Once it IS analysed, the resolution replaces the reason: a stored row with no analysis
+    instant has nothing to defend.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    unresolved = StoredSonarMapping(
+        project_key="hmcts.never-analysed",
+        resolved_at=datetime(2026, 8, 27, 10, 0, tzinfo=UTC),
+        detail="SonarCloud records no analysis of this project, so there is no commit to resolve it by",
+    )
+
+    assert record_sonar_mapping(path, "hmcts", unresolved) is True
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.never-analysed")
+    assert stored is not None
+    assert stored.mapping is None
+    assert stored.detail == "SonarCloud records no analysis of this project, so there is no commit to resolve it by"
+    # An unresolved project is nobody's project, so it never answers a reverse lookup.
+    assert repository_project(path, "hmcts", "hmcts.never-analysed") is None
+
+    assert record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.never-analysed", "cath-service", 27)) is True
+
+    resolved = load_sonar_mapping(path, "hmcts", "hmcts.never-analysed")
+    assert resolved is not None
+    assert resolved.detail is None
+    assert resolved.mapping is not None
+    assert resolved.mapping.repository == "cath-service"
+
+
+def test_a_resolution_is_never_replaced_by_a_reason(tmp_path: Path) -> None:
+    """Keep a mapping the search quota was spent on when a later run cannot resolve the project.
+
+    Overwriting a resolved row with "no analysis" would spend the quota twice to end up worse off:
+    the commit that resolved it is still in the repository whatever SonarCloud has retained since.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+
+    forgetful = StoredSonarMapping(
+        project_key="hmcts.cath",
+        resolved_at=datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+        detail="none of the 5 most recent analyses names the commit it ran against",
+    )
+    assert record_sonar_mapping(path, "hmcts", forgetful) is False
+
+    stored = load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+
+
+def test_the_sonar_project_map_lives_in_the_durable_file_and_not_the_disposable_cache(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Keep the map where deleting the cache cannot cost it, because rebuilding it is rate limited.
+
+    289 projects against a 10-per-minute commit search is between ten minutes and half an hour of
+    paced calls, so "delete the cache and refetch" must not silently shrink the next evidence run's
+    coverage to whichever repositories happen to declare a properties file.
+    """
+    database = tmp_path / "nested" / "metrics.sqlite3"
+    record_repository_state(database, inventory)
+    record_sonar_mapping(observation_database(database), "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+
+    with closing(connect(database)) as connection:
+        tables = {name for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "sonar_project_map" not in tables
+
+    database.unlink()
+
+    stored = load_sonar_mapping(observation_database(database), "hmcts", "hmcts.cath")
+    assert stored is not None
+    assert stored.mapping is not None
+    assert stored.mapping.repository == "cath-service"
+
+
+def test_a_row_naming_an_unreadable_resolution_method_fails_rather_than_reporting_one(tmp_path: Path) -> None:
+    """Refuse a stored method this build cannot interpret, wherever the row came from.
+
+    The report's whole use for the method is to make a wrong mapping diagnosable, so a row written by
+    a build that knew a method this one does not — or edited by hand — must say so rather than be
+    presented as a resolution nobody can trace.
+    """
+    path = observation_database(tmp_path / "metrics.sqlite3")
+    record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+    with closing(connect(path)) as connection, connection:
+        connection.execute("UPDATE sonar_project_map SET method = 'guessed-from-the-name'")
+
+    with pytest.raises(StorageError, match="unknown resolution method 'guessed-from-the-name'"):
+        load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    with pytest.raises(StorageError, match="unknown resolution method"):
+        repository_project(path, "hmcts", "cath-service")
+
+
+def test_sonar_project_map_storage_translates_sqlite_failures(tmp_path: Path) -> None:
+    """Expose failed map reads and writes through the storage boundary."""
+    path = observation_database(tmp_path / "metrics.sqlite3")
+
+    with (
+        patch("metrics.storage.connect", side_effect=Error("unavailable")),
+        pytest.raises(StorageError, match="could not store the sonar project map"),
+    ):
+        record_sonar_mapping(path, "hmcts", resolved_mapping("hmcts.cath", "cath-service", 26))
+    with (
+        patch("metrics.storage.connect", side_effect=Error("unavailable")),
+        pytest.raises(StorageError, match="could not read the sonar project map"),
+    ):
+        load_sonar_mapping(path, "hmcts", "hmcts.cath")
+    with (
+        patch("metrics.storage.connect", side_effect=Error("unavailable")),
+        pytest.raises(StorageError, match="could not read the sonar project map"),
+    ):
+        repository_project(path, "hmcts", "cath-service")
 
 
 def test_source_coverage_coalesces_intervals_and_reports_gaps() -> None:

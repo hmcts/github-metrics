@@ -16,11 +16,18 @@ from metrics.domain import AvailabilityReason
 
 
 class GitHubError(RuntimeError):
-    """Report a GitHub access failure."""
+    """Report a GitHub access failure.
 
-    def __init__(self, message: str, reason: AvailabilityReason) -> None:
+    The status is carried alongside the reason, and is None for a failure no HTTP response caused,
+    so that a caller who knows what ONE endpoint means by ONE status can read it without that
+    meaning being asserted for every other endpoint. `reason` stays the classification everything
+    else grades on.
+    """
+
+    def __init__(self, message: str, reason: AvailabilityReason, status: int | None = None) -> None:
         super().__init__(message)
         self.reason = reason
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,17 @@ class GitHubClient:
             AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
         ),
     }
+    """How one HTTP status is classified for EVERY endpoint this client reads.
+
+    422 is deliberately absent. `/repos/{org}/{repo}/commits/{sha}` answers it for a SHA the
+    repository does not hold, which refutes a candidate mapping — but that meaning belongs to that
+    one endpoint, and classifying it here would give it to all of them. Two readers turn
+    `NOT_FOUND_OR_INACCESSIBLE` into an affirmative observation: `collect_classic_merge_gate` reads
+    it as "the branch is unprotected" and `open_alerts` as "the family is not enabled". A 422 from
+    either — a malformed query, a spammed endpoint — would then be published as a fact nobody
+    observed. It stays a collection failure here and is read as a refutation only by the call that
+    knows what it means, through `GitHubError.status`.
+    """
 
     def __init__(
         self,
@@ -368,5 +386,5 @@ class GitHubClient:
                 response.status_code,
                 (f"GitHub returned HTTP {response.status_code}", AvailabilityReason.COLLECTION_FAILED),
             )
-            raise GitHubError(message, reason) from exception
+            raise GitHubError(message, reason, response.status_code) from exception
         return response

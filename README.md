@@ -34,12 +34,16 @@ teams:
       - example-service
 enablement:
   example-service: 2026-06-01
+sonar_organization: hmcts
+sonar_projects:
+  example-service: example-service
 ```
 
 Relative database paths are resolved from the directory containing the configuration file. **`database` names two
 files**: the cache itself, and an observation history beside it — `metrics.sqlite3` gets `metrics-observations.sqlite3`.
 The cache is disposable and deleting it costs only a refetch; the observation file holds the open security-alert counts
-each `collect` run recorded, which cannot be refetched at all, and is therefore kept out of the file it is safe to
+each `collect` run recorded, which cannot be refetched at all, and the SonarCloud project map, which can be refetched
+but only at tens of minutes of rate-limited calls — so both are kept out of the file it is safe to
 delete. `metrics prune` never touches it. Unknown keys and unsupported
 configuration versions are rejected before any collection starts. `github_team_slugs` may optionally list GitHub teams
 when the token can access that data; repository ownership remains authoritative.
@@ -50,7 +54,22 @@ bare `2026-06-01` is UTC midnight, a naive `2026-06-01T09:30:00` is UTC, and an 
 governs every instant in the system. The JSON reports the instant as written, offset and all; `--format report` prints
 the same instant converted to UTC, as it prints every other instant. Every name must be a configured repository; a date for an unconfigured one is a
 configuration error naming the repository, because a typo would otherwise be indistinguishable from a forgotten entry. A
-repository with no date is reported as having none rather than being anchored to a guess.
+repository with no date is reported as having none rather than being anchored to a guess. That name check runs wherever
+there is a cohort to check against, so it is skipped — not weakened — by a policy file loaded on its own for `map-sonar`
+or `prune`, which owns no repository; every run that reports enablement loads a team file and is checked.
+
+`sonar_organization` names the **SonarCloud** organisation whose projects are read. Omit it when it
+matches `organization`, as it does at HMCTS; it exists only because the two names are allowed to differ, and a map
+built against one SonarCloud organisation says nothing about another's project keys.
+
+`sonar_projects` maps a configured repository to its SonarCloud project key, and is the **answer of last resort** for a
+repository the stored map cannot settle — the only place a human decides a mapping, and the one rung of the resolution
+ladder that beats every observation. Ambiguity is real rather than hypothetical: `rpx-xui-icp-api` declares `em-icp-api`
+in its `sonar-project.properties`, and so does `em-icp-api` itself, so at most one of them owns the project and no
+evidence in either repository says which. Every name must be a configured repository, for the same reason `enablement`
+insists on it — a typo would otherwise read as "no project configured", indistinguishable from having forgotten the
+entry — and no key may be empty, because an override silently meaning "unresolved" would read as a decision somebody
+made. See [SonarCloud](#sonarcloud-quality-evidence) below for how a repository is mapped when no override is given.
 
 ### Splitting the configuration across several files
 
@@ -86,7 +105,11 @@ uv run metrics evidence --config policy.yaml --config family.yaml
 
 **The split is about how the text is stored, and nothing below it knows about it.** The files are concatenated and
 parsed once, so a file is not a configuration in its own right and is never checked as one: `version`, `organization`,
-`database`, and `teams` may come from whichever file states them, and neither file above loads alone. Everything the
+`database`, and `teams` may come from whichever file states them, and the team file above does not load alone.
+**The policy file does load alone, for the commands that read no repository cohort**: `map-sonar` resolves every project
+the SonarCloud organisation lists and `prune` deletes stale cache rows, so neither needs a `teams:` section and neither
+asks for one. The commands that do report the cohort — `collect`, `doctor`, `evidence`, `trend` — refuse without it and
+say which command needed it. Everything the
 schema does is unchanged — the same keys, the same defaults, the same rejection of an unknown key — because by the time
 it runs there is only one document. A key given twice is resolved by YAML as it always was, with the last occurrence
 winning, so a whole block is replaced rather than merged into. A relative `database` is resolved from the directory of
@@ -104,6 +127,7 @@ uv run poe check
 ```bash
 export GH_TOKEN=your-fine-grained-personal-access-token
 uv run metrics doctor --config metrics.example.yaml
+uv run metrics map-sonar --config metrics.example.yaml
 uv run metrics collect --config metrics.example.yaml --from 2026-05-01 --to 2026-08-01
 uv run metrics evidence --config metrics.example.yaml
 uv run metrics evidence --config metrics.example.yaml --format report
@@ -122,6 +146,14 @@ series of windows anchored to each repository's enablement date, through the sam
 `doctor` validates the configuration and verifies that the token can read every configured repository. It does not query
 GitHub's repository-team endpoint, which is unavailable to fine-grained personal access tokens.
 
+`map-sonar` resolves which GitHub repository each SonarCloud project analyses and stores the answer, so that `collect`
+can read a repository's quality state without having to work out whose it is. It is **run by hand, periodically — not on
+every `collect`** — and the reason is a rate limit: nothing on either side records the link, so each project is resolved
+by searching GitHub for the commit its latest analysis ran against, and that search is limited to **10 requests a minute
+unauthenticated and 30 authenticated**. The `hmcts` organisation lists 289 projects, so a full rebuild is tens of
+minutes of paced calls, which is not a cost worth paying on every collection to refresh a map that only changes when a
+project is analysed against a different repository. See [SonarCloud](#sonarcloud-quality-evidence) below.
+
 `collect` takes the same window options as `evidence` and emits a collection report: the resolved window, each
 repository's current state, and what the window fetched or reused. Per repository, `collection` reports whether stable
 history was `fetched`, `partially_reused`, or `fully_reused`, how many stable intervals were requested, the refreshed
@@ -135,8 +167,9 @@ diffable and a diff shows what actually changed. It is presentation, not aggrega
 team's repositories are reduced to one label. `costs` is the one exception, ordered slowest first because it answers a
 different question.
 
-`costs` reports what the run spent per repository — `requests`, the GitHub calls issued for it across both collection
-phases, and `elapsed_seconds`, measured on a monotonic clock — ordered **slowest first**, because the question it
+`costs` reports what the run spent per repository — `requests`, every call issued for it across both collection phases,
+GitHub and SonarCloud alike, since one repository's collection is one unit of work — and
+`elapsed_seconds`, measured on a monotonic clock — ordered **slowest first**, because the question it
 answers is which repository dominates a run. A repository whose collection failed is reported too: the calls and the
 seconds spent before the failure are the cost of the attempt. Unlike everything else `collect` emits, these figures
 describe the run rather than the repository, so two runs over identical evidence will differ — the second reuses the
@@ -145,9 +178,10 @@ stored: nothing in the cache remembers what a previous run cost.
 
 Not everything `collect` fetches is windowed. Pull-request, review, and direct-commit facts are historical and
 accumulate in the cache.
-Repository metadata, merge-gate state, CODEOWNERS presence and default-branch maintenance instants are *current-state*
+Repository metadata, merge-gate state, CODEOWNERS presence, default-branch maintenance instants and the SonarCloud
+measures of the project a repository maps to are *current-state*
 sources: GitHub cannot report what branch protection was three months ago, and the question is whether the gate protects
-merges now. They are therefore always fetched fresh and stored as one latest row per repository, replacing the previous
+merges now. SonarCloud is the first current-state source that is not GitHub, and it obeys the same rules. They are therefore always fetched fresh and stored as one latest row per repository, replacing the previous
 one. So `collect --from X --to Y` means: fetch windowed
 sources for `[X, Y)`, and refresh current state as of now.
 
@@ -310,7 +344,8 @@ Three details matter when reading it:
   Advanced Security being disabled, and only the response text tells those apart.
 
 Collection costs one call per family plus one more per additional hundred open alerts. Measured against
-hmcts/cath-service on 2026-08-14: three calls, against a whole-repository collection of roughly fourteen. Like the merge
+hmcts/cath-service on 2026-08-14: three calls, against a whole-repository GitHub collection of roughly fourteen. That
+denominator predates SonarCloud, which adds its own calls on top — see [SonarCloud](#sonarcloud-quality-evidence). Like the merge
 gate the block is display only — nothing scores it, because no open-alert threshold has an owner — and it appears in the
 practice report rather than in a `--metric` drill-down.
 
@@ -352,6 +387,67 @@ unknown reasons spelled out beneath it.
 
 If the bundled query fails, both blocks report the shared reason, one failure is recorded per block, and the run exits
 `3` — the same shape as a refused alert family. A missing CODEOWNERS file is never a failure.
+
+### SonarCloud quality evidence
+
+Each repository also carries a `sonar` block: the quality state of the SonarCloud project that repository maps to. It
+reports the project key, **how the project was resolved**, when it was last analysed, the quality gate level with
+**every condition behind it** — metric, comparator, threshold, actual value and level — and the measures beside them:
+coverage, duplicated lines, lines of code, total violations, the reliability, maintainability and security issue counts,
+security hotspots, and the four ratings as `A`–`E` letters. Like the merge gate it is **current state**, stored
+latest-only by `collect` and served with the `fetched_at` instant it was read, so `--offline` shows the last
+collection's answer. SonarCloud is read anonymously; setting `SONAR_TOKEN` or `SONARCLOUD_TOKEN` widens the project
+listing to private projects.
+
+It is **report-only and ungraded**. A failing quality gate imposes no readiness ceiling and carries no label, per the
+standing rule that a signal becoming visible is not a reason to grade it. The conditions are printed in full anyway, as
+the merge gate prints its rules: "the gate failed" is an assertion, and `coverage < 80, actual 62.1` is the evidence for
+it. An absent measure prints as a dash and never as zero, and every row is printed even when its measure is missing, so
+the block says which measurements were asked for as well as which came back.
+
+**Which project a repository maps to is the hard part**, because nothing on either side records it. It is resolved in
+this order, and the rung that answered is reported as `Resolved by`, because a wrong mapping is only diagnosable if the
+report says which one produced it:
+
+| `Resolved by` | how |
+| --- | --- |
+| `configured` | the `sonar_projects` override — a human's instruction, which beats every observation |
+| `declared_confirmed_by_map` | the repository's `sonar-project.properties` key, and the stored map agrees it is this repository's |
+| `declared_confirmed_by_commit` | the declared key, confirmed because this repository holds the commit that project was last analysed against |
+| `stored_map` | the map `map-sonar` built, resolving the project through its latest analysis commit |
+
+A declared key is a **hypothesis, never an answer**, and is always tested. Measured across 3,372 hmcts repositories: 240
+declare a key, 123 of those name no project SonarCloud lists, and 69 collide — `rpe-expressjs-template` is declared by 14
+repositories scaffolded from that template. So a declaration the map attributes to a *different* repository is treated as
+refuted, and resolution falls through to the map's own answer. Matching repositories to projects **by name** was measured
+too, and rejected: it was wrong for 6 of the 70 repositories where it answered, and three of those six preferred an
+abandoned project to the live one, because SonarCloud has no rename and `rpx-xui-webapp_2` is the project still being
+analysed. `docs/architecture.md` records the full measurement.
+
+Two projects may legitimately map to one repository — those same duplicate pairs — so the repository's project is the
+candidate with the **most recent analysis**, which picks the live project in every measured pair, and `map-sonar` warns
+with both keys so a human can see there was a choice.
+
+**A repository no project is mapped to is an observation, not a failure.** The block says so, no failure is recorded, and
+the run exits `0` — most of the organisation is in that state, and exiting `3` for it would empty the status of meaning.
+That is deliberately distinct from "SonarCloud measures were not collected when repository state was stored", which is a
+gap `collect` closes. A SonarCloud or GitHub call that actually **failed** while resolving or measuring records one
+failure against the `sonar` evidence kind and exits `3`. SonarCloud calls are counted in the `costs` table beside the
+GitHub ones, so a repository's collection stays one measurable figure.
+
+`map-sonar` stores every row as it resolves it, so a run stopped by a rate limit keeps everything it already paid for,
+and skips any project that has not been analysed since its stored row was written — nothing has happened that could
+change the answer, so there is nothing to learn and no call to spend. It summarises what it learned: projects listed,
+resolved, unchanged, never analysed, unresolvable, failed, and repositories now mapped. It exits `0` when every project
+was answered, `3` when at least one call failed or a rate limit stopped the run, and `1` when the run produced nothing
+usable: the organisation lists nothing, the listing itself was refused, the durable map could not be read or written, or
+no project was answered at all. A never-analysed or unresolvable project **is** answered — it is stored with its reason,
+so the next run does not spend the scarcest quota in the system asking the same hopeless question again.
+
+Two limitations follow from all of this rather than being defects. A repository whose project has not been analysed
+recently enough for SonarCloud to still hold the analysis, and which carries no properties file, cannot be mapped until
+`map-sonar` runs again after an analysis; the configured override is the escape hatch. And `map-sonar` must be run
+periodically, because a project that moves to a different repository keeps reporting the old one until it does.
 
 ### Readiness assessment
 
@@ -669,7 +765,9 @@ The report prints, per repository: a header with the resolved window and its pro
 **every** condition behind it, blocking, caution and clear alike; the cohort, the direct commits, the total merges
 those two add up to, and who was excluded; the merge gate
 with the instant it was read; the open security alerts by family and severity, or the reason a family could not be
-read; the CODEOWNERS files found with their sizes and whether GitHub recognises the location, or `absent`, or the reason
+read; the SonarCloud project with how it was resolved, its analysis instant, its quality gate and every condition behind
+it, and its measures and ratings — or the reason no project is mapped; the CODEOWNERS files found with their sizes and
+whether GitHub recognises the location, or `absent`, or the reason
 the state is unavailable; the maintenance instants (last commit, last human commit, search bound) with the 6/12/24-month
 window table and the reason beneath any `unknown`; the open pull-request counts with the instant they were fetched, or
 the reason they are unavailable; one row per metric; the cohort's review events counted by state; and the `unreviewed-merge`
@@ -721,6 +819,27 @@ Security alerts, read 2026-08-02T09:30Z
   secret-scanning     2         0     0       0    0
   code-scanning not available: GitHub permission denied
   secret-scanning alerts carry no severity, so their severity columns are always zero
+
+SonarCloud, read 2026-08-02T09:30Z
+----------------------------------
+  Project       rpx-xui-webapp_2
+  Resolved by   stored_map
+  Analysed      2026-08-01T04:12Z
+  Quality gate  OK
+  Metric        Comparator  Threshold  Actual  Level
+  new_coverage          LT         80    91.4     OK
+  Coverage                74.2%
+  Duplicated lines        1.5%
+  Lines of code           1234567
+  Violations              318
+  Reliability issues      12
+  Maintainability issues  280
+  Security issues         3
+  Security hotspots       7
+  Reliability rating      C
+  Maintainability rating  A
+  Security rating         B
+  Security review rating  E
 
 Open pull requests, read 2026-08-02T09:30Z
 ------------------------------------------

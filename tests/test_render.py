@@ -39,6 +39,14 @@ from metrics.domain import (
     RepositoryTrend,
     SecurityAlertEvidence,
     SecurityAlertReport,
+    SonarGateLevel,
+    SonarMeasures,
+    SonarProjectMapping,
+    SonarQualityGate,
+    SonarQualityGateCondition,
+    SonarRating,
+    SonarReport,
+    SonarResolution,
     StatusCheck,
     StatusChecksRule,
     TrendDelta,
@@ -250,6 +258,70 @@ def maintenance_report() -> MaintenanceReport:
     )
 
 
+def sonar_report() -> SonarReport:
+    """Build the SonarCloud report of a repository no SonarCloud project is mapped to."""
+    return SonarReport(
+        fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        detail="no SonarCloud project is mapped to this repository",
+    )
+
+
+def sonar_mapping(**overrides: object) -> SonarProjectMapping:
+    """Attribute the live half of a duplicate project pair to the repository the fixtures report."""
+    mapping = SonarProjectMapping(
+        project_key="rpx-xui-webapp_2",
+        repository="cath-service",
+        method=SonarResolution.STORED_MAP,
+        analysis_at=datetime(2026, 8, 1, 4, 12, tzinfo=UTC),
+        revision="9f1c0d4a2b6e8f70d1c3a5b7e9f1c0d4a2b6e8f7",
+    )
+    return mapping.model_copy(update=overrides)
+
+
+def sonar_measures(**overrides: object) -> SonarMeasures:
+    """Build a fully measured project whose gate passed, overriding selected measures."""
+    measures = SonarMeasures(
+        project_key="rpx-xui-webapp_2",
+        analysis_at=datetime(2026, 8, 1, 4, 12, tzinfo=UTC),
+        gate=SonarQualityGate(
+            level=SonarGateLevel.OK,
+            conditions=(
+                SonarQualityGateCondition(
+                    metric="new_coverage",
+                    comparator="LT",
+                    threshold="80",
+                    actual="91.4",
+                    level=SonarGateLevel.OK,
+                ),
+            ),
+        ),
+        coverage=74.2,
+        duplicated_lines_density=1.5,
+        # Over a million, so a `%g` rendering would print it as an exponent.
+        lines_of_code=1234567,
+        violations=318,
+        reliability_issues=12,
+        maintainability_issues=280,
+        security_issues=3,
+        security_hotspots=7,
+        reliability_rating=SonarRating(value=3.0),
+        maintainability_rating=SonarRating(value=1.0),
+        security_rating=SonarRating(value=2.0),
+        security_review_rating=SonarRating(value=5.0),
+    )
+    return measures.model_copy(update=overrides)
+
+
+def mapped_sonar_report(**overrides: object) -> SonarReport:
+    """Build the stored SonarCloud state of a repository whose project resolved and was measured."""
+    report = SonarReport(
+        fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        mapping=sonar_mapping(),
+        measures=sonar_measures(),
+    )
+    return report.model_copy(update=overrides)
+
+
 def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
     """Build one repository's practice evidence, overriding selected fields."""
     evidence = RepositoryPracticeEvidence(
@@ -264,6 +336,7 @@ def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
         security=security_report(),
         codeowners=codeowners_report(),
         maintenance=maintenance_report(),
+        sonar=sonar_report(),
         behaviour=(finding(),),
     )
     return evidence.model_copy(update=overrides)
@@ -309,6 +382,7 @@ def test_every_section_of_the_practice_report_is_rendered(report: str) -> None:
         "Cohort",
         "Merge gate, read 2026-08-02T09:30Z",
         "Security alerts, read 2026-08-02T09:30Z",
+        "SonarCloud, read 2026-08-02T09:30Z",
         "CODEOWNERS, read 2026-08-02T09:30Z",
         "Maintenance, read 2026-08-02T09:30Z",
         "Open pull requests, read 2026-08-02T09:30Z",
@@ -708,6 +782,185 @@ def test_uncollected_maintenance_state_says_so_rather_than_vanishing() -> None:
 
     assert "\nMaintenance\n-----------\n" in rendered
     assert "  not available: no repository state has been collected; run metrics collect" in rendered
+
+
+def sonar_rendering(report: SonarReport) -> str:
+    """Render the practice report of a repository carrying one SonarCloud report."""
+    evidence = practice_evidence(sonar=report)
+    return render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+
+def test_sonar_reports_the_project_it_resolved_its_gate_and_every_measure() -> None:
+    """Head the block with the project and the rung that answered, then the gate and its measures.
+
+    The resolution method is printed because a wrong mapping is otherwise mysterious: a configured
+    override and a stored map's inference from one commit are not the same strength of answer.
+    """
+    rendered = sonar_rendering(mapped_sonar_report())
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[0].split(maxsplit=1) == ["Project", "rpx-xui-webapp_2"]
+    assert block[1].split(maxsplit=2) == ["Resolved", "by", "stored_map"]
+    assert block[2].split(maxsplit=1) == ["Analysed", "2026-08-01T04:12Z"]
+    assert block[3].split(maxsplit=2) == ["Quality", "gate", "OK"]
+    assert block[4].split() == ["Metric", "Comparator", "Threshold", "Actual", "Level"]
+    assert block[5].split() == ["new_coverage", "LT", "80", "91.4", "OK"]
+    assert block[6].split(maxsplit=1) == ["Coverage", "74.2%"]
+    assert block[7].split(maxsplit=2) == ["Duplicated", "lines", "1.5%"]
+    assert block[8].split(maxsplit=3) == ["Lines", "of", "code", "1234567"]
+    assert block[9].split(maxsplit=1) == ["Violations", "318"]
+    assert block[10].split(maxsplit=2) == ["Reliability", "issues", "12"]
+    assert block[11].split(maxsplit=2) == ["Maintainability", "issues", "280"]
+    assert block[12].split(maxsplit=2) == ["Security", "issues", "3"]
+    assert block[13].split(maxsplit=2) == ["Security", "hotspots", "7"]
+
+
+def test_the_four_ratings_render_as_the_letters_they_name() -> None:
+    """Render each 1-to-5 rating as the `A`-to-`E` letter every SonarCloud reader knows it by."""
+    rendered = sonar_rendering(mapped_sonar_report())
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[14].split(maxsplit=2) == ["Reliability", "rating", "C"]
+    assert block[15].split(maxsplit=2) == ["Maintainability", "rating", "A"]
+    assert block[16].split(maxsplit=2) == ["Security", "rating", "B"]
+    assert block[17].split(maxsplit=3) == ["Security", "review", "rating", "E"]
+
+
+def test_a_rating_off_the_scale_is_not_reported_as_a_letter() -> None:
+    """Print a rating this build does not understand as the number it was sent, marked unknown.
+
+    Defaulting to `A` would report an unrecognised rating as the best there is, and defaulting to `E`
+    as the worst; neither is what SonarCloud said.
+    """
+    measures = sonar_measures(reliability_rating=SonarRating(value=7.0))
+    rendered = sonar_rendering(mapped_sonar_report(measures=measures))
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[14].split(maxsplit=2) == ["Reliability", "rating", "unknown (7)"]
+
+
+def test_a_failing_gate_condition_is_shown_beside_the_threshold_it_missed() -> None:
+    """Print every condition behind a failure, so the verdict can be argued with rather than obeyed.
+
+    Nothing here is graded — the failure imposes no readiness label — so the conditions are the whole
+    of what the block offers a reader deciding whether the gate is measuring anything they care about.
+    """
+    gate = SonarQualityGate(
+        level=SonarGateLevel.ERROR,
+        conditions=(
+            SonarQualityGateCondition(
+                metric="new_coverage",
+                comparator="LT",
+                threshold="80",
+                actual="62.1",
+                level=SonarGateLevel.ERROR,
+            ),
+            SonarQualityGateCondition(
+                metric="new_duplicated_lines_density",
+                comparator="GT",
+                threshold="3",
+                actual="0.4",
+                level=SonarGateLevel.OK,
+            ),
+            SonarQualityGateCondition(
+                metric="new_security_rating",
+                comparator="GT",
+                threshold="1",
+                level=SonarGateLevel.ERROR,
+            ),
+        ),
+    )
+    rendered = sonar_rendering(mapped_sonar_report(measures=sonar_measures(gate=gate)))
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[3].split(maxsplit=2) == ["Quality", "gate", "ERROR"]
+    assert block[5].split() == ["new_coverage", "LT", "80", "62.1", "ERROR"]
+    assert block[6].split() == ["new_duplicated_lines_density", "GT", "3", "0.4", "OK"]
+    assert block[7].split() == ["new_security_rating", "GT", "1", "-", "ERROR"]
+
+
+def test_a_never_analysed_project_says_so_rather_than_printing_an_instant() -> None:
+    """Report a listed but never-analysed project as one, gate level and all — 14 of 289 are.
+
+    The project exists and nothing has been measured against it, which is a third answer and not a
+    failure, so the gate's own `NONE` level is printed with a line saying nothing sits behind it.
+    """
+    measures = sonar_measures(
+        analysis_at=None,
+        gate=SonarQualityGate(level=SonarGateLevel.NONE),
+    )
+    rendered = sonar_rendering(mapped_sonar_report(measures=measures))
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[2].split(maxsplit=1) == ["Analysed", "never"]
+    assert block[3].split(maxsplit=2) == ["Quality", "gate", "NONE"]
+    assert block[4] == "  no gate conditions were reported for this project"
+
+
+def test_every_absent_measure_renders_as_a_dash_rather_than_a_zero() -> None:
+    """Leave a measure SonarCloud returned no value for visibly absent, in every row of the block.
+
+    A rendered `0.0%` coverage would be a claim about the code where the measurement is the thing
+    that is missing, and every row is still printed so the block says what was asked for.
+    """
+    rendered = sonar_rendering(mapped_sonar_report(measures=SonarMeasures(project_key="rpx-xui-webapp_2")))
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[3].split(maxsplit=2) == ["Quality", "gate", "not reported"]
+    assert [line.split()[-1] for line in block[4:]] == ["-"] * len(block[4:])
+    assert len(block[4:]) == 12
+
+
+@pytest.mark.parametrize(
+    ("fetched_at", "detail"),
+    [
+        (None, "the observations database at metrics.sqlite3 could not be read"),
+        (None, "no repository state has been collected; run metrics collect"),
+        (
+            datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+            "SonarCloud measures were not collected when repository state was stored; run metrics collect",
+        ),
+        (datetime(2026, 8, 2, 9, 30, tzinfo=UTC), "no SonarCloud project is mapped to this repository"),
+    ],
+)
+def test_each_reason_for_having_no_sonar_evidence_is_stated_rather_than_vanishing(
+    fetched_at: datetime | None,
+    detail: str,
+) -> None:
+    """Keep the block and print its reason, because an absent one would read as a gate nobody checked.
+
+    Most of the organisation's repositories have no SonarCloud project at all, and that answer has to
+    be distinguishable from a report that never looked.
+    """
+    rendered = sonar_rendering(SonarReport(fetched_at=fetched_at, detail=detail))
+
+    read = "" if fetched_at is None else ", read 2026-08-02T09:30Z"
+    title = f"SonarCloud{read}"
+    assert f"\n{title}\n{'-' * len(title)}\n" in rendered
+    assert f"  not available: {detail}" in rendered
+
+
+def test_a_resolved_project_whose_measures_failed_is_still_named_above_the_reason() -> None:
+    """Name the project a refusal was about, which is the first thing needed to chase it."""
+    rendered = sonar_rendering(
+        SonarReport(
+            fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+            mapping=sonar_mapping(method=SonarResolution.CONFIGURED),
+            detail="SonarCloud refused the measures request: HTTP 503",
+        ),
+    )
+
+    block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
+    assert block[0].split(maxsplit=1) == ["Project", "rpx-xui-webapp_2"]
+    assert block[1].split(maxsplit=2) == ["Resolved", "by", "configured"]
+    assert block[2] == "  not available: SonarCloud refused the measures request: HTTP 503"
+
+
+def test_the_sonar_block_sits_with_the_other_stored_current_state() -> None:
+    """Keep the stored current-state blocks together, between the security alerts and CODEOWNERS."""
+    rendered = sonar_rendering(mapped_sonar_report())
+
+    assert rendered.index("\nSecurity alerts") < rendered.index("\nSonarCloud") < rendered.index("\nCODEOWNERS")
 
 
 def population_teams() -> dict[str, str]:

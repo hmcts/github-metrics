@@ -27,6 +27,7 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryPracticeEvidence,
     SecurityAlertReport,
+    SonarReport,
     SourceCoverage,
     StoredRepositoryState,
     WindowProvenance,
@@ -76,19 +77,23 @@ class RepositoryEvidence(CachedBehaviourFacts):
     def practices(
         self,
         rules: Iterable[PracticeRule],
-        merge_gate: MergeGateReport,
         policy: ReadinessPolicy,
         open_pull_requests: OpenPullRequestReport,
-        security: SecurityAlertReport,
-        codeowners: CodeownersReport,
-        maintenance: MaintenanceReport,
+        current_state: StoredReports,
     ) -> RepositoryPracticeEvidence:
         """Assess readiness and evaluate every enabled practice rule beside the collected merge gate.
 
+        The stored blocks arrive together in `current_state` because they ARE one thing: five
+        projections of the single stored row this repository's last collection wrote. Passing them
+        one by one grew a parameter for every source added and let a call site pair a repository's
+        gate with another's alerts.
+
         `security` is reported but grades nothing: no open-alert threshold has an owner, and the same
         reasoning keeps description quality out of the label (architecture.md, "Readiness assessment").
-        `codeowners` and `maintenance` are reported and ungraded for the same reason: a signal
-        becoming visible is not a reason to grade it.
+        CODEOWNERS, maintenance and SonarCloud are reported and ungraded for the same reason: a
+        signal becoming visible is not a reason to grade it. A failing SonarCloud quality gate is the
+        sharpest example — it is somebody else's threshold, set per project, and adopting it here
+        would import a judgment this tool did not make.
         """
         return RepositoryPracticeEvidence(
             repository=self.repository,
@@ -96,12 +101,13 @@ class RepositoryEvidence(CachedBehaviourFacts):
             ends_at=self.ends_at,
             provenance=self.provenance,
             cohort=self.cohort,
-            assessment=policy.assess(self, merge_gate) if policy.enabled else None,
-            merge_gate=merge_gate,
+            assessment=policy.assess(self, current_state.merge_gate) if policy.enabled else None,
+            merge_gate=current_state.merge_gate,
             open_pull_requests=open_pull_requests,
-            security=security,
-            codeowners=codeowners,
-            maintenance=maintenance,
+            security=current_state.security,
+            codeowners=current_state.codeowners,
+            maintenance=current_state.maintenance,
+            sonar=current_state.sonar,
             behaviour=tuple(finding for rule in rules if rule.enabled for finding in rule.findings(self)),
         )
 
@@ -159,6 +165,23 @@ class StoredState:
 
     latest: StoredRepositoryState | None = None
     unreadable: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredReports:
+    """Hold every current-state block one stored row projects into, for one repository.
+
+    Assembled once by `stored_reports` and handed to `practices` whole. The blocks travel together
+    because they all describe the same observation instant: a reader comparing a merge gate against
+    the CODEOWNERS beside it is entitled to assume both were read from the same row, and separate
+    arguments made that an assumption rather than a fact.
+    """
+
+    merge_gate: MergeGateReport
+    security: SecurityAlertReport
+    codeowners: CodeownersReport
+    maintenance: MaintenanceReport
+    sonar: SonarReport
 
 
 def stored_repository_state(configuration: Configuration, repository: str) -> StoredState:
@@ -223,6 +246,52 @@ def stored_codeowners(stored: StoredState) -> CodeownersReport:
             detail="CODEOWNERS presence was not collected when repository state was stored; run metrics collect",
         )
     return CodeownersReport(fetched_at=stored.latest.fetched_at, codeowners=stored.latest.state.codeowners)
+
+
+def stored_sonar(stored: StoredState) -> SonarReport:
+    """Report the SonarCloud measures the last collection stored, or state why there are none.
+
+    THE ANSWER IS READ FROM THE STORED RESOLUTION, NOT FROM THE ABSENCE OF MEASURES. "No SonarCloud
+    project is mapped to this repository" is an answer, and the answer for most of the organisation;
+    "measures were not collected when this row was stored" is a gap that `metrics collect` closes.
+    Both leave `sonar` unset, so telling them apart means reading `sonar_project`: the collection
+    stored one carrying its reason for the first, and a row written by a build predating this source —
+    or by a run configured to read no SonarCloud state — has neither field.
+
+    A resolved project whose measures could not be read reports the project ANYWAY, beside the reason:
+    naming the project a failed call was about is more useful than withholding it.
+    """
+    if stored.unreadable is not None:
+        return SonarReport(detail=stored.unreadable)
+    if stored.latest is None:
+        return SonarReport(detail="no repository state has been collected; run metrics collect")
+    resolution = stored.latest.state.sonar_project
+    if resolution is None:
+        return SonarReport(
+            fetched_at=stored.latest.fetched_at,
+            detail="SonarCloud measures were not collected when repository state was stored; run metrics collect",
+        )
+    measures = stored.latest.state.sonar
+    if measures is None:
+        return SonarReport(
+            fetched_at=stored.latest.fetched_at,
+            mapping=resolution.mapping,
+            # A resolution names a project or says why it names none, so one of the two is always
+            # here; the fallback covers only a stored row this build did not write.
+            detail=resolution.detail or "SonarCloud measured nothing for this project",
+        )
+    return SonarReport(fetched_at=stored.latest.fetched_at, mapping=resolution.mapping, measures=measures)
+
+
+def stored_reports(stored: StoredState) -> StoredReports:
+    """Project one stored row into every current-state block a repository's report carries."""
+    return StoredReports(
+        merge_gate=stored_merge_gate(stored),
+        security=stored_security_alerts(stored),
+        codeowners=stored_codeowners(stored),
+        maintenance=stored_maintenance(stored),
+        sonar=stored_sonar(stored),
+    )
 
 
 def human_window_answer(evidence: MaintenanceEvidence, cutoff: datetime) -> tuple[bool | None, str | None]:

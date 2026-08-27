@@ -1,6 +1,7 @@
 """Test configured repository inventory collection."""
 
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -24,6 +25,11 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryInventoryIssue,
     RepositoryMetadata,
+    SonarProjectMapping,
+    SonarProjectResolution,
+    SonarRepositoryProject,
+    SonarResolution,
+    StoredSonarMapping,
 )
 from metrics.github import GitHubClient, GitHubError
 from metrics.inventory import (
@@ -33,6 +39,8 @@ from metrics.inventory import (
     HistoryPage,
     RepositoryStandardsResult,
     Ruleset,
+    SonarSource,
+    SonarSubject,
     binds_administrators,
     bypasses_as_administrator,
     collect_inventory,
@@ -41,6 +49,7 @@ from metrics.inventory import (
     collect_repository_standards,
     collect_rulesets,
     collect_security_alerts,
+    collect_sonar,
     continue_history,
     count_by_severity,
     enforcing_rules,
@@ -49,6 +58,7 @@ from metrics.inventory import (
     repository_standards_query,
 )
 from metrics.inventory import RepositoryRule as InventoryRule
+from metrics.sonar import SonarClient, SonarDeclaration
 
 
 def collection_window() -> ReportingWindow:
@@ -1352,6 +1362,38 @@ def test_repository_standards_query_checks_the_six_locations_in_one_bundled_call
     assert f"history(first: {MAINTENANCE_HISTORY_PAGE_SIZE}, after: $cursor)" in query
 
 
+def test_repository_standards_query_reads_the_sonar_declaration_in_the_same_call() -> None:
+    """Read `sonar-project.properties` as text beside the CODEOWNERS sizes, for no extra round trip."""
+    query = repository_standards_query()
+
+    assert 'sonarProperties: object(expression: "HEAD:sonar-project.properties")' in query
+    assert "{ ... on Blob { text } }" in query
+
+
+def test_collect_repository_standards_reads_the_declared_sonar_project() -> None:
+    """Carry the declaration the bundled call already paid for, for the resolver to confirm or refute."""
+    client = standards_client(
+        standards_data(
+            files={"sonarProperties": {"text": "sonar.projectKey=hmcts.cath\nsonar.organization=hmcts\n"}},
+            nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")],
+        ),
+    )
+
+    result = collect_standards(client)
+
+    assert result.declaration == SonarDeclaration(project_key="hmcts.cath", organization="hmcts")
+    assert client.graphql.call_count == 1
+
+
+def test_collect_repository_standards_reports_no_declaration_where_there_is_no_file() -> None:
+    """Leave the declaration unset for the repositories that carry no properties file, which is most."""
+    client = standards_client(
+        standards_data(nodes=[commit_node("2026-07-01T00:00:00Z", login="alice")]),
+    )
+
+    assert collect_standards(client).declaration is None
+
+
 def test_collect_repository_standards_lists_every_codeowners_location_found() -> None:
     """Report each found file with its size and whether GitHub reads a file at that path."""
     client = standards_client(
@@ -1798,3 +1840,375 @@ def test_collect_inventory_carries_standards_evidence_onto_the_item() -> None:
         last_human_commit_at=datetime(2026, 7, 1, tzinfo=UTC),
         searched_back_to=None,
     )
+
+
+ANALYSED_AT = datetime(2026, 8, 27, 9, 49, 35, tzinfo=UTC)
+"""The instant of the analysis the faked SonarCloud measures were taken at."""
+
+MAPPED_AT = datetime(2026, 7, 1, tzinfo=UTC)
+"""The older analysis the stored map resolved a project from, which is not when it was last measured."""
+
+
+def sonar_answer(payload: object, status_code: int = 200) -> MagicMock:
+    """Build one faked SonarCloud response carrying a JSON body."""
+    response = MagicMock(status_code=status_code)
+    response.json.return_value = payload
+    return response
+
+
+def analyses_payload(date: str = "2026-08-27T09:49:35+0000", revision: str = "ce34e614") -> dict[str, object]:
+    """Build one `/api/project_analyses/search` body naming a single analysis."""
+    return {"analyses": [{"key": "analysis-0", "date": date, "revision": revision}]}
+
+
+def measures_payload(project_key: str) -> dict[str, object]:
+    """Build one `/api/measures/component` body with the measures these tests read back."""
+    return {
+        "component": {
+            "key": project_key,
+            "measures": [
+                {"metric": "alert_status", "value": "ERROR"},
+                {"metric": "coverage", "value": "62.1"},
+                {"metric": "ncloc", "value": "18422"},
+            ],
+        },
+    }
+
+
+@dataclass(frozen=True)
+class FakeMap:
+    """Answer both directions of the stored `sonar → github` map from rows a test wrote by hand.
+
+    Stated rather than built, as `tests/test_sonar.py` states it: what these tests are about is what
+    a COLLECTION does with a resolution, so putting a database and a `map-sonar` run between the test
+    and its own fixture would exercise the resolver twice and the collection barely at all.
+    """
+
+    sonar_organization: str = "hmcts"
+    projects: dict[str, StoredSonarMapping] = field(default_factory=dict)
+    repositories: dict[str, SonarRepositoryProject] = field(default_factory=dict)
+
+    def project(self, project_key: str) -> StoredSonarMapping | None:
+        """Return the row the test filed under one project key."""
+        return self.projects.get(project_key)
+
+    def repository(self, repository: str) -> SonarRepositoryProject | None:
+        """Return the claim the test filed under one repository name."""
+        return self.repositories.get(repository)
+
+
+def resolved_mapping(project_key: str, repository: str) -> SonarProjectMapping:
+    """Build the mapping a resolved row of the stored map holds."""
+    return SonarProjectMapping(
+        project_key=project_key,
+        repository=repository,
+        method=SonarResolution.ANALYSIS_REVISION,
+        analysis_at=MAPPED_AT,
+        revision="ce34e614",
+    )
+
+
+def resolved_row(project_key: str, repository: str) -> StoredSonarMapping:
+    """Build one resolved row of the stored map, dated at the analysis that resolved it."""
+    return StoredSonarMapping(
+        project_key=project_key,
+        resolved_at=datetime(2026, 7, 2, tzinfo=UTC),
+        mapping=resolved_mapping(project_key, repository),
+    )
+
+
+def claimed_by(project_key: str, repository: str) -> SonarRepositoryProject:
+    """Build the map's answer for one repository, as the reverse lookup returns it."""
+    return SonarRepositoryProject(mapping=resolved_mapping(project_key, repository))
+
+
+def sonar_reading(
+    *responses: MagicMock,
+    project_map: FakeMap | None = None,
+    overrides: dict[str, str] | None = None,
+) -> tuple[SonarSource, MagicMock]:
+    """Build a SonarCloud source over a faked session, returning both so calls can be asserted on."""
+    session = Session()
+    get = MagicMock(side_effect=responses)
+    session.get = get  # type: ignore[method-assign]
+    source = SonarSource(
+        client=SonarClient(session, {}),
+        project_map=FakeMap() if project_map is None else project_map,
+        overrides={} if overrides is None else overrides,
+    )
+    return source, get
+
+
+def single_repository_configuration(repository: str = "nfdiv-case-api", **fields: object) -> Configuration:
+    """Configure one team owning one repository, which is all a SonarCloud resolution needs."""
+    return Configuration(
+        version=1,
+        organization="hmcts",
+        database=Path("metrics.sqlite3"),
+        teams=(TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=(repository,)),),
+        **fields,  # type: ignore[arg-type]
+    )
+
+
+def test_collect_inventory_stores_the_measures_of_a_resolved_project() -> None:
+    """Store one repository's quality state as current state, dated by its LATEST analysis.
+
+    The declaration the bundled standards query already read is confirmed by the stored map for
+    nothing, and the measures are then dated by a fresh read of the project's newest analysis rather
+    than by the older analysis that attributed the project to the repository.
+    """
+    payload = standards_data(
+        files={"sonarProperties": {"text": "sonar.projectKey=hmcts.cath\n"}},
+        nodes=[commit_node("2026-08-01T00:00:00Z", login="alice")],
+    )
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    sonar, sonar_get = sonar_reading(
+        sonar_answer(analyses_payload()),
+        sonar_answer(measures_payload("hmcts.cath")),
+        project_map=FakeMap(projects={"hmcts.cath": resolved_row("hmcts.cath", "nfdiv-case-api")}),
+    )
+    with (
+        patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response(payload)]),
+        patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
+    ):
+        inventory = collect_inventory(single_repository_configuration(), client, collection_window(), sonar)
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    assert inventory.failures == ()
+    item = inventory.repositories[0]
+    assert item.sonar_project == SonarProjectResolution(
+        mapping=SonarProjectMapping(
+            project_key="hmcts.cath",
+            repository="nfdiv-case-api",
+            method=SonarResolution.DECLARED_CONFIRMED_BY_MAP,
+            analysis_at=MAPPED_AT,
+            revision="ce34e614",
+        ),
+    )
+    assert item.sonar is not None
+    assert item.sonar.project_key == "hmcts.cath"
+    assert item.sonar.coverage == 62.1
+    assert item.sonar.lines_of_code == 18422
+    # The measures describe the newest analysis, not the one the mapping was resolved from.
+    assert item.sonar.analysis_at == ANALYSED_AT
+    assert [call.args[0] for call in sonar_get.call_args_list] == [
+        "https://sonarcloud.io/api/project_analyses/search",
+        "https://sonarcloud.io/api/measures/component",
+    ]
+    # Seven GitHub calls and two SonarCloud ones in ONE figure: the unit metered is the repository.
+    assert inventory.costs[0].requests == 9
+
+
+def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_project() -> None:
+    """Report a repository no project is mapped to as an OBSERVATION, and exit `0` for it.
+
+    Most of the organisation is this case — 289 projects against 3,372 repositories — so grading it
+    as a collection failure would make nearly every run partial and empty the exit status of the
+    signal it carries.
+    """
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    sonar, sonar_get = sonar_reading()
+    with (
+        patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response()]),
+        patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
+    ):
+        inventory = collect_inventory(single_repository_configuration(), client, collection_window(), sonar)
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    assert inventory.failures == ()
+    item = inventory.repositories[0]
+    # No measures, and the reason there are none — which is an answer, not the absence of one.
+    assert item.sonar is None
+    assert item.sonar_project is not None
+    assert item.sonar_project.mapping is None
+    assert item.sonar_project.detail == "no SonarCloud project in hmcts is mapped to this repository"
+    # A repository with no project costs nothing to answer for: the map is local.
+    sonar_get.assert_not_called()
+    assert inventory.costs[0].requests == 7
+
+
+def test_collect_inventory_collects_no_sonar_state_without_a_source() -> None:
+    """Leave both SonarCloud fields unset for a run collecting none, so a stored row says nothing."""
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response()]),
+        patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
+    ):
+        inventory = collect_inventory(single_repository_configuration(), client, collection_window())
+
+    item = inventory.repositories[0]
+    assert item.sonar is None
+    assert item.sonar_project is None
+    assert inventory.failures == ()
+
+
+def test_collect_inventory_reads_an_override_under_the_configured_repository_name() -> None:
+    """Apply an override keyed by the CONFIGURED name to the repository GitHub answered with.
+
+    A repository renamed since the configuration was written is followed by the API, so the two names
+    differ: the override is looked up under the name a human typed, and the resolution it produces
+    names the repository GitHub reported.
+    """
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    configuration = single_repository_configuration(
+        "nfdiv-case-api-old-name",
+        sonar_projects={"nfdiv-case-api-old-name": "hmcts.cath"},
+    )
+    sonar, sonar_get = sonar_reading(
+        sonar_answer(analyses_payload()),
+        sonar_answer(measures_payload("hmcts.cath")),
+        overrides=configuration.sonar_projects,
+    )
+    with (
+        patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
+        patch.object(session, "post", side_effect=[standards_response()]),
+        patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window(), sonar)
+
+    item = inventory.repositories[0]
+    assert item.sonar_project is not None
+    assert item.sonar_project.mapping is not None
+    assert item.sonar_project.mapping.method is SonarResolution.CONFIGURED
+    assert item.sonar_project.mapping.project_key == "hmcts.cath"
+    assert item.sonar_project.mapping.repository == "nfdiv-case-api"
+    assert item.sonar is not None
+    assert sonar_get.call_count == 2
+
+
+def test_collect_sonar_records_one_issue_when_the_measures_are_refused() -> None:
+    """Record a refused SonarCloud read as one failure, still naming the project it could not read.
+
+    The project a run resolved and then could not measure is worth storing: the block can say which
+    project the reason is about, and the run exits `3` because a call was genuinely refused.
+    """
+    sonar, _ = sonar_reading(
+        sonar_answer(analyses_payload()),
+        sonar_answer({"errors": []}, status_code=401),
+        project_map=FakeMap(repositories={"nfdiv-case-api": claimed_by("nfdiv-case-api", "nfdiv-case-api")}),
+    )
+
+    result = collect_sonar(
+        sonar,
+        MagicMock(spec=GitHubClient),
+        "hmcts",
+        "divorce",
+        SonarSubject(repository="nfdiv-case-api"),
+    )
+
+    assert result.measures is None
+    assert result.resolution.mapping is not None
+    assert result.resolution.mapping.method is SonarResolution.STORED_MAP
+    assert result.resolution.detail == "SonarCloud authentication failed"
+    assert result.failure is not None
+    assert result.failure.evidence is EvidenceKind.SONAR
+    assert result.failure.reason is AvailabilityReason.AUTHENTICATION_FAILED
+    assert result.failure.repository == "nfdiv-case-api"
+    assert result.failure.team_identifier == "divorce"
+
+
+def test_collect_sonar_records_one_issue_when_a_confirmation_call_failed() -> None:
+    """Record a call that failed while resolving as a failure, and store nothing it did not establish."""
+    github = MagicMock(spec=GitHubClient)
+    github.get.side_effect = GitHubError("GitHub rate limit exhausted", AvailabilityReason.RATE_LIMITED)
+    sonar, _ = sonar_reading(sonar_answer(analyses_payload()))
+
+    result = collect_sonar(
+        sonar,
+        github,
+        "hmcts",
+        "divorce",
+        SonarSubject(repository="nfdiv-case-api", declaration=SonarDeclaration(project_key="hmcts.cath")),
+    )
+
+    assert result.measures is None
+    assert result.resolution.mapping is None
+    assert result.resolution.detail is not None
+    assert "rate limit exhausted" in result.resolution.detail
+    assert result.failure is not None
+    assert result.failure.evidence is EvidenceKind.SONAR
+    assert result.failure.reason is AvailabilityReason.RATE_LIMITED
+
+
+def test_collect_sonar_records_no_failure_for_a_declared_key_sonarcloud_does_not_list() -> None:
+    """Grade a stale properties file as an observation, so the run does not exit `3` for half the org.
+
+    123 of the organisation's 240 declarations name a project SonarCloud does not list, and a `404`
+    on one of them is the answer that the hypothesis is false — not a read that was refused.
+    """
+    sonar, _ = sonar_reading(sonar_answer({"errors": []}, status_code=404))
+
+    result = collect_sonar(
+        sonar,
+        MagicMock(spec=GitHubClient),
+        "hmcts",
+        "divorce",
+        SonarSubject(repository="nfdiv-case-api", declaration=SonarDeclaration(project_key="hmcts.phantom")),
+    )
+
+    assert result.failure is None
+    assert result.measures is None
+    assert result.resolution.mapping is None
+    assert result.resolution.detail is not None
+    assert "SonarCloud lists no project hmcts.phantom" in result.resolution.detail
+
+
+def test_collect_sonar_records_no_failure_for_a_mapped_project_sonarcloud_no_longer_lists() -> None:
+    """Read a `404` for a mapped project as the map having gone stale, not as a refused call.
+
+    A mapped project can be deleted, renamed, or made private after the map was built, and
+    `map-sonar` walks only the projects SonarCloud still lists — so it never clears the row. Grading
+    that as a refusal would exit `3` on every run for a condition no operator action fixes.
+    """
+    sonar, _ = sonar_reading(
+        sonar_answer({"errors": []}, status_code=404),
+        project_map=FakeMap(repositories={"nfdiv-case-api": claimed_by("hmcts.deleted", "nfdiv-case-api")}),
+    )
+
+    result = collect_sonar(
+        sonar,
+        MagicMock(spec=GitHubClient),
+        "hmcts",
+        "divorce",
+        SonarSubject(repository="nfdiv-case-api"),
+    )
+
+    assert result.failure is None
+    assert result.measures is None
+    assert result.resolution.mapping is not None
+    assert result.resolution.mapping.project_key == "hmcts.deleted"
+    assert result.resolution.detail is not None
+    assert result.resolution.detail == (
+        "SonarCloud lists no project hmcts.deleted, resolved for nfdiv-case-api by stored_map"
+    )
+
+
+def test_collect_sonar_dates_nothing_for_a_project_that_has_never_been_analysed() -> None:
+    """Leave the analysis instant absent for a project SonarCloud has never analysed, never zero-dated."""
+    sonar, _ = sonar_reading(
+        sonar_answer({"analyses": []}),
+        sonar_answer({"component": {"key": "hmcts.cath", "measures": []}}),
+        project_map=FakeMap(repositories={"nfdiv-case-api": claimed_by("hmcts.cath", "nfdiv-case-api")}),
+    )
+
+    result = collect_sonar(
+        sonar,
+        MagicMock(spec=GitHubClient),
+        "hmcts",
+        "divorce",
+        SonarSubject(repository="nfdiv-case-api"),
+    )
+
+    assert result.failure is None
+    assert result.measures is not None
+    assert result.measures.project_key == "hmcts.cath"
+    assert result.measures.analysis_at is None
+    assert result.measures.gate is None
+    assert result.measures.coverage is None

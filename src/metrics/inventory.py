@@ -1,8 +1,8 @@
 """Collect configured repository inventory."""
 
 import logging
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
@@ -31,10 +31,21 @@ from metrics.domain import (
     RepositoryInventoryItem,
     RepositoryMetadata,
     SecurityAlertEvidence,
+    SonarMeasures,
+    SonarProjectResolution,
     StatusCheck,
     StatusChecksRule,
 )
 from metrics.github import GitHubClient, GitHubError
+from metrics.sonar import (
+    SONAR_PROPERTIES_PATH,
+    SonarClient,
+    SonarDeclaration,
+    SonarError,
+    SonarProjectMap,
+    declared_project,
+    github_to_sonar,
+)
 
 
 class RepositoryRule(BaseModel):
@@ -642,6 +653,14 @@ carried so the report can say a `.md` variant satisfies the letter of the standa
 nothing on GitHub.
 """
 
+SONAR_PROPERTIES_ALIAS = "sonarProperties"
+"""The alias the root `sonar-project.properties` is selected under, beside the CODEOWNERS blobs.
+
+Read in the SAME bundled call rather than in one of its own: this is a current-state document like
+the CODEOWNERS files beside it, it is not windowed, and no cached coverage signature is keyed on
+this query — so the whole declaration costs no extra round trip.
+"""
+
 
 class CodeownersBlob(BaseModel):
     """Select the size of one CODEOWNERS blob, absent when the path names no blob.
@@ -653,6 +672,18 @@ class CodeownersBlob(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     byte_size: int | None = Field(default=None, alias="byteSize")
+
+
+class PropertiesBlob(BaseModel):
+    """Select the text of the root `sonar-project.properties`, absent where the path names no blob.
+
+    `text` is null for a blob GitHub considers binary as well as for a path that is not a blob at
+    all, and both are read the same way: nothing was declared that this build can read.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    text: str | None = None
 
 
 class CommitAccount(BaseModel):
@@ -737,6 +768,11 @@ class StandardsRepository(BaseModel):
         raw = (self.model_extra or {}).get(alias)
         return None if raw is None else CodeownersBlob.model_validate(raw)
 
+    def sonar_properties(self) -> str | None:
+        """Return the root `sonar-project.properties` as text, None where the repository has none."""
+        raw = (self.model_extra or {}).get(SONAR_PROPERTIES_ALIAS)
+        return None if raw is None else PropertiesBlob.model_validate(raw).text
+
 
 class StandardsData(BaseModel):
     """Select the repository from a repository-standards response, first page or continuation."""
@@ -747,25 +783,33 @@ class StandardsData(BaseModel):
 
 
 def repository_standards_query() -> str:
-    """Return the bundled current-state query answering CODEOWNERS presence and maintenance.
+    """Return the bundled current-state query answering CODEOWNERS, maintenance and the Sonar declaration.
 
     A NEW, SEPARATE query, deliberately: coverage is keyed on a hash of the windowed GraphQL
     documents, so adding one field to `pull_request_query()` or the direct-commit history query
-    would invalidate every repository's settled history. Nothing here touches a windowed signature.
+    would invalidate every repository's settled history. Nothing here touches a windowed signature —
+    which is also why the SonarCloud declaration is read HERE rather than in a request of its own.
 
     Six aliased `object(expression: "HEAD:<path>")` selections answer every CODEOWNERS location in
-    one round trip, reading only `byteSize` so an empty file stays visible as found-but-empty. The
-    history page selects only dates and author identity — none of the rollup cost that forced the
-    tuned page sizes elsewhere — which is why `first` is GitHub's maximum rather than the 50 the
-    windowed history query uses. One call answers everything in the common case; the measured
-    confirmation comes from the `costs` table of the first real `collect` run.
+    one round trip, reading only `byteSize` so an empty file stays visible as found-but-empty; a
+    seventh reads the root `sonar-project.properties` as `text`, since its content is the whole
+    point of reading it. The history page selects only dates and author identity — none of the
+    rollup cost that forced the tuned page sizes elsewhere — which is why `first` is GitHub's
+    maximum rather than the 50 the windowed history query uses. One call answers everything in the
+    common case; the measured confirmation comes from the `costs` table of the first real `collect`
+    run.
 
-    The same document follows continuation pages, with `$cursor` set: re-reading six `byteSize`
+    The same document follows continuation pages, with `$cursor` set: re-reading seven small blob
     selections costs nothing worth a second document, and one shape keeps one parser.
     """
     selections = "\n            ".join(
-        f'{alias}: object(expression: "HEAD:{path}") {{ ... on Blob {{ byteSize }} }}'
-        for alias, path, _ in CODEOWNERS_LOCATIONS
+        [
+            *(
+                f'{alias}: object(expression: "HEAD:{path}") {{ ... on Blob {{ byteSize }} }}'
+                for alias, path, _ in CODEOWNERS_LOCATIONS
+            ),
+            f'{SONAR_PROPERTIES_ALIAS}: object(expression: "HEAD:{SONAR_PROPERTIES_PATH}") {{ ... on Blob {{ text }} }}',
+        ],
     )
     return f"""
         query RepositoryStandards($organization: String!, $repository: String!, $cursor: String) {{
@@ -889,11 +933,18 @@ def find_human_commit(
 
 @dataclass(frozen=True)
 class RepositoryStandardsResult:
-    """Carry the CODEOWNERS and maintenance blocks, and one failure per block left unobserved."""
+    """Carry the CODEOWNERS and maintenance blocks, and one failure per block left unobserved.
+
+    `declaration` is not a block and never becomes one: what a repository says about its own
+    SonarCloud project is a hypothesis for `github_to_sonar` to confirm or refute, not evidence to
+    report. It is None both where the bundled query failed and where the repository carries no
+    `sonar-project.properties`, because in neither case is there a key to test.
+    """
 
     codeowners: CodeownersEvidence | None
     maintenance: MaintenanceEvidence | None
     failures: tuple[RepositoryInventoryIssue, ...]
+    declaration: SonarDeclaration | None = None
 
 
 def standards_failure_detail(exception: GitHubError | ValidationError) -> tuple[AvailabilityReason, str]:
@@ -948,6 +999,7 @@ def collect_repository_standards(
         )
         answered = standards_repository(data)
         files = found_codeowners(answered)
+        declaration = declared_project(answered.sonar_properties())
         history = standards_history(answered)
     except (GitHubError, ValidationError) as exception:
         return RepositoryStandardsResult(
@@ -963,7 +1015,12 @@ def collect_repository_standards(
             last_human_commit_at=None,
             searched_back_to=None,
         )
-        return RepositoryStandardsResult(codeowners=codeowners, maintenance=maintenance, failures=())
+        return RepositoryStandardsResult(
+            codeowners=codeowners,
+            maintenance=maintenance,
+            failures=(),
+            declaration=declaration,
+        )
     try:
         last_human_commit_at, searched_back_to = find_human_commit(
             client,
@@ -978,6 +1035,7 @@ def collect_repository_standards(
             codeowners=codeowners,
             maintenance=None,
             failures=failures((EvidenceKind.MAINTENANCE,), exception),
+            declaration=declaration,
         )
     maintenance = MaintenanceEvidence(
         branch=repository.default_branch,
@@ -985,7 +1043,165 @@ def collect_repository_standards(
         last_human_commit_at=last_human_commit_at,
         searched_back_to=searched_back_to,
     )
-    return RepositoryStandardsResult(codeowners=codeowners, maintenance=maintenance, failures=())
+    return RepositoryStandardsResult(
+        codeowners=codeowners,
+        maintenance=maintenance,
+        failures=(),
+        declaration=declaration,
+    )
+
+
+@dataclass(frozen=True)
+class SonarSource:
+    """Everything a collection needs to read one repository's SonarCloud quality state.
+
+    OPTIONAL at every call site that takes one: a collection given no source collects no measures and
+    records no failure. That is what lets this source be added to an installation which has never run
+    `map-sonar` — an empty map resolves nothing, and a run that resolved nothing is not a run that
+    failed.
+
+    `overrides` is keyed by CONFIGURED repository name, which the configuration validator has already
+    checked names a real one, while resolution itself uses the name GitHub answered with: a repository
+    renamed since the file was written is followed by the API, and the stored map holds GitHub's own
+    spelling of every name in it.
+    """
+
+    client: SonarClient
+    project_map: SonarProjectMap
+    overrides: Mapping[str, str] = field(default_factory=dict)
+
+    def override(self, repository: str) -> str | None:
+        """Return the project key configured for one repository, or None where none was."""
+        return self.overrides.get(repository)
+
+
+@dataclass(frozen=True)
+class SonarSubject:
+    """The repository one resolution is about, and everything already known about it going in.
+
+    Three facts that travel together and are all about the same repository — the name GitHub answered
+    with, the project key a human configured for it, and the key it declares about itself — so they
+    are one argument rather than three. `repository` is GitHub's own spelling because that is what the
+    stored map holds and what a commit check must be addressed to, while the override was looked up
+    under the CONFIGURED name by the caller that knows both.
+    """
+
+    repository: str
+    override: str | None = None
+    declaration: SonarDeclaration | None = None
+
+
+@dataclass(frozen=True)
+class SonarStateResult:
+    """Carry the project one repository was attributed to, what was measured, and any failure.
+
+    The resolution is carried whether or not measures came back, because it is an answer either way:
+    a repository no project is mapped to has been answered for, and storing that reason is what keeps
+    it apart from a row written before this source existed. `measures` and `failure` are then
+    independent of it — a resolved project's measures can still be refused.
+    """
+
+    resolution: SonarProjectResolution
+    measures: SonarMeasures | None = None
+    failure: RepositoryInventoryIssue | None = None
+
+
+def latest_analysis_at(client: SonarClient, project: str) -> datetime | None:
+    """Read the instant of one project's most recent analysis, None for a project never analysed.
+
+    Read fresh rather than taken from the resolution, whose instant belongs to whichever analysis
+    ATTRIBUTED the project to the repository: for a stored mapping that may be months old, and for a
+    configured override there is none at all. The measures fetched a moment later are the latest
+    analysis's, so dating them by the resolution's evidence would misreport when the quality state
+    was measured. One cheap SonarCloud read, against a quota nothing else in a collection competes
+    for.
+    """
+    analyses = client.project_analyses(project, 1)
+    return analyses[0].analysis_at if analyses else None
+
+
+def sonar_failure(
+    team_identifier: str,
+    repository: str,
+    reason: AvailabilityReason,
+    detail: str,
+) -> RepositoryInventoryIssue:
+    """Record one SonarCloud call that would not answer, so the run exits `3` for a real refusal."""
+    return RepositoryInventoryIssue(
+        team_identifier=team_identifier,
+        repository=repository,
+        evidence=EvidenceKind.SONAR,
+        reason=reason,
+        detail=detail,
+    )
+
+
+def collect_sonar(
+    source: SonarSource,
+    client: GitHubClient,
+    organization: str,
+    team_identifier: str,
+    subject: SonarSubject,
+) -> SonarStateResult:
+    """Attribute one repository to a SonarCloud project and measure it, or say why it has none.
+
+    A REPOSITORY WITH NO SONARCLOUD PROJECT RECORDS NO FAILURE. Most of the organisation's
+    repositories have none — 289 projects against 3,372 repositories — so grading that as a
+    collection failure would make `collect` exit `3` for nearly every run and empty the three-valued
+    exit status of the signal it was built to carry. It is an observation, and it is stored as one,
+    with the reason resolution gave.
+
+    Only a CALL that failed is a failure: a refused SonarCloud read, or a GitHub read the resolution
+    ladder needed to confirm a declared key. Both are recorded as one issue under
+    `EvidenceKind.SONAR`, and both still store what the resolution did establish — a project named by
+    a run that could not then measure it is more useful than no project at all.
+
+    A SONARCLOUD `404` HERE IS THE SAME ANSWER `confirm_by_commit` READS IT AS: the project is not
+    there. A mapped project can be deleted, renamed, or made private after the map was built, and
+    `map-sonar` walks only the projects SonarCloud still lists, so it never clears the row. Grading
+    that as a refusal would exit `3` on every run for a condition no operator action fixes, while the
+    truth of it — the map names a project SonarCloud will not show us — is an observation, and is
+    stored as one beside the mapping it doubts. A refused read keeps its reason: `401`, `403`, `429`
+    and an unparseable response all still fail the run.
+    """
+    attribution = github_to_sonar(
+        source.client,
+        client,
+        organization,
+        subject.repository,
+        source.project_map,
+        override=subject.override,
+        declaration=subject.declaration,
+    )
+    mapping = attribution.mapping
+    if mapping is None:
+        detail = attribution.detail
+        return SonarStateResult(
+            resolution=SonarProjectResolution(detail=detail),
+            failure=(
+                sonar_failure(team_identifier, subject.repository, attribution.reason, detail or "")
+                if attribution.reason is not None
+                else None
+            ),
+        )
+    try:
+        analysis_at = latest_analysis_at(source.client, mapping.project_key)
+        measures = source.client.component_measures(mapping.project_key, analysis_at)
+    except SonarError as exception:
+        gone = exception.reason is AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE
+        detail = (
+            # The method is named because it is what a human needs to fix this: a stale map row is
+            # cleared by re-running `map-sonar`, a wrong `sonar_projects` override by editing it.
+            f"SonarCloud lists no project {mapping.project_key}, resolved for {subject.repository} "
+            f"by {mapping.method.value}"
+            if gone
+            else str(exception)
+        )
+        return SonarStateResult(
+            resolution=SonarProjectResolution(mapping=mapping, detail=detail),
+            failure=(None if gone else sonar_failure(team_identifier, subject.repository, exception.reason, detail)),
+        )
+    return SonarStateResult(resolution=SonarProjectResolution(mapping=mapping), measures=measures)
 
 
 def collect_repository(
@@ -1108,13 +1324,24 @@ def collect_repository_state(
     team_identifier: str,
     repository: str,
     excluded: frozenset[str],
+    sonar: SonarSource | None = None,
 ) -> tuple[RepositoryInventoryItem | None, tuple[RepositoryInventoryIssue, ...]]:
-    """Collect one repository's metadata, standards, merge gate and open alerts, or say what was unavailable.
+    """Collect one repository's metadata, standards, merge gate, open alerts and quality state.
 
     All of it is collected together so that one repository's collection is one measurable unit;
     see `metrics.cost`. A repository whose metadata could not be read is not asked for anything
     else, because there is no default branch to ask about. `excluded` is the comparable
     `cohort.excluded_authors` set the human-commit search tests authors against.
+
+    `sonar` is None for a run collecting no SonarCloud state, which stores neither measures nor a
+    resolution: a row that says nothing about SonarCloud is read back as "not collected", never as a
+    repository without a project. The declaration the bundled standards query already read is handed
+    to the resolution rather than fetched again, and the SonarCloud calls it makes are counted in the
+    same meter as the GitHub ones, because the unit being measured is this repository.
+
+    A `StorageError` from the stored map is deliberately NOT caught here. It is a run-level fault —
+    the durable observations file cannot be read, which will be true for every repository after this
+    one — so it belongs to the command that opened the file rather than to one repository's evidence.
     """
     result = collect_repository(client, organization, team_identifier, repository)
     if isinstance(result, RepositoryInventoryIssue):
@@ -1122,6 +1349,21 @@ def collect_repository_state(
     standards = collect_repository_standards(client, organization, team_identifier, result.repository, excluded)
     gate = collect_merge_gate(client, organization, team_identifier, result.repository)
     alerts = collect_security_alerts(client, organization, team_identifier, result.repository.name)
+    quality = (
+        None
+        if sonar is None
+        else collect_sonar(
+            sonar,
+            client,
+            organization,
+            team_identifier,
+            SonarSubject(
+                repository=result.repository.name,
+                override=sonar.override(repository),
+                declaration=standards.declaration,
+            ),
+        )
+    )
     item = result.model_copy(
         update={
             # Security alerts fail per family, so unlike the merge gate the field is never left
@@ -1130,15 +1372,19 @@ def collect_repository_state(
             **({"merge_gate": gate.evidence} if gate.evidence is not None else {}),
             **({"codeowners": standards.codeowners} if standards.codeowners is not None else {}),
             **({"maintenance": standards.maintenance} if standards.maintenance is not None else {}),
+            **({"sonar_project": quality.resolution} if quality is not None else {}),
+            **({"sonar": quality.measures} if quality is not None and quality.measures is not None else {}),
         },
     )
-    return item, standards.failures + (() if gate.failure is None else (gate.failure,)) + alerts.failures
+    failures = standards.failures + (() if gate.failure is None else (gate.failure,)) + alerts.failures
+    return item, failures + (() if quality is None or quality.failure is None else (quality.failure,))
 
 
 def collect_inventory(
     configuration: Configuration,
     client: GitHubClient,
     window: ReportingWindow,
+    sonar: SonarSource | None = None,
 ) -> RepositoryInventory:
     """Collect current repository state for every configured team, measuring what each one cost.
 
@@ -1146,13 +1392,16 @@ def collect_inventory(
     so the collection report is diffable between runs and cannot be reordered by an edit to the
     configuration file. `costs` is ordered separately, slowest first, because it answers a different
     question.
+
+    `sonar` is None for a run collecting no SonarCloud state. When it is given, its client is metered
+    beside the GitHub one so that a repository's figure covers everything its collection spent.
     """
     repositories: tuple[RepositoryInventoryItem, ...] = ()
     failures: tuple[RepositoryInventoryIssue, ...] = ()
     costs: tuple[RepositoryCollectionCost, ...] = ()
     excluded = excluded_authors(configuration.cohort.excluded_authors)
     for team_identifier, repository in owned_repositories(configuration):
-        meter = CostMeter(client)
+        meter = CostMeter(client, None if sonar is None else sonar.client)
         with meter.measure():
             item, issues = collect_repository_state(
                 client,
@@ -1160,6 +1409,7 @@ def collect_inventory(
                 team_identifier,
                 repository,
                 excluded,
+                sonar,
             )
         repositories += () if item is None else (item,)
         failures += issues

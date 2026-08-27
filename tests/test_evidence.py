@@ -1,5 +1,6 @@
 """Test behaviour evidence projections and window loading."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -56,11 +57,21 @@ from metrics.domain import (
     ReviewState,
     SecurityAlertEvidence,
     SecurityAlertReport,
+    SonarGateLevel,
+    SonarMeasures,
+    SonarProjectMapping,
+    SonarProjectResolution,
+    SonarQualityGate,
+    SonarQualityGateCondition,
+    SonarRating,
+    SonarReport,
+    SonarResolution,
     SourceCoverage,
     WindowProvenance,
 )
 from metrics.evidence import (
     RepositoryEvidence,
+    StoredReports,
     cached_repository_evidence,
     collected_repository_evidence,
     maintenance_windows,
@@ -72,6 +83,7 @@ from metrics.evidence import (
     stored_merge_gate,
     stored_repository_state,
     stored_security_alerts,
+    stored_sonar,
 )
 from metrics.github import GitHubClient, GitHubError
 from metrics.rules.unreviewed_merge import UnreviewedMerge
@@ -106,6 +118,22 @@ def uncollected_codeowners() -> CodeownersReport:
 def uncollected_maintenance() -> MaintenanceReport:
     """Build the maintenance report of a repository whose state has never been collected."""
     return MaintenanceReport(detail="no repository state has been collected; run metrics collect")
+
+
+def uncollected_sonar() -> SonarReport:
+    """Build the SonarCloud report of a repository whose state has never been collected."""
+    return SonarReport(detail="no repository state has been collected; run metrics collect")
+
+
+def uncollected_reports() -> StoredReports:
+    """Build every current-state block of a repository whose state has never been collected."""
+    return StoredReports(
+        merge_gate=uncollected_gate(),
+        security=uncollected_security(),
+        codeowners=uncollected_codeowners(),
+        maintenance=uncollected_maintenance(),
+        sonar=uncollected_sonar(),
+    )
 
 
 def default_policy() -> ReadinessPolicy:
@@ -422,12 +450,9 @@ def test_repository_practice_evidence_honors_rule_controls() -> None:
             unreviewed_merge(PracticeRuleConfiguration(excluded_logins=("second-author",))),
             unreviewed_merge(PracticeRuleConfiguration(enabled=False)),
         ),
-        uncollected_gate(),
         default_policy(),
         offline_open_pull_request_report(),
-        uncollected_security(),
-        uncollected_codeowners(),
-        uncollected_maintenance(),
+        uncollected_reports(),
     )
 
     assert excluded.behaviour == ()
@@ -436,35 +461,28 @@ def test_repository_practice_evidence_honors_rule_controls() -> None:
 def test_repository_practice_evidence_collates_every_enabled_rule() -> None:
     """Flatten findings from enabled rule instances and skip disabled instances."""
     configuration = PracticeRuleConfiguration()
-    gate = uncollected_gate()
     report = cached_facts().practices(
         (
             unreviewed_merge(configuration),
             unreviewed_merge(configuration),
             unreviewed_merge(PracticeRuleConfiguration(enabled=False)),
         ),
-        gate,
         default_policy(),
         offline_open_pull_request_report(),
-        uncollected_security(),
-        uncollected_codeowners(),
-        uncollected_maintenance(),
+        uncollected_reports(),
     )
 
     assert len(report.behaviour) == 2
-    assert report.merge_gate == gate
+    assert report.merge_gate == uncollected_gate()
 
 
 def test_repository_practice_evidence_omits_a_disabled_assessment() -> None:
     """Leave the assessment out entirely rather than emitting an unjudged label."""
     report = cached_facts().practices(
         (unreviewed_merge(),),
-        uncollected_gate(),
         ReadinessPolicy(AssessmentConfiguration(enabled=False), TrivialityConfiguration()),
         offline_open_pull_request_report(),
-        uncollected_security(),
-        uncollected_codeowners(),
-        uncollected_maintenance(),
+        uncollected_reports(),
     )
 
     assert report.assessment is None
@@ -595,6 +613,8 @@ def collected_state(
     security: SecurityAlertEvidence | None = None,
     codeowners: CodeownersEvidence | None = None,
     maintenance: MaintenanceEvidence | None = None,
+    sonar: SonarMeasures | None = None,
+    sonar_project: SonarProjectResolution | None = None,
 ) -> RepositoryInventory:
     """Build one collection whose stored state carries the given current-state blocks."""
     collected_at = datetime(2026, 8, 8, 9, tzinfo=UTC)
@@ -621,6 +641,8 @@ def collected_state(
                 security=security,
                 codeowners=codeowners,
                 maintenance=maintenance,
+                sonar=sonar,
+                sonar_project=sonar_project,
             ),
         ),
         failures=(),
@@ -863,6 +885,216 @@ def test_stored_maintenance_preserves_storage_failure(tmp_path: Path) -> None:
         report = stored_maintenance(stored_repository_state(configuration(tmp_path), "cath-service"))
 
     assert report == MaintenanceReport(detail="cache unreadable")
+
+
+SONAR_ANALYSED_AT = datetime(2026, 8, 7, 6, 30, tzinfo=UTC)
+"""The instant the stored measures below were analysed at, before the row was stored."""
+
+
+def collected_project(project_key: str = "hmcts.cath") -> SonarProjectResolution:
+    """Build the stored resolution of a repository attributed to one project by the stored map."""
+    return SonarProjectResolution(
+        mapping=SonarProjectMapping(
+            project_key=project_key,
+            repository="cath-service",
+            method=SonarResolution.DECLARED_CONFIRMED_BY_MAP,
+            analysis_at=SONAR_ANALYSED_AT,
+            revision="ce34e614",
+        ),
+    )
+
+
+def collected_measures(project_key: str = "hmcts.cath") -> SonarMeasures:
+    """Build stored measures where the gate failed on one condition and one measure is absent."""
+    return SonarMeasures(
+        project_key=project_key,
+        analysis_at=SONAR_ANALYSED_AT,
+        gate=SonarQualityGate(
+            level=SonarGateLevel.ERROR,
+            conditions=(
+                SonarQualityGateCondition(
+                    metric="new_coverage",
+                    comparator="LT",
+                    threshold="80",
+                    actual="61.4",
+                    level=SonarGateLevel.ERROR,
+                ),
+                SonarQualityGateCondition(
+                    metric="new_duplicated_lines_density",
+                    comparator="GT",
+                    threshold="3",
+                    actual="0.0",
+                    level=SonarGateLevel.OK,
+                ),
+            ),
+        ),
+        coverage=62.1,
+        lines_of_code=18422,
+        violations=57,
+        reliability_issues=3,
+        maintainability_issues=41,
+        security_issues=1,
+        security_hotspots=4,
+        reliability_rating=SonarRating(value=2.0),
+        maintainability_rating=SonarRating(value=1.0),
+        security_rating=SonarRating(value=3.0),
+        security_review_rating=SonarRating(value=5.0),
+    )
+
+
+def test_stored_sonar_reports_the_measures_with_the_project_they_were_measured_for(tmp_path: Path) -> None:
+    """Serve the stored quality state with its freshness and the project it belongs to.
+
+    The mapping travels with the measures because a block headed by nothing cannot be checked: which
+    project answered, and by which rung of the ladder, is the thing that makes a wrong attribution
+    diagnosable later rather than mysterious.
+    """
+    settings = configuration(tmp_path)
+    record_repository_state(
+        settings.database,
+        collected_state(merge_gate(), sonar=collected_measures(), sonar_project=collected_project()),
+    )
+
+    report = stored_sonar(stored_repository_state(settings, "cath-service"))
+
+    assert report.measures == collected_measures()
+    assert report.mapping == collected_project().mapping
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail is None
+
+
+def test_stored_sonar_survives_the_storage_round_trip(tmp_path: Path) -> None:
+    """Keep the gate conditions, the ratings and the absent measures intact through JSON storage.
+
+    A round trip that stringified a rating or defaulted an absent measure to zero would still
+    typecheck while changing what the block claims about the code.
+    """
+    settings = configuration(tmp_path)
+    record_repository_state(
+        settings.database,
+        collected_state(merge_gate(), sonar=collected_measures(), sonar_project=collected_project()),
+    )
+
+    measures = stored_sonar(stored_repository_state(settings, "cath-service")).measures
+
+    assert measures is not None
+    assert measures.analysis_at == SONAR_ANALYSED_AT
+    assert measures.gate is not None
+    assert measures.gate.level is SonarGateLevel.ERROR
+    assert tuple(condition.metric for condition in measures.gate.conditions) == (
+        "new_coverage",
+        "new_duplicated_lines_density",
+    )
+    assert measures.gate.conditions[0].actual == "61.4"
+    assert measures.security_review_rating is not None
+    assert measures.security_review_rating.letter == "E"
+    # Absent stays absent: SonarCloud measured no duplication, which is not the same as none.
+    assert measures.duplicated_lines_density is None
+
+
+def test_stored_sonar_reports_a_repository_that_was_never_collected(tmp_path: Path) -> None:
+    """State that nothing was collected rather than implying a repository with no project."""
+    report = stored_sonar(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report.measures is None
+    assert report.mapping is None
+    assert report.fetched_at is None
+    assert report.detail == "no repository state has been collected; run metrics collect"
+
+
+def test_stored_sonar_separates_state_collected_before_the_source_existed(tmp_path: Path) -> None:
+    """Distinguish a row stored without the source from a repository no project is mapped to.
+
+    A row written by a build predating this source carries neither field, and reading that as "no
+    SonarCloud project" would answer a question nobody asked: the first is a gap `metrics collect`
+    closes, and the second is a settled answer.
+    """
+    settings = configuration(tmp_path)
+    record_repository_state(settings.database, collected_state(merge_gate()))
+
+    report = stored_sonar(stored_repository_state(settings, "cath-service"))
+
+    assert report.measures is None
+    assert report.mapping is None
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert (
+        report.detail == "SonarCloud measures were not collected when repository state was stored; run metrics collect"
+    )
+
+
+def test_stored_sonar_reports_a_repository_no_project_is_mapped_to(tmp_path: Path) -> None:
+    """Report the resolution's own reason, because having no project IS the answer for most repositories."""
+    settings = configuration(tmp_path)
+    reason = "no SonarCloud project in hmcts is mapped to this repository"
+    record_repository_state(
+        settings.database,
+        collected_state(merge_gate(), sonar_project=SonarProjectResolution(detail=reason)),
+    )
+
+    report = stored_sonar(stored_repository_state(settings, "cath-service"))
+
+    assert report.measures is None
+    assert report.mapping is None
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail == reason
+
+
+def test_stored_sonar_names_the_project_a_failed_measurement_was_about(tmp_path: Path) -> None:
+    """Report a resolved project beside the reason its measures are missing, rather than withholding it."""
+    settings = configuration(tmp_path)
+    resolution = collected_project().model_copy(update={"detail": "SonarCloud request failed"})
+    record_repository_state(settings.database, collected_state(merge_gate(), sonar_project=resolution))
+
+    report = stored_sonar(stored_repository_state(settings, "cath-service"))
+
+    assert report.measures is None
+    assert report.mapping == collected_project().mapping
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail == "SonarCloud request failed"
+
+
+def test_stored_sonar_preserves_storage_failure(tmp_path: Path) -> None:
+    """Describe an unreadable state table instead of raising through the report."""
+    with patch("metrics.evidence.load_repository_state", side_effect=StorageError("cache unreadable")):
+        report = stored_sonar(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report == SonarReport(detail="cache unreadable")
+
+
+def test_repository_practice_evidence_grades_nothing_from_sonar_evidence() -> None:
+    """Leave the readiness label identical with and without a FAILING quality gate in evidence.
+
+    The sharpest case of the standing rule that a signal becoming visible is not a reason to grade
+    it: a SonarCloud gate is somebody else's threshold, set per project, and letting it move the
+    label would import a judgment this tool did not make.
+    """
+    uncollected = uncollected_reports()
+    failing = replace(
+        uncollected,
+        sonar=SonarReport(
+            fetched_at=STANDARDS_FETCHED_AT,
+            mapping=collected_project().mapping,
+            measures=collected_measures(),
+        ),
+    )
+
+    without = cached_facts().practices(
+        (unreviewed_merge(),),
+        default_policy(),
+        offline_open_pull_request_report(),
+        uncollected,
+    )
+    with_sonar = cached_facts().practices(
+        (unreviewed_merge(),),
+        default_policy(),
+        offline_open_pull_request_report(),
+        failing,
+    )
+
+    assert without.assessment is not None
+    assert with_sonar.assessment == without.assessment
+    assert with_sonar.sonar.measures == collected_measures()
+    assert without.sonar == uncollected_sonar()
 
 
 @pytest.mark.parametrize(

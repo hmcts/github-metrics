@@ -36,6 +36,7 @@ def test_get_repository_sends_authenticated_request() -> None:
         (401, "GitHub authentication failed"),
         (403, "GitHub permission denied"),
         (404, "GitHub repository not found or inaccessible"),
+        (422, "GitHub returned HTTP 422"),
         (500, "GitHub returned HTTP 500"),
     ],
 )
@@ -51,6 +52,27 @@ def test_get_reports_http_failure(status_code: int, message: str) -> None:
         pytest.raises(GitHubError, match=message),
     ):
         client.get("https://api.github.com/repos/hmcts/nfdiv-case-api")
+
+
+def test_get_leaves_a_422_unclassified_for_every_reader_but_the_one_that_knows_it() -> None:
+    """Never let one endpoint's meaning for `422` become an affirmative observation everywhere.
+
+    `confirms_candidate` reads a `422` from the commit endpoint as "the repository does not hold
+    it", but two other readers turn `NOT_FOUND_OR_INACCESSIBLE` into a published fact — "the branch
+    is unprotected", "the alert family is not enabled". Classifying `422` in the shared table would
+    manufacture those facts out of a malformed or throttled request, so the status is carried on the
+    error and read only by the call that knows what it means.
+    """
+    session = Session()
+    response = Response()
+    response.status_code = 422
+    response.url = "https://api.github.com/repos/hmcts/nfdiv-case-api/dependabot/alerts"
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with patch.object(session, "get", return_value=response), pytest.raises(GitHubError) as captured:
+        client.get("https://api.github.com/repos/hmcts/nfdiv-case-api/dependabot/alerts")
+
+    assert captured.value.reason is AvailabilityReason.COLLECTION_FAILED
+    assert captured.value.status == 422
 
 
 def test_get_reports_network_failure() -> None:

@@ -188,6 +188,72 @@ def test_load_configuration_rejects_invalid_values(
         load_configuration(configuration_path)
 
 
+def test_load_configuration_names_the_rejected_key_and_the_files_read(configuration_path: Path) -> None:
+    """Report the location of every rejected key, and what was read, without the input document."""
+    policy = configuration_path.parent / "policy.yaml"
+    content = configuration_path.read_text(encoding="utf-8")
+    teams = content.index("teams:")
+    policy.write_text(content[:teams].replace("  maximum_days: 180", "  maximum_days: 0"), encoding="utf-8")
+    team_file = configuration_path.parent / "civil.yaml"
+    team_file.write_text(content[teams:].replace("    display_name: Civil\n", ""), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as raised:
+        load_configuration(policy, team_file)
+
+    message = str(raised.value)
+    assert "lookback.maximum_days: Input should be greater than 0" in message
+    assert "teams.0.display_name: Field required" in message
+    assert f"(read from {policy}, {team_file})" in message
+    assert "https://errors.pydantic.dev" not in message
+    assert "organization" not in message  # The input document itself is never echoed.
+
+
+def test_load_configuration_reports_a_missing_required_key(configuration_path: Path) -> None:
+    """Name the missing key rather than printing the configuration that lacks it."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(content.replace("organization: hmcts\n", ""), encoding="utf-8")
+
+    with pytest.raises(
+        ConfigurationError,
+        match=f"^organization: Field required \\(read from {configuration_path}\\)$",
+    ):
+        load_configuration(configuration_path)
+
+
+def test_load_configuration_accepts_a_policy_file_without_teams(configuration_path: Path) -> None:
+    """Load the policy half on its own, for the commands that read no repository cohort."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(content[: content.index("teams:")], encoding="utf-8")
+
+    configuration = load_configuration(configuration_path)
+
+    assert configuration.teams == ()
+    assert configuration.sonar_organization_name == "hmcts"
+    assert configured_repositories(configuration) == ()
+
+
+def test_load_configuration_keeps_checking_project_keys_without_teams(configuration_path: Path) -> None:
+    """Reject a blank project key even where there is no cohort to attribute it to."""
+    content = configuration_path.read_text(encoding="utf-8")
+    policy = content[: content.index("teams:")] + "sonar_projects:\n  civil-service: ' '\n"
+    configuration_path.write_text(policy, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="sonar project keys may not be empty: civil-service"):
+        load_configuration(configuration_path)
+
+
+@pytest.mark.parametrize("section", ["enablement:\n  civil-service: 2026-01-05\n", "sonar_projects:\n  a: b\n"])
+def test_load_configuration_defers_cohort_cross_checks_without_teams(
+    configuration_path: Path,
+    section: str,
+) -> None:
+    """Do not fail a cohort-less load over a key that names a repository it cannot see."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(content[: content.index("teams:")] + section, encoding="utf-8")
+
+    assert load_configuration(configuration_path).teams == ()
+
+
 def test_load_configuration_rejects_duplicate_ownership(configuration_path: Path) -> None:
     """Prevent one repository contributing to multiple team aggregates."""
     with configuration_path.open("a", encoding="utf-8") as configuration_file:
@@ -321,6 +387,60 @@ def test_enablement_instants_reports_every_repository_in_the_reporting_order(pop
     ]
 
 
+def test_load_configuration_reads_sonar_under_the_github_organisation_by_default(
+    configuration_path: Path,
+) -> None:
+    """Fall back to the GitHub organisation, so the common case is not restated in the file."""
+    configuration = load_configuration(configuration_path)
+
+    assert configuration.sonar_organization is None
+    assert configuration.sonar_organization_name == "hmcts"
+    assert configuration.sonar_projects == {}
+
+
+def test_load_configuration_prefers_an_explicit_sonar_organisation(configuration_path: Path) -> None:
+    """Let the two names differ, because SonarCloud's organisation key is its own namespace."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write("sonar_organization: hmcts-sonar\n")
+
+    configuration = load_configuration(configuration_path)
+
+    assert configuration.sonar_organization == "hmcts-sonar"
+    assert configuration.sonar_organization_name == "hmcts-sonar"
+
+
+def test_load_configuration_loads_a_sonar_project_override(configuration_path: Path) -> None:
+    """Carry the answer of last resort for a repository whose project the map cannot settle."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write("sonar_projects:\n  civil-service: uk.gov.hmcts.civil\n")
+
+    assert load_configuration(configuration_path).sonar_projects == {"civil-service": "uk.gov.hmcts.civil"}
+
+
+def test_load_configuration_rejects_a_sonar_project_for_an_unconfigured_repository(
+    configuration_path: Path,
+) -> None:
+    """Name the offending repository rather than reporting it as a project nobody mapped."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write("sonar_projects:\n  civil-servcie: civil\n  retired-service: retired\n")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="sonar projects must name a configured repository: civil-servcie, retired-service",
+    ):
+        load_configuration(configuration_path)
+
+
+@pytest.mark.parametrize("written", ["''", "'   '"])
+def test_load_configuration_rejects_an_empty_sonar_project_key(configuration_path: Path, written: str) -> None:
+    """Refuse an override that silently means "unresolved" while reading as a decision."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write(f"sonar_projects:\n  civil-service: {written}\n")
+
+    with pytest.raises(ConfigurationError, match="sonar project keys may not be empty: civil-service"):
+        load_configuration(configuration_path)
+
+
 def test_load_configuration_preserves_absolute_database_path(configuration_path: Path, tmp_path: Path) -> None:
     """Keep explicitly absolute database paths unchanged."""
     database = tmp_path / "absolute.sqlite3"
@@ -416,6 +536,8 @@ def test_the_shipped_example_configuration_loads_and_carries_every_documented_ke
     assert configuration.traceability.minimum_description == 30
     assert configuration.traceability.reference_patterns == (r"#\d+", r"[A-Z][A-Z0-9]+-\d+")
     assert configuration.enablement == {"example-service": datetime(2026, 6, 1, tzinfo=UTC)}
+    assert configuration.sonar_organization_name == "hmcts"
+    assert configuration.sonar_projects == {"example-service": "example-service"}
 
 
 @pytest.fixture

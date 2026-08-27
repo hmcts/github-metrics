@@ -10,9 +10,22 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from time import monotonic
+from typing import Protocol
 
 from metrics.domain import RepositoryCollectionCost
-from metrics.github import GitHubClient
+
+
+class CallCounter(Protocol):
+    """Count the calls one client has issued, which is the only thing a meter reads off it.
+
+    A protocol rather than `GitHubClient`, because a repository's collection now spends two APIs and
+    both belong in its one figure. Nothing here knows which quota a call came out of: the meter
+    measures WORK, and the quotas are named where they are respected.
+    """
+
+    @property
+    def requests_issued(self) -> int:
+        """Count every call this client has issued since it was built."""
 
 
 def elapsed() -> float:
@@ -39,11 +52,23 @@ class CostMeter:
     between two readings taken around that repository's work. Elapsed seconds come from a MONOTONIC
     clock and are never the difference of two wall-clock instants: a clock correction mid-run would
     otherwise report a repository as having taken a negative amount of time.
+
+    `sonar` is the second client a current-state collection may spend calls on, and its calls are
+    added to the SAME figure rather than reported separately: the unit being measured is one
+    repository's collection, and splitting it by API would answer a question about quotas that this
+    instrument does not track. It is None wherever no SonarCloud state is collected — the window
+    phase, and any run given no SonarCloud source.
     """
 
-    client: GitHubClient
+    client: CallCounter
+    sonar: CallCounter | None = None
     requests: int = field(default=0, init=False)
     elapsed: float = field(default=0.0, init=False)
+
+    @property
+    def issued(self) -> int:
+        """Read every counter this meter watches, as one running total of calls made."""
+        return self.client.requests_issued + (0 if self.sonar is None else self.sonar.requests_issued)
 
     @contextmanager
     def measure(self) -> Iterator[None]:
@@ -53,12 +78,12 @@ class CostMeter:
         spent the calls and the seconds it spent before failing, and a run stopped by a rate limit is
         precisely the run whose cost a reader needs to see.
         """
-        issued = self.client.requests_issued
+        issued = self.issued
         started = elapsed()
         try:
             yield
         finally:
-            self.requests += self.client.requests_issued - issued
+            self.requests += self.issued - issued
             self.elapsed += elapsed() - started
 
     def cost(self, repository: str) -> RepositoryCollectionCost:

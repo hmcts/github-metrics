@@ -3,8 +3,10 @@
 import logging
 import sys
 from argparse import ArgumentParser, Namespace
+from collections import Counter
 from collections.abc import Mapping
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from os import environ
 from pathlib import Path
@@ -31,6 +33,8 @@ from metrics.domain import (
     OpenPullRequestReport,
     PracticeEvidenceReport,
     ReportingWindow,
+    SonarProjectMapping,
+    StoredSonarMapping,
     TrendReport,
 )
 from metrics.evidence import (
@@ -39,22 +43,32 @@ from metrics.evidence import (
     collected_repository_evidence,
     offline_open_pull_request_report,
     open_pull_request_report,
-    stored_codeowners,
-    stored_maintenance,
-    stored_merge_gate,
+    stored_reports,
     stored_repository_state,
-    stored_security_alerts,
 )
-from metrics.github import GitHubClient
-from metrics.inventory import collect_inventory
+from metrics.github import GitHubClient, GitHubError
+from metrics.inventory import SonarSource, collect_inventory
 from metrics.render import RepositoryDrillDown, render_report, render_trend_report
 from metrics.rules import configured_rules
+from metrics.sonar import (
+    SEARCH_INTERVAL_SECONDS,
+    CallPacer,
+    SonarClient,
+    SonarError,
+    SonarMappingOutcome,
+    SonarProject,
+    SonarResolutionAttempt,
+    StoredProjectMap,
+    sonar_to_github,
+)
 from metrics.storage import (
     StorageError,
+    load_sonar_mapping,
     observation_database,
     prune_cache,
     record_alert_observations,
     record_repository_state,
+    record_sonar_mapping,
 )
 from metrics.trend import SeriesRequest, series_status, trend_report
 from metrics.window import parse_instant, resolve_window
@@ -70,6 +84,17 @@ exiting `1` would throw away evidence that was collected and is worth reporting.
 
 `3` rather than `2`: `argparse` already exits `2` for a usage error, and a caller must be able to
 tell "you invoked me wrongly" from "I ran, and part of the org would not answer".
+"""
+
+COHORT_COMMANDS = frozenset({"collect", "doctor", "evidence", "trend"})
+"""Every command whose subject is the configured repository cohort, and which therefore needs one.
+
+`map-sonar` and `prune` are absent deliberately: the first resolves every project a SonarCloud
+organisation lists and the second deletes stale cache rows, and neither reads a team, a repository
+list, or anything derived from either. Requiring a `teams:` section of them — which the schema did
+until the configuration was split into a policy file and a team file — obliged a team file to be
+layered in to satisfy a validator, not to be used, and reported its absence as invalid configuration
+when nothing about the run was invalid. See config.py's `teams` for the other half of this.
 """
 
 
@@ -116,6 +141,14 @@ def parse_arguments() -> Namespace:
     prune = commands.add_parser("prune", help="delete cached intervals that have not been used recently")
     add_configuration_argument(prune)
     prune.add_argument("--days", type=int, default=30, help="delete cached intervals unused for this many days")
+    # Its own command rather than part of `collect`, because it is paced against GitHub's
+    # 30-per-minute commit search: 289 projects cannot be resolved inside a collection run, and
+    # nothing about the answer changes between analyses. Run it by hand, periodically.
+    map_sonar = commands.add_parser(
+        "map-sonar",
+        help="resolve each SonarCloud project to the GitHub repository it analyses, and store the map",
+    )
+    add_configuration_argument(map_sonar)
     evidence = commands.add_parser("evidence", help="explain cached behaviour evidence without GitHub access")
     add_configuration_argument(evidence)
     evidence.add_argument("--repository", help="limit results to one configured repository")
@@ -197,19 +230,17 @@ def evidence_report(
         rules = configured_rules(configuration)
         policy = readiness_policy(configuration)
         # One load per repository, projected into every block that reads it: the merge gate, the
-        # security alerts, CODEOWNERS presence and maintenance are four views of the same stored row.
+        # security alerts, CODEOWNERS presence, maintenance and the SonarCloud measures are five
+        # views of the same stored row.
         stored = {item.repository: stored_repository_state(configuration, item.repository) for item in evidence}
         return PracticeEvidenceReport(
             organization=configuration.organization,
             repositories=tuple(
                 item.practices(
                     rules,
-                    stored_merge_gate(stored[item.repository]),
                     policy,
                     open_pull_requests[item.repository],
-                    stored_security_alerts(stored[item.repository]),
-                    stored_codeowners(stored[item.repository]),
-                    stored_maintenance(stored[item.repository]),
+                    stored_reports(stored[item.repository]),
                 )
                 for item in evidence
             ),
@@ -432,6 +463,24 @@ def emit_trend(configuration: Configuration, options: Namespace) -> int:
     return run_status(series_status(report))
 
 
+def sonar_source(configuration: Configuration, session: Session) -> SonarSource:
+    """Build the SonarCloud source a collection reads each repository's quality state through.
+
+    The map it resolves through is the one `map-sonar` wrote into the DURABLE observations file, and
+    it is read rather than built here: attributing a project to a repository costs a commit search
+    limited to 30 calls a minute, which a collection cannot afford. A configuration whose map is
+    empty resolves nothing, reports the reason on every repository, and exits `0`.
+    """
+    return SonarSource(
+        client=SonarClient(session),
+        project_map=StoredProjectMap(
+            path=observation_database(configuration.database),
+            sonar_organization=configuration.sonar_organization_name,
+        ),
+        overrides=configuration.sonar_projects,
+    )
+
+
 def collect_evidence(configuration: Configuration, options: Namespace, token: str) -> int:
     """Fill the cache for one collection window and report what was fetched or reused.
 
@@ -450,13 +499,15 @@ def collect_evidence(configuration: Configuration, options: Namespace, token: st
     except ValueError as exception:
         logging.error("Unusable collection window: %s", exception)
         return 1
-    with Session() as session:
+    # Two sessions, as `map-sonar` uses: the GitHub client puts its bearer token on the session it is
+    # given, and sharing one would send a GitHub token to SonarCloud on every request.
+    with Session() as session, Session() as sonar_session:
         client = GitHubClient(token, session)
         try:
             inventory = collect_window(
                 configuration,
                 client,
-                collect_inventory(configuration, client, window),
+                collect_inventory(configuration, client, window, sonar_source(configuration, sonar_session)),
                 window,
                 reference,
             )
@@ -470,18 +521,272 @@ def collect_evidence(configuration: Configuration, options: Namespace, token: st
     return run_status(inventory.status)
 
 
+@dataclass
+class MappingProgress:
+    """Tally what one `map-sonar` run learned and what it spent, as it goes.
+
+    Accumulated in one object rather than assembled at the end because the run is INTERRUPTIBLE: it
+    is paced against the scarcest quota this project spends, and a rate limit or a human can stop it
+    part way through an organisation. The summary must then describe the projects it did answer,
+    which is the whole reason each row is written as it is resolved rather than in one batch.
+
+    `claims` is keyed by repository and holds every project key that named it, so that the
+    many-to-one case is visible: SonarCloud has no rename, so a re-created project leaves its
+    abandoned twin behind claiming the same repository, and a human deciding which key is live wants
+    both names rather than a count.
+    """
+
+    listed: int
+    unchanged: int = 0
+    stopped: bool = False
+    outcomes: Counter[SonarMappingOutcome] = field(default_factory=Counter)
+    claims: dict[str, list[str]] = field(default_factory=dict)
+
+    def claim(self, mapping: SonarProjectMapping | None) -> None:
+        """Record that one project names one repository, keeping every project that named it."""
+        if mapping is not None:
+            self.claims.setdefault(mapping.repository, []).append(mapping.project_key)
+
+    def record(self, attempt: SonarResolutionAttempt) -> None:
+        """Count one attempt's outcome, and the repository it claimed if it resolved one."""
+        self.outcomes[attempt.outcome] += 1
+        self.claim(attempt.mapping)
+
+    def count(self, *outcomes: SonarMappingOutcome) -> int:
+        """Count the visited projects that ended in any of the given outcomes."""
+        return sum(self.outcomes[outcome] for outcome in outcomes)
+
+    @property
+    def answered(self) -> int:
+        """Count the projects this run has an answer for, whether it resolved one or read one back.
+
+        A never-analysed or unresolvable project IS answered: there is nothing more to learn about it
+        until it is analysed again, which is why it is stored with its reason. Only a failed call
+        leaves a project unanswered.
+        """
+        return self.unchanged + sum(count for outcome, count in self.outcomes.items() if outcome.is_observation)
+
+    @property
+    def disputed(self) -> dict[str, tuple[str, ...]]:
+        """List every repository more than one project claims, which is the duplicate-project list."""
+        return {
+            repository: tuple(projects) for repository, projects in sorted(self.claims.items()) if len(projects) > 1
+        }
+
+    @property
+    def status(self) -> CollectionStatus:
+        """Describe the run's completeness the way every other command's status is described."""
+        if not self.answered:
+            return CollectionStatus.FAILED
+        if self.stopped or self.outcomes[SonarMappingOutcome.FAILED]:
+            return CollectionStatus.PARTIAL
+        return CollectionStatus.COMPLETE
+
+
+def already_answered(project: SonarProject, stored: StoredSonarMapping) -> bool:
+    """Decide whether the stored map already answers for this project, so no call need be spent.
+
+    THE WATERMARK IS WHEN THE ROW WAS WRITTEN, NOT WHICH ANALYSIS ANSWERED. A row is skipped when
+    NOTHING HAS BEEN ANALYSED SINCE it was stored: whatever the last run learned — a repository, or
+    the reason there is none — is a property of the analyses that existed then, and asking again
+    before a newer one exists spends the scarcest quota there is on a question already answered. It
+    falls through the moment a newer analysis exists, which is the only thing that can change the
+    answer.
+
+    Comparing against the RESOLVING analysis instead would never converge for the projects
+    `sonar_to_github` walks back for: it records the instant of whichever analysis resolved, which is
+    older than the listed one whenever the newest commit is not findable — so the row would be
+    re-resolved every run, and `record_sonar_mapping` would then refuse the identical write.
+    """
+    return project.analysis_at is None or project.analysis_at <= stored.resolved_at
+
+
+def resolve_listed_projects(
+    sonar: SonarClient,
+    github: GitHubClient,
+    organization: str,
+    sonar_organization: str,
+    database: Path,
+    projects: tuple[SonarProject, ...],
+) -> MappingProgress:
+    """Resolve each listed project to its repository, storing every answer as it is arrived at.
+
+    BOTH ORGANISATION NAMES ARE CARRIED, because they are allowed to differ: `organization` is the
+    GitHub one the commit search is qualified by and the owner an answer must belong to, and
+    `sonar_organization` is the SonarCloud one the map is keyed under. Collapsing them would search
+    GitHub for an organisation that need not exist there.
+
+    Stopped rather than failed by a rate limit that survived the client's own retries: the limit
+    applies to every project still to come exactly as it applied to this one, so continuing would
+    write this run's exhaustion into the map as each remaining project's own dead end.
+    """
+    pacer = CallPacer(SEARCH_INTERVAL_SECONDS)
+    progress = MappingProgress(listed=len(projects))
+    for position, project in enumerate(projects, start=1):
+        stored = load_sonar_mapping(database, sonar_organization, project.key)
+        if stored is not None and already_answered(project, stored):
+            progress.unchanged += 1
+            progress.claim(stored.mapping)
+            logging.info(
+                "SKIP   %s (%s/%s): nothing analysed since it was resolved",
+                project.key,
+                position,
+                len(projects),
+            )
+            continue
+        try:
+            attempt = sonar_to_github(sonar, github, organization, project.key, pacer=pacer)
+        except GitHubError as exception:
+            # The one error `sonar_to_github` raises rather than classifying is an exhausted rate
+            # limit, which is why this is a stop and not one project's failure.
+            logging.error(
+                "ERROR  %s (%s/%s): %s; stopping and keeping the %s projects already resolved",
+                project.key,
+                position,
+                len(projects),
+                exception,
+                progress.answered,
+            )
+            progress.stopped = True
+            return progress
+        progress.record(attempt)
+        report_attempt(project, attempt, position, len(projects))
+        if attempt.outcome.is_observation:
+            store_attempt(database, sonar_organization, attempt)
+    return progress
+
+
+def report_attempt(project: SonarProject, attempt: SonarResolutionAttempt, position: int, listed: int) -> None:
+    """Say on stderr what became of one project, as `doctor` reports one repository."""
+    progress = f"({position}/{listed})"
+    if attempt.mapping is not None:
+        logging.info("OK     %s %s: %s", attempt.project_key, progress, attempt.mapping.repository)
+    elif attempt.outcome is SonarMappingOutcome.FAILED:
+        logging.error("ERROR  %s %s: %s", attempt.project_key, progress, attempt.detail)
+    else:
+        # An observation, not a failure: the project has been answered for, and the answer is that
+        # nothing on either side names a repository for it.
+        logging.info("NONE   %s %s: %s", attempt.project_key, progress, attempt.detail)
+    logging.debug("project %s was last analysed at %s", project.key, project.analysis_at)
+
+
+def store_attempt(database: Path, sonar_organization: str, attempt: SonarResolutionAttempt) -> None:
+    """Upsert one answered project, saying when a newer stored answer was left in place.
+
+    Only an answer is stored, never a failed call: `record_sonar_mapping` refuses anything whose
+    analysis is not newer than the stored row's, so a resolution taken from an older analysis — and
+    every unresolved reason, which has no analysis instant at all — leaves an existing mapping alone
+    rather than overwriting it with less.
+    """
+    resolution = StoredSonarMapping(
+        project_key=attempt.project_key,
+        resolved_at=datetime.now(UTC),
+        mapping=attempt.mapping,
+        detail=attempt.detail,
+    )
+    if not record_sonar_mapping(database, sonar_organization, resolution):
+        logging.debug("kept the stored mapping for %s: it was resolved from a newer analysis", attempt.project_key)
+
+
+def log_mapping_summary(organization: str, progress: MappingProgress) -> None:
+    """Report what the run cost and what the map now holds, including the repositories two projects claim."""
+    logging.info(
+        "Mapped %s of %s projects listed for %s: %s resolved, %s unchanged, %s never analysed, "
+        "%s unresolvable, %s failed; %s repositories mapped",
+        progress.answered,
+        progress.listed,
+        organization,
+        progress.count(SonarMappingOutcome.RESOLVED),
+        progress.unchanged,
+        progress.count(SonarMappingOutcome.NO_ANALYSIS),
+        progress.count(
+            SonarMappingOutcome.NO_REVISION,
+            SonarMappingOutcome.UNKNOWN_COMMIT,
+            SonarMappingOutcome.OUTSIDE_ORGANIZATION,
+        ),
+        progress.count(SonarMappingOutcome.FAILED),
+        len(progress.claims),
+    )
+    for repository, projects in progress.disputed.items():
+        # A warning rather than an error: it is legitimate, and the reverse lookup resolves it by
+        # analysis recency. It is surfaced because the alternative to a human seeing both keys is a
+        # report quietly showing one project's gate for a repository that has two.
+        logging.warning("%s is claimed by %s projects: %s", repository, len(projects), ", ".join(projects))
+
+
+def map_sonar_projects(configuration: Configuration, token: str) -> int:
+    """Resolve every project the configured SonarCloud organisation lists, and store the map.
+
+    Two sessions, not one: the GitHub client puts its bearer token on the session it is given, and
+    sharing that session would send a GitHub token to SonarCloud on every request.
+
+    An organisation that lists nothing is a refusal rather than an empty success — the configured
+    `sonar_organization` names nothing readable, and reporting `0` would let a later evidence run
+    read an empty map as "no repository has a SonarCloud project".
+
+    The two organisation names are kept apart throughout: SonarCloud is listed and the map is keyed
+    under `sonar_organization`, while the commit search that resolves a project is qualified by the
+    GitHub `organization`. They are the same string at HMCTS and need not be anywhere else.
+    """
+    sonar_organization = configuration.sonar_organization_name
+    database = observation_database(configuration.database)
+    with Session() as github_session, Session() as sonar_session:
+        github = GitHubClient(token, github_session)
+        sonar = SonarClient(sonar_session)
+        try:
+            projects = sonar.list_projects(sonar_organization)
+        except SonarError as exception:
+            logging.error("SonarCloud project listing failed for %s: %s", sonar_organization, exception)
+            return 1
+        if not projects:
+            logging.error("SonarCloud lists no project for organisation %s", sonar_organization)
+            return 1
+        logging.info("SonarCloud lists %s projects for %s", len(projects), sonar_organization)
+        try:
+            progress = resolve_listed_projects(
+                sonar,
+                github,
+                configuration.organization,
+                sonar_organization,
+                database,
+                projects,
+            )
+        except StorageError as exception:
+            logging.error("Storage failed: %s", exception)
+            return 1
+    log_mapping_summary(sonar_organization, progress)
+    return run_status(progress.status)
+
+
+def resolve_configuration(options: Namespace) -> Configuration | None:
+    """Load the configuration, or report why it cannot serve the command that was asked for.
+
+    Two refusals, kept together because both are answered the same way — by a human editing what
+    `--config` points at — and both must happen before a session is opened or a token is looked for.
+    The second is not a schema rule: a configuration without a `teams:` section is perfectly valid
+    for `map-sonar` and `prune`, and invalid only for a command that reports the cohort.
+    """
+    try:
+        configuration = load_configuration(*options.config)
+    except ConfigurationError as exception:
+        logging.error("Invalid configuration: %s", exception)
+        return None
+    if options.command in COHORT_COMMANDS and not configuration.teams:
+        logging.error(
+            "%s reports the configured repositories, but no team is configured: add a `teams:` "
+            "section, or layer the team file in with a second --config",
+            options.command,
+        )
+        return None
+    return configuration
+
+
 def main() -> int:
     """Entry point for the command-line interface."""
     options = parse_arguments()
     logging.basicConfig(level=options.logging.upper(), format="%(asctime)s:%(levelname)s: %(message)s")
-    configuration: Configuration | None
-    try:
-        configuration = load_configuration(*options.config)
-    except ConfigurationError as exception:
-        configuration = None
-        message = str(exception)
+    configuration = resolve_configuration(options)
     if configuration is None:
-        logging.error("Invalid configuration: %s", message)
         return 1
     # The commands main() need not hold a token for: `prune` never contacts GitHub, and the two
     # reporting commands acquire one themselves only when they were not asked to stay offline.
@@ -497,6 +802,8 @@ def main() -> int:
         with Session() as session:
             logging.info("OK     Configuration valid")
             return 0 if run_doctor(configuration, token, session) else 1
+    if options.command == "map-sonar":
+        return map_sonar_projects(configuration, token)
     return collect_evidence(configuration, options, token)
 
 

@@ -31,7 +31,17 @@ from metrics.domain import (
     RepositoryTrend,
     SecurityAlertEvidence,
     SecurityAlertReport,
+    SonarGateLevel,
+    SonarMeasures,
+    SonarProjectMapping,
+    SonarProjectResolution,
+    SonarQualityGate,
+    SonarQualityGateCondition,
+    SonarRating,
+    SonarReport,
+    SonarResolution,
     SourceCoverage,
+    StoredSonarMapping,
     TrendDelta,
     TrendMetric,
     TrendPeriod,
@@ -460,6 +470,207 @@ def test_a_repository_state_row_stored_before_the_minimum_standards_blocks_still
 
     assert item.codeowners is None
     assert item.maintenance is None
+    assert item.sonar is None
+
+
+SONAR_ANALYSIS_INSTANT = datetime(2026, 8, 26, 9, 30, tzinfo=UTC)
+
+
+def sonar_mapping(**overrides: object) -> SonarProjectMapping:
+    """Attribute one project to the repository a commit search resolved it to."""
+    fields: dict[str, object] = {
+        "project_key": "hmcts.cath",
+        "repository": "cath-service",
+        "method": SonarResolution.ANALYSIS_REVISION,
+        "analysis_at": SONAR_ANALYSIS_INSTANT,
+        "revision": "f00dcafe",
+    }
+    return SonarProjectMapping.model_validate(fields | overrides)
+
+
+def sonar_measures(**overrides: object) -> SonarMeasures:
+    """Describe one analysed project whose gate passed."""
+    fields: dict[str, object] = {
+        "project_key": "hmcts.cath",
+        "analysis_at": SONAR_ANALYSIS_INSTANT,
+        "gate": SonarQualityGate(
+            level=SonarGateLevel.OK,
+            conditions=(
+                SonarQualityGateCondition(
+                    metric="new_coverage",
+                    comparator="LT",
+                    threshold="80",
+                    actual="86.5",
+                    level=SonarGateLevel.OK,
+                ),
+            ),
+        ),
+        "coverage": 89.2,
+        "maintainability_rating": SonarRating(value=1.0),
+    }
+    return SonarMeasures.model_validate(fields | overrides)
+
+
+@pytest.mark.parametrize(
+    ("value", "letter"),
+    [(1.0, "A"), (2.0, "B"), (3.0, "C"), (4.0, "D"), (5.0, "E")],
+)
+def test_a_sonar_rating_names_the_letter_its_number_stands_for(value: float, letter: str) -> None:
+    """Read SonarCloud's 1.0-5.0 scale as the A-E letters every reader of the block expects."""
+    assert SonarRating(value=value).letter == letter
+
+
+@pytest.mark.parametrize("value", [0.0, 6.0, 3.5, -1.0, 100.0])
+def test_a_rating_off_the_scale_names_no_letter_rather_than_the_best_one(value: float) -> None:
+    """Refuse to letter a rating this build does not understand, and keep the number it was given.
+
+    Clamping to an end of the scale would report an unknown rating as `A`, which is a claim about
+    the code; an absent letter renders as a dash and claims nothing.
+    """
+    rating = SonarRating(value=value)
+
+    assert rating.letter is None
+    assert rating.value == value
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {
+            "measures": sonar_measures(),
+            "mapping": sonar_mapping(),
+            "detail": "no repository state has been collected; run metrics collect",
+        },
+    ],
+)
+def test_sonar_report_requires_evidence_or_the_reason_there_is_none(fields: dict[str, object]) -> None:
+    """Refuse a SonarCloud block that is silently empty, or that both reports and disclaims one."""
+    with pytest.raises(ValidationError, match="either its evidence or the reason it is unavailable"):
+        SonarReport.model_validate(fields)
+
+
+def test_a_sonar_report_may_name_the_project_a_reason_is_about() -> None:
+    """Report the resolved project beside an unreadable measurement, rather than withholding it.
+
+    A project can be mapped and its measures still be unavailable — a failed call, or a row stored
+    before this source existed — and the reason is more use to a reader when it says which project it
+    concerns.
+    """
+    report = SonarReport(
+        fetched_at=MAINTENANCE_INSTANT,
+        mapping=sonar_mapping(),
+        detail="SonarCloud measures were not collected when repository state was stored",
+    )
+
+    assert report.mapping is not None
+    assert report.mapping.project_key == "hmcts.cath"
+
+
+def test_a_sonar_report_cannot_report_one_project_under_another_project_name() -> None:
+    """Refuse a block headed by one project key that carries a different project's measures."""
+    with pytest.raises(ValidationError, match="reported for the project the mapping names"):
+        SonarReport(
+            fetched_at=MAINTENANCE_INSTANT,
+            mapping=sonar_mapping(project_key="rpx-xui-webapp_2"),
+            measures=sonar_measures(),
+        )
+
+
+def test_a_sonar_report_carries_its_measures_beside_the_mapping_that_found_them() -> None:
+    """Report the gate, its conditions and the resolution method that attributed the project."""
+    report = SonarReport(fetched_at=MAINTENANCE_INSTANT, mapping=sonar_mapping(), measures=sonar_measures())
+
+    assert report.mapping is not None
+    assert report.mapping.method is SonarResolution.ANALYSIS_REVISION
+    assert report.measures is not None
+    assert report.measures.gate is not None
+    assert report.measures.gate.conditions[0].actual == "86.5"
+    assert report.measures.maintainability_rating is not None
+    assert report.measures.maintainability_rating.letter == "A"
+
+
+def test_a_sonar_project_resolution_must_name_a_project_or_say_why_it_names_none() -> None:
+    """Refuse a stored resolution that says nothing, which would read as "not collected"."""
+    with pytest.raises(ValidationError, match="name a project or say why it names none"):
+        SonarProjectResolution()
+
+
+def test_a_sonar_project_resolution_may_name_a_project_and_a_reason_together() -> None:
+    """Keep the reason beside the project it is about, for a project resolved and then not measured."""
+    resolution = SonarProjectResolution(mapping=sonar_mapping(), detail="SonarCloud rate limit exceeded")
+
+    assert resolution.mapping is not None
+    assert resolution.mapping.project_key == "hmcts.cath"
+    assert resolution.detail == "SonarCloud rate limit exceeded"
+
+
+def test_a_gate_with_no_conditions_is_accepted() -> None:
+    """Accept the never-analysed project's gate: a level, and nothing measured behind it.
+
+    Fourteen of the organisation's 289 projects had never been analysed on 2026-08-27, and each has
+    a gate SonarCloud reports as `NONE` with no conditions at all.
+    """
+    gate = SonarQualityGate(level=SonarGateLevel.NONE)
+
+    assert gate.conditions == ()
+
+
+def test_a_listed_project_that_was_never_analysed_measures_nothing_rather_than_zero() -> None:
+    """Leave every measure absent for a project with no analysis, so no rendering invents a number."""
+    measures = SonarMeasures(project_key="hmcts.never-analysed")
+
+    assert measures.analysis_at is None
+    assert measures.gate is None
+    assert measures.coverage is None
+    assert measures.lines_of_code is None
+    assert measures.violations is None
+    assert measures.security_hotspots is None
+    assert measures.reliability_rating is None
+    assert measures.maintainability_rating is None
+    assert measures.security_rating is None
+    assert measures.security_review_rating is None
+    assert "coverage" not in measures.model_dump(exclude_none=True)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"mapping": sonar_mapping(), "detail": "SonarCloud records no analysis of this project"},
+    ],
+)
+def test_a_stored_sonar_mapping_requires_a_mapping_or_the_reason_there_is_none(fields: dict[str, object]) -> None:
+    """Refuse a stored map row that neither resolves a project nor says why it could not.
+
+    A row with neither would cost the search quota to re-ask on every run while looking answered,
+    which is the one thing storing the failures is there to prevent.
+    """
+    with pytest.raises(ValidationError, match="either its mapping or the reason it has none"):
+        StoredSonarMapping.model_validate({"project_key": "hmcts.cath", "resolved_at": MAINTENANCE_INSTANT} | fields)
+
+
+def test_a_stored_sonar_mapping_is_filed_under_the_project_it_names() -> None:
+    """Refuse a row keyed on one project that carries another project's mapping."""
+    with pytest.raises(ValidationError, match="filed under the project key it names"):
+        StoredSonarMapping(
+            project_key="rpx-xui-webapp",
+            resolved_at=MAINTENANCE_INSTANT,
+            mapping=sonar_mapping(project_key="rpx-xui-webapp_2"),
+        )
+
+
+def test_a_stored_sonar_mapping_reports_the_analysis_it_was_resolved_from() -> None:
+    """Expose the analysis instant a row was resolved from, which is what the upsert rule compares."""
+    resolved = StoredSonarMapping(project_key="hmcts.cath", resolved_at=MAINTENANCE_INSTANT, mapping=sonar_mapping())
+    unresolved = StoredSonarMapping(
+        project_key="hmcts.never-analysed",
+        resolved_at=MAINTENANCE_INSTANT,
+        detail="SonarCloud records no analysis of this project",
+    )
+
+    assert resolved.analysis_at == SONAR_ANALYSIS_INSTANT
+    assert unresolved.analysis_at is None
 
 
 def test_distribution_rejects_negative_percentiles() -> None:
