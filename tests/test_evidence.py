@@ -29,12 +29,17 @@ from metrics.domain import (
     AvailabilityReason,
     BehaviourProvenance,
     CacheStatus,
+    CodeownersEvidence,
+    CodeownersFile,
+    CodeownersReport,
     CohortSummary,
     CollectionStatus,
     DirectCommitFact,
     DistributionObservation,
     EvidenceSource,
     EvidenceUnavailable,
+    MaintenanceEvidence,
+    MaintenanceReport,
     MergeGateEvidence,
     MergeGateReport,
     Merges,
@@ -58,9 +63,12 @@ from metrics.evidence import (
     RepositoryEvidence,
     cached_repository_evidence,
     collected_repository_evidence,
+    maintenance_windows,
     offline_open_pull_request_report,
     open_pull_request_report,
     repository_evidence,
+    stored_codeowners,
+    stored_maintenance,
     stored_merge_gate,
     stored_repository_state,
     stored_security_alerts,
@@ -88,6 +96,16 @@ def uncollected_gate() -> MergeGateReport:
 def uncollected_security() -> SecurityAlertReport:
     """Build the security report of a repository whose state has never been collected."""
     return SecurityAlertReport(detail="no repository state has been collected; run metrics collect")
+
+
+def uncollected_codeowners() -> CodeownersReport:
+    """Build the CODEOWNERS report of a repository whose state has never been collected."""
+    return CodeownersReport(detail="no repository state has been collected; run metrics collect")
+
+
+def uncollected_maintenance() -> MaintenanceReport:
+    """Build the maintenance report of a repository whose state has never been collected."""
+    return MaintenanceReport(detail="no repository state has been collected; run metrics collect")
 
 
 def default_policy() -> ReadinessPolicy:
@@ -408,6 +426,8 @@ def test_repository_practice_evidence_honors_rule_controls() -> None:
         default_policy(),
         offline_open_pull_request_report(),
         uncollected_security(),
+        uncollected_codeowners(),
+        uncollected_maintenance(),
     )
 
     assert excluded.behaviour == ()
@@ -427,6 +447,8 @@ def test_repository_practice_evidence_collates_every_enabled_rule() -> None:
         default_policy(),
         offline_open_pull_request_report(),
         uncollected_security(),
+        uncollected_codeowners(),
+        uncollected_maintenance(),
     )
 
     assert len(report.behaviour) == 2
@@ -441,6 +463,8 @@ def test_repository_practice_evidence_omits_a_disabled_assessment() -> None:
         ReadinessPolicy(AssessmentConfiguration(enabled=False), TrivialityConfiguration()),
         offline_open_pull_request_report(),
         uncollected_security(),
+        uncollected_codeowners(),
+        uncollected_maintenance(),
     )
 
     assert report.assessment is None
@@ -569,8 +593,10 @@ def merge_gate() -> MergeGateEvidence:
 def collected_state(
     gate: MergeGateEvidence | None,
     security: SecurityAlertEvidence | None = None,
+    codeowners: CodeownersEvidence | None = None,
+    maintenance: MaintenanceEvidence | None = None,
 ) -> RepositoryInventory:
-    """Build one collection whose stored state carries the given merge gate and security alerts."""
+    """Build one collection whose stored state carries the given current-state blocks."""
     collected_at = datetime(2026, 8, 8, 9, tzinfo=UTC)
     return RepositoryInventory(
         status=CollectionStatus.COMPLETE,
@@ -593,6 +619,8 @@ def collected_state(
                 ),
                 merge_gate=gate,
                 security=security,
+                codeowners=codeowners,
+                maintenance=maintenance,
             ),
         ),
         failures=(),
@@ -710,6 +738,212 @@ def test_stored_security_alerts_preserve_storage_failure(tmp_path: Path) -> None
         report = stored_security_alerts(stored_repository_state(configuration(tmp_path), "cath-service"))
 
     assert report == SecurityAlertReport(detail="cache unreadable")
+
+
+STANDARDS_FETCHED_AT = datetime(2026, 8, 8, 9, tzinfo=UTC)
+"""The instant `collected_state` stamps on the stored row, against which windows derive."""
+
+
+def collected_codeowners() -> CodeownersEvidence:
+    """Build stored CODEOWNERS files where one location counts on GitHub and one does not."""
+    return CodeownersEvidence(
+        files=(
+            CodeownersFile(path=".github/CODEOWNERS", size_bytes=120, recognised_by_github=True),
+            CodeownersFile(path="docs/CODEOWNERS.md", size_bytes=0, recognised_by_github=False),
+        ),
+    )
+
+
+def maintained(
+    last_commit_at: datetime | None,
+    last_human_commit_at: datetime | None = None,
+    searched_back_to: datetime | None = None,
+) -> MaintenanceEvidence:
+    """Build stored maintenance instants on the default branch."""
+    return MaintenanceEvidence(
+        branch="main",
+        last_commit_at=last_commit_at,
+        last_human_commit_at=last_human_commit_at,
+        searched_back_to=searched_back_to,
+    )
+
+
+def test_stored_codeowners_reports_the_files_with_the_instant_they_were_read(tmp_path: Path) -> None:
+    """Serve CODEOWNERS presence from storage with its freshness, like the merge gate beside it."""
+    settings = configuration(tmp_path)
+    record_repository_state(settings.database, collected_state(merge_gate(), codeowners=collected_codeowners()))
+
+    report = stored_codeowners(stored_repository_state(settings, "cath-service"))
+
+    assert report.codeowners == collected_codeowners()
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail is None
+
+
+def test_stored_codeowners_reports_a_repository_that_was_never_collected(tmp_path: Path) -> None:
+    """State that nothing was collected rather than omitting the block or implying an absent file."""
+    report = stored_codeowners(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report.codeowners is None
+    assert report.fetched_at is None
+    assert report.detail == "no repository state has been collected; run metrics collect"
+
+
+def test_stored_codeowners_separates_state_collected_before_the_check_existed(tmp_path: Path) -> None:
+    """Distinguish a row stored without the check from a repository that was never collected.
+
+    Reporting an old row as checked-and-absent would invent an observation nobody made — the same
+    rule that keeps a pre-alerts row from reading as a clean bill of health.
+    """
+    settings = configuration(tmp_path)
+    record_repository_state(settings.database, collected_state(merge_gate()))
+
+    report = stored_codeowners(stored_repository_state(settings, "cath-service"))
+
+    assert report.codeowners is None
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert (
+        report.detail == "CODEOWNERS presence was not collected when repository state was stored; run metrics collect"
+    )
+
+
+def test_stored_codeowners_preserves_storage_failure(tmp_path: Path) -> None:
+    """Describe an unreadable state table instead of raising through the report."""
+    with patch("metrics.evidence.load_repository_state", side_effect=StorageError("cache unreadable")):
+        report = stored_codeowners(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report == CodeownersReport(detail="cache unreadable")
+
+
+def test_stored_maintenance_derives_every_window_from_the_stored_instants(tmp_path: Path) -> None:
+    """Serve the stored instants with the three window rows derived against `fetched_at`."""
+    settings = configuration(tmp_path)
+    evidence = maintained(
+        STANDARDS_FETCHED_AT - timedelta(days=1),
+        last_human_commit_at=STANDARDS_FETCHED_AT - timedelta(days=10),
+    )
+    record_repository_state(settings.database, collected_state(merge_gate(), maintenance=evidence))
+
+    report = stored_maintenance(stored_repository_state(settings, "cath-service"))
+
+    assert report.maintenance == evidence
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail is None
+    assert tuple(row.months for row in report.windows) == (6, 12, 24)
+    assert all(row.committed_within for row in report.windows)
+    assert all(row.human_committed_within for row in report.windows)
+    assert all(row.human_detail is None for row in report.windows)
+
+
+def test_stored_maintenance_reports_a_repository_that_was_never_collected(tmp_path: Path) -> None:
+    """State that nothing was collected rather than implying an unmaintained repository."""
+    report = stored_maintenance(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report.maintenance is None
+    assert report.windows == ()
+    assert report.detail == "no repository state has been collected; run metrics collect"
+
+
+def test_stored_maintenance_separates_state_collected_before_the_check_existed(tmp_path: Path) -> None:
+    """Distinguish a row stored without the check from a repository that was never collected."""
+    settings = configuration(tmp_path)
+    record_repository_state(settings.database, collected_state(merge_gate()))
+
+    report = stored_maintenance(stored_repository_state(settings, "cath-service"))
+
+    assert report.maintenance is None
+    assert report.windows == ()
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail == "maintenance state was not collected when repository state was stored; run metrics collect"
+
+
+def test_stored_maintenance_preserves_storage_failure(tmp_path: Path) -> None:
+    """Describe an unreadable state table instead of raising through the report."""
+    with patch("metrics.evidence.load_repository_state", side_effect=StorageError("cache unreadable")):
+        report = stored_maintenance(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report == MaintenanceReport(detail="cache unreadable")
+
+
+@pytest.mark.parametrize(
+    ("offset", "committed_within_six_months"),
+    [
+        # The window is half-open [fetched_at - days, fetched_at): its start instant is inside.
+        (timedelta(0), True),
+        (timedelta(seconds=1), True),
+        (timedelta(seconds=-1), False),
+    ],
+)
+def test_maintenance_windows_decide_committed_at_the_exact_cutoff(
+    offset: timedelta,
+    committed_within_six_months: bool,  # noqa: FBT001 - parametrised expectation
+) -> None:
+    """Hold the 183-day boundary exactly: the cutoff instant itself is inside the window."""
+    committed_at = STANDARDS_FETCHED_AT - timedelta(days=183) + offset
+
+    windows = maintenance_windows(maintained(committed_at, last_human_commit_at=committed_at), STANDARDS_FETCHED_AT)
+
+    assert windows[0].committed_within is committed_within_six_months
+    assert windows[0].human_committed_within is committed_within_six_months
+    # A commit a second past the 6-month cutoff is still comfortably inside 12 and 24 months.
+    assert windows[1].committed_within is True
+    assert windows[2].committed_within is True
+
+
+def test_maintenance_windows_grade_a_found_human_commit_per_window() -> None:
+    """Decide every window both ways from a found human commit: no bound, so nothing is unknown."""
+    evidence = maintained(
+        STANDARDS_FETCHED_AT - timedelta(days=1),
+        last_human_commit_at=STANDARDS_FETCHED_AT - timedelta(days=200),
+    )
+
+    windows = maintenance_windows(evidence, STANDARDS_FETCHED_AT)
+
+    assert tuple(row.committed_within for row in windows) == (True, True, True)
+    assert tuple(row.human_committed_within for row in windows) == (False, True, True)
+    assert all(row.human_detail is None for row in windows)
+
+
+def test_maintenance_windows_decide_false_where_the_search_reached_the_cutoff() -> None:
+    """Answer False for every window the search fully examined without finding a human commit."""
+    evidence = maintained(
+        STANDARDS_FETCHED_AT - timedelta(days=1),
+        searched_back_to=STANDARDS_FETCHED_AT - timedelta(days=730),
+    )
+
+    windows = maintenance_windows(evidence, STANDARDS_FETCHED_AT)
+
+    assert tuple(row.committed_within for row in windows) == (True, True, True)
+    assert tuple(row.human_committed_within for row in windows) == (False, False, False)
+    assert all(row.human_detail is None for row in windows)
+
+
+def test_maintenance_windows_report_unknown_where_the_page_cap_stopped_the_search() -> None:
+    """Keep "none found" apart from "not examined": a capped search decides only the windows it covered."""
+    evidence = maintained(
+        STANDARDS_FETCHED_AT - timedelta(days=1),
+        searched_back_to=STANDARDS_FETCHED_AT - timedelta(days=300),
+    )
+
+    windows = maintenance_windows(evidence, STANDARDS_FETCHED_AT)
+
+    assert windows[0].human_committed_within is False
+    assert windows[0].human_detail is None
+    assert windows[1].human_committed_within is None
+    assert windows[2].human_committed_within is None
+    assert (
+        windows[1].human_detail == "the bounded search examined commits no older than 2025-10-12T09:00Z, "
+        "which does not reach this window's cutoff"
+    )
+
+
+def test_maintenance_windows_date_nothing_on_an_empty_branch() -> None:
+    """Decide every answer False on a branch with no commits: nothing exists to have been found."""
+    windows = maintenance_windows(maintained(None), STANDARDS_FETCHED_AT)
+
+    assert tuple(row.committed_within for row in windows) == (False, False, False)
+    assert tuple(row.human_committed_within for row in windows) == (False, False, False)
+    assert all(row.human_detail is None for row in windows)
 
 
 def open_pull_request_data(

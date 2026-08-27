@@ -84,6 +84,31 @@ def contributor_logins(changes: Iterable[Merge]) -> frozenset[str]:
     )
 
 
+def is_human_commit_author(
+    login: str | None,
+    account_type: str | None,
+    author_name: str | None,
+    excluded: Collection[str],
+) -> bool:
+    """Report whether one commit was authored by a person maintaining the repository.
+
+    LINKED ACCOUNT FIRST: when GitHub matched the commit's authorship to an account, that account
+    settles the answer — it must pass `is_human_account` (no `Bot` type, no `[bot]` login suffix)
+    and its login must not match `cohort.excluded_authors` under the same normalisation the cohort
+    uses. When GitHub links no account, the git author NAME is tested against the same two checks
+    instead, and otherwise counts as human. That fallback is a stated limitation: a name is whatever
+    the committer's tooling wrote, so automation signing an unrecognisable name reads as a person,
+    and a person whose commit email matches no account is judged by their name alone.
+
+    Deliberately wider than `cohort.excluded_authors` on its own: ALL bot accounts fail, not just
+    dependency automation. An agent-authored commit is work the cohort keeps, but it is not a person
+    maintaining the repository — the same distinction `contributor_logins` draws.
+    """
+    identity = login if login is not None else author_name
+    linked_type = account_type if login is not None else None
+    return is_human_account(identity, linked_type) and comparable_login(identity) not in excluded
+
+
 def comparable_login(login: str | None) -> str:
     """Return a login without GitHub's bot suffix, for configuration matching."""
     return (login or "").casefold().removesuffix("[bot]")

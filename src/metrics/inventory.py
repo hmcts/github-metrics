@@ -3,19 +3,24 @@
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 from requests.exceptions import JSONDecodeError
 
+from metrics.analysis import excluded_authors, is_human_commit_author
 from metrics.config import Configuration, owned_repositories
 from metrics.cost import CostMeter, combined
 from metrics.domain import (
+    MAINTENANCE_WINDOWS,
     AlertSeverity,
     AvailabilityReason,
+    CodeownersEvidence,
+    CodeownersFile,
     CollectionStatus,
     EvidenceKind,
+    MaintenanceEvidence,
     MergeGateEvidence,
     OpenAlertCount,
     PullRequestRule,
@@ -594,6 +599,395 @@ def collect_security_alerts(
     )
 
 
+MAINTENANCE_HISTORY_PAGE_SIZE = 100
+"""Commits per default-branch history page in the repository-standards query.
+
+GitHub's maximum, taken deliberately where `commit_history_query()` stays at 50: these nodes carry
+only a date and an author identity — none of the rollup cost that forced the tuned page sizes — so
+the page is cheap and fewer round trips win. The measured confirmation comes from the `costs` table
+of the first real `collect` run, per the tuned-page-size rule.
+"""
+
+MAINTENANCE_HISTORY_PAGE_LIMIT = 10
+"""Pages the human-commit search may follow before recording the answer as unknown.
+
+A COST LIMIT, not a policy threshold, which is why it is a module constant rather than
+configuration: a bot-dominated repository is exactly where the human-maintenance answer is
+interesting, and exactly where paging until a human appears is unbounded — the flux-config
+repositories hold roughly 20k direct commits per quarter. Ten pages of 100 bounds the search at
+1,000 commits.
+"""
+
+HUMAN_MAINTENANCE_SEARCH_DAYS = max(days for _, days in MAINTENANCE_WINDOWS)
+"""How far back the human-commit search reaches: the widest reported window, "24 months".
+
+Derived from the windows rather than restated, because `human_window_answer` decides False only
+where the search is known to have reached a window's cutoff: a bound narrower than the widest
+window would silently turn every exhausted-history answer for that window into "unknown".
+"""
+
+CODEOWNERS_LOCATIONS: tuple[tuple[str, str, bool], ...] = (
+    ("githubCodeowners", ".github/CODEOWNERS", True),
+    ("rootCodeowners", "CODEOWNERS", True),
+    ("docsCodeowners", "docs/CODEOWNERS", True),
+    ("githubCodeownersMd", ".github/CODEOWNERS.md", False),
+    ("rootCodeownersMd", "CODEOWNERS.md", False),
+    ("docsCodeownersMd", "docs/CODEOWNERS.md", False),
+)
+"""Each checked CODEOWNERS location: its query alias, its path, and whether GitHub reads it.
+
+The minimum-standards request names `CODEOWNERS` or `CODEOWNERS.md` in the repository root,
+`.github/` or `docs/`; GitHub itself reads only the three extensionless paths. Both facts are
+carried so the report can say a `.md` variant satisfies the letter of the standard while doing
+nothing on GitHub.
+"""
+
+
+class CodeownersBlob(BaseModel):
+    """Select the size of one CODEOWNERS blob, absent when the path names no blob.
+
+    `byte_size` is None when the path exists but is not a blob — a directory named CODEOWNERS —
+    which is treated as no file found, exactly like a missing path.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    byte_size: int | None = Field(default=None, alias="byteSize")
+
+
+class CommitAccount(BaseModel):
+    """Select the GitHub account linked to one commit's authorship."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    login: str
+    typename: str = Field(alias="__typename")
+
+
+class CommitAuthor(BaseModel):
+    """Select one commit's git author name and any account GitHub links it to.
+
+    `user` is null when the commit's email address matches no account, which is when the author
+    NAME becomes the only identity the human predicate can test.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    name: str | None = None
+    user: CommitAccount | None = None
+
+
+class HistoryCommit(BaseModel):
+    """Select the date and author identity of one default-branch commit."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    committed_at: AwareDatetime = Field(alias="committedDate")
+    author: CommitAuthor | None = None
+
+
+class HistoryPageInfo(BaseModel):
+    """Select GraphQL connection pagination fields."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    has_next_page: bool = Field(alias="hasNextPage")
+    end_cursor: str | None = Field(alias="endCursor")
+
+
+class HistoryPage(BaseModel):
+    """Select one bounded page of default-branch history."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    nodes: tuple[HistoryCommit, ...]
+    page_info: HistoryPageInfo = Field(alias="pageInfo")
+
+
+class HistoryTarget(BaseModel):
+    """Select the history reachable from the tip of the default branch."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    history: HistoryPage
+
+
+class HistoryBranchRef(BaseModel):
+    """Select the tip of one repository's default branch, absent on an empty repository."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    target: HistoryTarget | None = None
+
+
+class StandardsRepository(BaseModel):
+    """Select the history page from one standards response, keeping the aliased CODEOWNERS blobs.
+
+    The blobs stay as extra fields keyed by their `CODEOWNERS_LOCATIONS` alias rather than being
+    declared one by one, so the tuple of locations is the single place a path is spelled;
+    `found_codeowners` parses each one as it is read.
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    default_branch_ref: HistoryBranchRef | None = Field(default=None, alias="defaultBranchRef")
+
+    def blob(self, alias: str) -> CodeownersBlob | None:
+        """Parse the blob one aliased CODEOWNERS selection answered with, None when it named nothing."""
+        raw = (self.model_extra or {}).get(alias)
+        return None if raw is None else CodeownersBlob.model_validate(raw)
+
+
+class StandardsData(BaseModel):
+    """Select the repository from a repository-standards response, first page or continuation."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    repository: StandardsRepository | None = None
+
+
+def repository_standards_query() -> str:
+    """Return the bundled current-state query answering CODEOWNERS presence and maintenance.
+
+    A NEW, SEPARATE query, deliberately: coverage is keyed on a hash of the windowed GraphQL
+    documents, so adding one field to `pull_request_query()` or the direct-commit history query
+    would invalidate every repository's settled history. Nothing here touches a windowed signature.
+
+    Six aliased `object(expression: "HEAD:<path>")` selections answer every CODEOWNERS location in
+    one round trip, reading only `byteSize` so an empty file stays visible as found-but-empty. The
+    history page selects only dates and author identity — none of the rollup cost that forced the
+    tuned page sizes elsewhere — which is why `first` is GitHub's maximum rather than the 50 the
+    windowed history query uses. One call answers everything in the common case; the measured
+    confirmation comes from the `costs` table of the first real `collect` run.
+
+    The same document follows continuation pages, with `$cursor` set: re-reading six `byteSize`
+    selections costs nothing worth a second document, and one shape keeps one parser.
+    """
+    selections = "\n            ".join(
+        f'{alias}: object(expression: "HEAD:{path}") {{ ... on Blob {{ byteSize }} }}'
+        for alias, path, _ in CODEOWNERS_LOCATIONS
+    )
+    return f"""
+        query RepositoryStandards($organization: String!, $repository: String!, $cursor: String) {{
+          repository(owner: $organization, name: $repository) {{
+            {selections}
+            defaultBranchRef {{
+              target {{
+                ... on Commit {{
+                  history(first: {MAINTENANCE_HISTORY_PAGE_SIZE}, after: $cursor) {{
+                    pageInfo {{ hasNextPage endCursor }}
+                    nodes {{ committedDate author {{ name user {{ login __typename }} }} }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+          rateLimit {{ cost limit remaining resetAt }}
+        }}
+    """
+
+
+def found_codeowners(repository: StandardsRepository) -> tuple[CodeownersFile, ...]:
+    """List every CODEOWNERS file the six aliased selections found, in checked order."""
+    return tuple(
+        CodeownersFile(path=path, size_bytes=blob.byte_size, recognised_by_github=recognised)
+        for alias, path, recognised in CODEOWNERS_LOCATIONS
+        if (blob := repository.blob(alias)) is not None and blob.byte_size is not None
+    )
+
+
+def standards_repository(data: dict[str, object]) -> StandardsRepository:
+    """Parse one standards response and require the repository it names.
+
+    A response naming no repository is classified rather than parsed around: the repository's
+    metadata was read with the same token moments earlier, so GitHub withholding it here is an
+    access statement, not an absence of evidence.
+    """
+    parsed = StandardsData.model_validate(data)
+    if parsed.repository is None:
+        message = "GitHub GraphQL returned no repository for the standards query"
+        raise GitHubError(message, AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE)
+    return parsed.repository
+
+
+def standards_history(repository: StandardsRepository) -> HistoryPage | None:
+    """Return the history page one standards response carries, or None for an empty repository."""
+    reference = repository.default_branch_ref
+    if reference is None or reference.target is None:
+        return None
+    return reference.target.history
+
+
+def is_human_history_commit(commit: HistoryCommit, excluded: frozenset[str]) -> bool:
+    """Report whether one history commit was authored by a person, by the shared predicate."""
+    author = commit.author
+    if author is None:
+        return False
+    account = author.user
+    return is_human_commit_author(
+        account.login if account is not None else None,
+        account.typename if account is not None else None,
+        author.name,
+        excluded,
+    )
+
+
+def continue_history(client: GitHubClient, organization: str, repository: str, cursor: str | None) -> HistoryPage:
+    """Fetch the next history page the human-commit search asked for."""
+    data = client.graphql(
+        repository_standards_query(),
+        {"organization": organization, "repository": repository, "cursor": cursor},
+    )
+    parsed = StandardsData.model_validate(data)
+    if parsed.repository is None:
+        message = "GitHub GraphQL returned no repository for a maintenance history page"
+        raise GitHubError(message, AvailabilityReason.COLLECTION_FAILED)
+    page = standards_history(parsed.repository)
+    if page is None:
+        message = "GitHub GraphQL returned no default-branch history to continue"
+        raise GitHubError(message, AvailabilityReason.COLLECTION_FAILED)
+    return page
+
+
+def find_human_commit(
+    client: GitHubClient,
+    organization: str,
+    repository: str,
+    first_page: HistoryPage,
+    cutoff: datetime,
+    excluded: frozenset[str],
+) -> tuple[datetime | None, datetime | None]:
+    """Find the newest human default-branch commit within the bounded search.
+
+    Returns `(last_human_commit_at, searched_back_to)`. Pagination continues only while no human
+    commit is found, the cutoff is not yet passed, and the page cap is not hit — the cost bound the
+    module constants above record. A commit found human is returned even when it predates the
+    cutoff, because it was already paid for and answers the question better than "none".
+
+    `searched_back_to` keeps the two absences apart, per the three-valued rule: the oldest commit
+    instant examined when the PAGE CAP stopped the search (unknown beyond it), the instant of the
+    first commit found past the cutoff when the CUTOFF stopped it, and the cutoff itself when the
+    history was EXHAUSTED — every commit after the cutoff was examined, so each reported window can
+    decide, even though no commit is that old.
+    """
+    page = first_page
+    searched_back_to = cutoff
+    for page_number in range(1, MAINTENANCE_HISTORY_PAGE_LIMIT + 1):
+        for node in page.nodes:
+            if is_human_history_commit(node, excluded):
+                return node.committed_at, None
+            searched_back_to = node.committed_at
+            if node.committed_at < cutoff:
+                return None, searched_back_to
+        if not page.page_info.has_next_page:
+            return None, cutoff
+        if page_number == MAINTENANCE_HISTORY_PAGE_LIMIT:
+            break
+        page = continue_history(client, organization, repository, page.page_info.end_cursor)
+    return None, searched_back_to
+
+
+@dataclass(frozen=True)
+class RepositoryStandardsResult:
+    """Carry the CODEOWNERS and maintenance blocks, and one failure per block left unobserved."""
+
+    codeowners: CodeownersEvidence | None
+    maintenance: MaintenanceEvidence | None
+    failures: tuple[RepositoryInventoryIssue, ...]
+
+
+def standards_failure_detail(exception: GitHubError | ValidationError) -> tuple[AvailabilityReason, str]:
+    """Classify what stopped a standards query: the transport's reason, or a response that did not parse."""
+    if isinstance(exception, GitHubError):
+        return exception.reason, str(exception)
+    details = ", ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exception.errors(include_url=False, include_input=False)
+    )
+    return AvailabilityReason.COLLECTION_FAILED, f"GitHub returned an invalid repository-standards response: {details}"
+
+
+def collect_repository_standards(
+    client: GitHubClient,
+    organization: str,
+    team_identifier: str,
+    repository: RepositoryMetadata,
+    excluded: frozenset[str],
+) -> RepositoryStandardsResult:
+    """Collect CODEOWNERS presence and maintenance instants, or say why each was not observed.
+
+    A missing CODEOWNERS file is an OBSERVATION — checked everywhere, found nowhere — never a
+    failure. The bundled query failing is a failure, recorded once per evidence kind with the
+    shared reason so each block can report why it is absent, and neither evidence field is built:
+    unavailable data never becomes an empty block. A continuation page of the human-commit search
+    failing loses only the maintenance block: the CODEOWNERS answer and the last commit were
+    already observed by the bundled call, and evidence paid for is not thrown away.
+    """
+    fetched_at = datetime.now(UTC)
+    cutoff = fetched_at - timedelta(days=HUMAN_MAINTENANCE_SEARCH_DAYS)
+
+    def failures(
+        kinds: tuple[EvidenceKind, ...], exception: GitHubError | ValidationError
+    ) -> tuple[RepositoryInventoryIssue, ...]:
+        reason, detail = standards_failure_detail(exception)
+        return tuple(
+            RepositoryInventoryIssue(
+                team_identifier=team_identifier,
+                repository=repository.name,
+                evidence=kind,
+                reason=reason,
+                detail=detail,
+            )
+            for kind in kinds
+        )
+
+    try:
+        data = client.graphql(
+            repository_standards_query(),
+            {"organization": organization, "repository": repository.name, "cursor": None},
+        )
+        answered = standards_repository(data)
+        files = found_codeowners(answered)
+        history = standards_history(answered)
+    except (GitHubError, ValidationError) as exception:
+        return RepositoryStandardsResult(
+            codeowners=None,
+            maintenance=None,
+            failures=failures((EvidenceKind.CODEOWNERS, EvidenceKind.MAINTENANCE), exception),
+        )
+    codeowners = CodeownersEvidence(files=files)
+    if history is None or not history.nodes:
+        maintenance = MaintenanceEvidence(
+            branch=repository.default_branch,
+            last_commit_at=None,
+            last_human_commit_at=None,
+            searched_back_to=None,
+        )
+        return RepositoryStandardsResult(codeowners=codeowners, maintenance=maintenance, failures=())
+    try:
+        last_human_commit_at, searched_back_to = find_human_commit(
+            client,
+            organization,
+            repository.name,
+            history,
+            cutoff,
+            excluded,
+        )
+    except (GitHubError, ValidationError) as exception:
+        return RepositoryStandardsResult(
+            codeowners=codeowners,
+            maintenance=None,
+            failures=failures((EvidenceKind.MAINTENANCE,), exception),
+        )
+    maintenance = MaintenanceEvidence(
+        branch=repository.default_branch,
+        last_commit_at=history.nodes[0].committed_at,
+        last_human_commit_at=last_human_commit_at,
+        searched_back_to=searched_back_to,
+    )
+    return RepositoryStandardsResult(codeowners=codeowners, maintenance=maintenance, failures=())
+
+
 def collect_repository(
     client: GitHubClient,
     organization: str,
@@ -713,16 +1107,19 @@ def collect_repository_state(
     organization: str,
     team_identifier: str,
     repository: str,
+    excluded: frozenset[str],
 ) -> tuple[RepositoryInventoryItem | None, tuple[RepositoryInventoryIssue, ...]]:
-    """Collect one repository's metadata, merge gate and open alerts, or say what was unavailable.
+    """Collect one repository's metadata, standards, merge gate and open alerts, or say what was unavailable.
 
-    All three are collected together so that one repository's collection is one measurable unit;
-    see `metrics.cost`. A repository whose metadata could not be read is not asked for its gate or
-    its alerts, because there is no default branch to ask about.
+    All of it is collected together so that one repository's collection is one measurable unit;
+    see `metrics.cost`. A repository whose metadata could not be read is not asked for anything
+    else, because there is no default branch to ask about. `excluded` is the comparable
+    `cohort.excluded_authors` set the human-commit search tests authors against.
     """
     result = collect_repository(client, organization, team_identifier, repository)
     if isinstance(result, RepositoryInventoryIssue):
         return None, (result,)
+    standards = collect_repository_standards(client, organization, team_identifier, result.repository, excluded)
     gate = collect_merge_gate(client, organization, team_identifier, result.repository)
     alerts = collect_security_alerts(client, organization, team_identifier, result.repository.name)
     item = result.model_copy(
@@ -731,9 +1128,11 @@ def collect_repository_state(
             # unset: a refused family reports its reason on the block AND records a failure.
             "security": alerts.evidence,
             **({"merge_gate": gate.evidence} if gate.evidence is not None else {}),
+            **({"codeowners": standards.codeowners} if standards.codeowners is not None else {}),
+            **({"maintenance": standards.maintenance} if standards.maintenance is not None else {}),
         },
     )
-    return item, (() if gate.failure is None else (gate.failure,)) + alerts.failures
+    return item, standards.failures + (() if gate.failure is None else (gate.failure,)) + alerts.failures
 
 
 def collect_inventory(
@@ -751,10 +1150,17 @@ def collect_inventory(
     repositories: tuple[RepositoryInventoryItem, ...] = ()
     failures: tuple[RepositoryInventoryIssue, ...] = ()
     costs: tuple[RepositoryCollectionCost, ...] = ()
+    excluded = excluded_authors(configuration.cohort.excluded_authors)
     for team_identifier, repository in owned_repositories(configuration):
         meter = CostMeter(client)
         with meter.measure():
-            item, issues = collect_repository_state(client, configuration.organization, team_identifier, repository)
+            item, issues = collect_repository_state(
+                client,
+                configuration.organization,
+                team_identifier,
+                repository,
+                excluded,
+            )
         repositories += () if item is None else (item,)
         failures += issues
         # Keyed on the name GitHub answered with, which is what the window phase meters against: a

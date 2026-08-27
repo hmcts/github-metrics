@@ -10,11 +10,17 @@ from metrics.domain import (
     AlertSeverity,
     BehaviourEvidenceCollection,
     BehaviourEvidenceReport,
+    CodeownersEvidence,
+    CodeownersFile,
+    CodeownersReport,
     CohortSummary,
     DeltaBasis,
     DistributionObservation,
     EvidenceUnavailable,
     FindingSeverity,
+    MaintenanceEvidence,
+    MaintenanceReport,
+    MaintenanceWindowStatus,
     MergeGateEvidence,
     MergeGateReport,
     ObservationStatus,
@@ -213,6 +219,37 @@ def security_report() -> SecurityAlertReport:
     )
 
 
+def codeowners_report() -> CodeownersReport:
+    """Build stored CODEOWNERS state holding a file GitHub reads and a `.md` variant it ignores."""
+    return CodeownersReport(
+        fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        codeowners=CodeownersEvidence(
+            files=(
+                CodeownersFile(path=".github/CODEOWNERS", size_bytes=120, recognised_by_github=True),
+                CodeownersFile(path="docs/CODEOWNERS.md", size_bytes=0, recognised_by_github=False),
+            ),
+        ),
+    )
+
+
+def maintenance_report() -> MaintenanceReport:
+    """Build stored maintenance state whose last human commit sits between the 6- and 12-month cutoffs."""
+    return MaintenanceReport(
+        fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        maintenance=MaintenanceEvidence(
+            branch="master",
+            last_commit_at=datetime(2026, 7, 30, 8, 0, tzinfo=UTC),
+            last_human_commit_at=datetime(2026, 1, 10, tzinfo=UTC),
+            searched_back_to=None,
+        ),
+        windows=(
+            MaintenanceWindowStatus(months=6, committed_within=True, human_committed_within=False),
+            MaintenanceWindowStatus(months=12, committed_within=True, human_committed_within=True),
+            MaintenanceWindowStatus(months=24, committed_within=True, human_committed_within=True),
+        ),
+    )
+
+
 def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
     """Build one repository's practice evidence, overriding selected fields."""
     evidence = RepositoryPracticeEvidence(
@@ -225,6 +262,8 @@ def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
         merge_gate=gate_report(),
         open_pull_requests=open_pull_requests_report(),
         security=security_report(),
+        codeowners=codeowners_report(),
+        maintenance=maintenance_report(),
         behaviour=(finding(),),
     )
     return evidence.model_copy(update=overrides)
@@ -270,6 +309,8 @@ def test_every_section_of_the_practice_report_is_rendered(report: str) -> None:
         "Cohort",
         "Merge gate, read 2026-08-02T09:30Z",
         "Security alerts, read 2026-08-02T09:30Z",
+        "CODEOWNERS, read 2026-08-02T09:30Z",
+        "Maintenance, read 2026-08-02T09:30Z",
         "Open pull requests, read 2026-08-02T09:30Z",
         "Behaviour",
         "Review breakdown",
@@ -542,6 +583,130 @@ def test_uncollected_security_alerts_say_so_rather_than_vanishing() -> None:
     rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
 
     assert "\nSecurity alerts\n---------------\n" in rendered
+    assert "  not available: no repository state has been collected; run metrics collect" in rendered
+
+
+def block_lines(report: str, title: str) -> list[str]:
+    """Return one section's lines, its column titles included and its heading excluded."""
+    lines = report.splitlines()
+    body = lines[lines.index(title) + 2 :]
+    return body[: body.index("")] if "" in body else body
+
+
+def test_codeowners_lists_each_found_location_with_its_size_and_recognition(report: str) -> None:
+    """Show every location a file was found at, keeping an ignored `.md` variant apart from one GitHub reads.
+
+    The byte size keeps an empty file visible as found-but-empty rather than silently passing.
+    """
+    block = block_lines(report, "CODEOWNERS, read 2026-08-02T09:30Z")
+    assert block[0].split() == ["Location", "Bytes", "Recognised", "by", "GitHub"]
+    assert block[1].split() == [".github/CODEOWNERS", "120", "yes"]
+    assert block[2].split() == ["docs/CODEOWNERS.md", "0", "no"]
+
+
+def test_a_repository_without_codeowners_reports_absent_rather_than_an_empty_table() -> None:
+    """Say "absent" when every location was checked and none held a file — an observation, not a failure."""
+    evidence = practice_evidence(
+        codeowners=CodeownersReport(
+            fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+            codeowners=CodeownersEvidence(files=()),
+        ),
+    )
+    rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+    assert "  absent: no CODEOWNERS file at any of the checked locations" in rendered
+
+
+def test_uncollected_codeowners_state_says_so_rather_than_vanishing() -> None:
+    """State that CODEOWNERS presence was never collected, because an absent block would read as an absent file."""
+    evidence = practice_evidence(
+        codeowners=CodeownersReport(detail="no repository state has been collected; run metrics collect"),
+    )
+    rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+    assert "\nCODEOWNERS\n----------\n" in rendered
+    assert "  not available: no repository state has been collected; run metrics collect" in rendered
+
+
+def test_maintenance_reports_its_instants_and_the_three_window_answers(report: str) -> None:
+    """Show the stored instants above one row per window, each answering any-commit and human-commit."""
+    block = block_lines(report, "Maintenance, read 2026-08-02T09:30Z")
+    assert block[0].split(maxsplit=1) == ["Branch", "master"]
+    assert block[1].split(maxsplit=2) == ["Last", "commit", "2026-07-30T08:00Z"]
+    assert block[2].split(maxsplit=3) == ["Last", "human", "commit", "2026-01-10T00:00Z"]
+    assert block[3].split() == ["Window", "Any", "commit", "Human", "commit"]
+    assert block[4].split() == ["6", "months", "yes", "no"]
+    assert block[5].split() == ["12", "months", "yes", "yes"]
+    assert block[6].split() == ["24", "months", "yes", "yes"]
+
+
+def test_an_undecided_human_answer_renders_unknown_with_its_reason() -> None:
+    """Spell "unknown" out with its reason where the bounded search stopped short of a window's cutoff.
+
+    The search bound is printed beside the instants, because it is what separates "no human commit
+    within the window" from "unknown beyond the commits examined" — and neither reads as False.
+    """
+    detail = "the bounded search examined commits no older than 2026-01-15T00:00Z"
+    evidence = practice_evidence(
+        maintenance=MaintenanceReport(
+            fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+            maintenance=MaintenanceEvidence(
+                branch="master",
+                last_commit_at=datetime(2026, 7, 30, 8, 0, tzinfo=UTC),
+                last_human_commit_at=None,
+                searched_back_to=datetime(2026, 1, 15, tzinfo=UTC),
+            ),
+            windows=(
+                MaintenanceWindowStatus(months=6, committed_within=True, human_committed_within=False),
+                MaintenanceWindowStatus(months=12, committed_within=True, human_detail=detail),
+                MaintenanceWindowStatus(months=24, committed_within=True, human_detail=detail),
+            ),
+        ),
+    )
+    rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+    block = block_lines(rendered, "Maintenance, read 2026-08-02T09:30Z")
+    assert block[2].split(maxsplit=3) == ["Last", "human", "commit", "none found"]
+    assert block[3].split(maxsplit=3) == ["Searched", "back", "to", "2026-01-15T00:00Z"]
+    assert block[5].split() == ["6", "months", "yes", "no"]
+    assert block[6].split() == ["12", "months", "yes", "unknown"]
+    assert f"  12 months human answer unknown: {detail}" in rendered
+    assert f"  24 months human answer unknown: {detail}" in rendered
+
+
+def test_an_empty_default_branch_reports_no_commits_rather_than_a_zero() -> None:
+    """Say in words that the branch holds no commits, instead of rendering an absent instant as anything else."""
+    evidence = practice_evidence(
+        maintenance=MaintenanceReport(
+            fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+            maintenance=MaintenanceEvidence(
+                branch="master",
+                last_commit_at=None,
+                last_human_commit_at=None,
+                searched_back_to=None,
+            ),
+            windows=(
+                MaintenanceWindowStatus(months=6, committed_within=False, human_committed_within=False),
+                MaintenanceWindowStatus(months=12, committed_within=False, human_committed_within=False),
+                MaintenanceWindowStatus(months=24, committed_within=False, human_committed_within=False),
+            ),
+        ),
+    )
+    rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+    assert "none: the branch has no commits" in rendered
+    block = block_lines(rendered, "Maintenance, read 2026-08-02T09:30Z")
+    assert block[4].split() == ["6", "months", "no", "no"]
+
+
+def test_uncollected_maintenance_state_says_so_rather_than_vanishing() -> None:
+    """State that maintenance was never collected, because an absent block would read as an undatable repository."""
+    evidence = practice_evidence(
+        maintenance=MaintenanceReport(detail="no repository state has been collected; run metrics collect"),
+    )
+    rendered = render_practice_report(practice_report(evidence), {"cath-service": drill_down()}, teams())
+
+    assert "\nMaintenance\n-----------\n" in rendered
     assert "  not available: no repository state has been collected; run metrics collect" in rendered
 
 

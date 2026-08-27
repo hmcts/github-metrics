@@ -39,6 +39,8 @@ from metrics.evidence import (
     collected_repository_evidence,
     offline_open_pull_request_report,
     open_pull_request_report,
+    stored_codeowners,
+    stored_maintenance,
     stored_merge_gate,
     stored_repository_state,
     stored_security_alerts,
@@ -194,8 +196,8 @@ def evidence_report(
     if options.metric is None:
         rules = configured_rules(configuration)
         policy = readiness_policy(configuration)
-        # One load per repository, projected into both blocks that read it: the merge gate and the
-        # security alerts are two views of the same stored row.
+        # One load per repository, projected into every block that reads it: the merge gate, the
+        # security alerts, CODEOWNERS presence and maintenance are four views of the same stored row.
         stored = {item.repository: stored_repository_state(configuration, item.repository) for item in evidence}
         return PracticeEvidenceReport(
             organization=configuration.organization,
@@ -206,6 +208,8 @@ def evidence_report(
                     policy,
                     open_pull_requests[item.repository],
                     stored_security_alerts(stored[item.repository]),
+                    stored_codeowners(stored[item.repository]),
+                    stored_maintenance(stored[item.repository]),
                 )
                 for item in evidence
             ),

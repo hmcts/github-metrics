@@ -17,10 +17,13 @@ from metrics.cli import INCOMPLETE_RUN, main
 from metrics.config import load_configuration
 from metrics.domain import (
     AlertSeverity,
+    CodeownersEvidence,
+    CodeownersFile,
     CohortSummary,
     CollectionStatus,
     DirectCommitFact,
     EvidenceUnavailable,
+    MaintenanceEvidence,
     MergeGateEvidence,
     MergeGateReport,
     OpenAlertCount,
@@ -65,6 +68,7 @@ def graphql_responses(
     search: dict[str, object],
     history: dict[str, object],
     checks: dict[str, object],
+    standards: dict[str, object] | None = None,
 ) -> Callable[..., MagicMock]:
     """Answer each GraphQL request with the payload belonging to the document it sent."""
 
@@ -72,7 +76,15 @@ def graphql_responses(
         """Return the response for one posted GraphQL document."""
         _ = url, timeout
         query = str(json["query"])
-        payload = history if "defaultBranchRef" in query else checks if "object(oid:" in query else search
+        if "githubCodeowners" in query:
+            # The bundled repository-standards query: an empty branch and no CODEOWNERS by default.
+            payload = standards if standards is not None else {"repository": {"defaultBranchRef": None}}
+        elif "defaultBranchRef" in query:
+            payload = history
+        elif "object(oid:" in query:
+            payload = checks
+        else:
+            payload = search
         response = MagicMock(status_code=200, headers={})
         response.json.return_value = {"data": payload}
         return response
@@ -208,12 +220,13 @@ def test_collect_reports_current_state_and_what_the_window_fetched(
     assert output["repositories"][0]["collection"]["pull_request_facts_loaded"] == 0
     assert output["repositories"][0]["collection"]["direct_commit_facts_loaded"] == 1
     assert output["repositories"][0]["collection"]["direct_commit_intervals_fetched"] == 1
-    # One repository's whole run, both phases: six current-state calls — the repository, its rules,
-    # its protection and one page per alert family — and four GraphQL queries for the window — a
-    # pull-request search over the stable interval and another over the mutable edge, the commit
-    # history, and one check rollup for the single direct commit it returned.
+    # One repository's whole run, both phases: seven current-state calls — the repository, the
+    # bundled standards query, its rules, its protection and one page per alert family — and four
+    # GraphQL queries for the window — a pull-request search over the stable interval and another
+    # over the mutable edge, the commit history, and one check rollup for the single direct commit
+    # it returned.
     assert output["costs"] == [
-        {"repository": "nfdiv-case-api", "requests": 10, "elapsed_seconds": ANY},
+        {"repository": "nfdiv-case-api", "requests": 11, "elapsed_seconds": ANY},
     ]
     assert "observations" not in json.dumps(output)
     assert datetime.fromisoformat(output["ends_at"]) - datetime.fromisoformat(output["starts_at"]) == timedelta(
@@ -833,6 +846,15 @@ def stored_state_for(repository: str) -> RepositoryInventory:
                     code_scanning=OpenAlertCount(detail="GitHub permission denied"),
                     secret_scanning=OpenAlertCount(open=0),
                 ),
+                codeowners=CodeownersEvidence(
+                    files=(CodeownersFile(path="docs/CODEOWNERS.md", size_bytes=42, recognised_by_github=False),),
+                ),
+                maintenance=MaintenanceEvidence(
+                    branch="master",
+                    last_commit_at=collected_at - timedelta(days=2),
+                    last_human_commit_at=None,
+                    searched_back_to=collected_at - timedelta(days=300),
+                ),
             ),
         ),
         failures=(),
@@ -864,6 +886,148 @@ def test_evidence_serves_the_security_block_from_what_collect_stored(
     assert security["alerts"]["code_scanning"] == {"by_severity": {}, "detail": "GitHub permission denied"}
     assert "open" not in security["alerts"]["code_scanning"]
     assert security["alerts"]["secret_scanning"]["open"] == 0
+
+
+def test_evidence_serves_the_standards_blocks_from_what_collect_stored(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Join `collect`'s storage to the CODEOWNERS and maintenance blocks `evidence` prints.
+
+    The default JSON report carries both blocks with the stored `fetched_at`, the window rows
+    derived at assembly, and the three-valued human answer kept three-valued on the wire: an
+    unknown window omits the boolean and carries its reason instead.
+    """
+    record_repository_state(load_configuration(configuration_path).database, stored_state_for("nfdiv-case-api"))
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)["repositories"][0]
+    codeowners = report["codeowners"]
+    assert codeowners["fetched_at"] == "2026-08-08T09:00:00Z"
+    assert codeowners["codeowners"]["files"] == [
+        {"path": "docs/CODEOWNERS.md", "size_bytes": 42, "recognised_by_github": False},
+    ]
+    maintenance = report["maintenance"]
+    assert maintenance["fetched_at"] == "2026-08-08T09:00:00Z"
+    assert maintenance["maintenance"]["last_commit_at"] == "2026-08-06T09:00:00Z"
+    assert "last_human_commit_at" not in maintenance["maintenance"]
+    assert maintenance["maintenance"]["searched_back_to"] == "2025-10-12T09:00:00Z"
+    six_months, twelve_months, twenty_four_months = maintenance["windows"]
+    assert six_months == {"months": 6, "committed_within": True, "human_committed_within": False}
+    assert twelve_months["committed_within"] is True
+    assert "human_committed_within" not in twelve_months
+    assert twelve_months["human_detail"].startswith("the bounded search examined commits no older than")
+    assert "human_committed_within" not in twenty_four_months
+
+
+def test_collect_then_evidence_decides_the_widest_window_from_an_exhausted_search(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Pin the cross-layer invariant the 24-month human answer rests on.
+
+    An exhausted bot-only history records `searched_back_to` as the collector's cutoff, and the
+    report derives the 24-month cutoff from the stored `collected_at`, which is stamped AFTER every
+    repository is collected. Only that ordering makes the widest window decidable as False rather
+    than unknown; stamping `collected_at` at the start of the run would break it silently.
+    """
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        repository_response = MagicMock(status_code=200)
+        repository_response.json.return_value = {
+            "name": "nfdiv-case-api",
+            "default_branch": "master",
+            "archived": False,
+            "fork": False,
+            "disabled": False,
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2026-08-01T12:00:00Z",
+            "pushed_at": "2026-08-01T11:00:00Z",
+        }
+        rules_response = MagicMock(status_code=200, links={})
+        rules_response.json.return_value = []
+        protection_response = Response()
+        protection_response.status_code = 404
+        session.get.side_effect = [repository_response, rules_response, protection_response, *alert_responses()]
+        session.post.side_effect = graphql_responses(
+            {"search": {"issueCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+            {
+                "repository": {
+                    "defaultBranchRef": {
+                        "target": {
+                            "history": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [],
+                            }
+                        }
+                    }
+                }
+            },
+            {"repository": {"object": {"statusCheckRollup": None}}},
+            standards={
+                "repository": {
+                    "defaultBranchRef": {
+                        "target": {
+                            "history": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [
+                                    {
+                                        "committedDate": "2026-08-01T00:00:00Z",
+                                        "author": {
+                                            "name": "renovate[bot]",
+                                            "user": {"login": "renovate[bot]", "__typename": "Bot"},
+                                        },
+                                    },
+                                ],
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        assert main() == 0
+    capsys.readouterr()
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    maintenance = json.loads(capsys.readouterr().out)["repositories"][0]["maintenance"]
+    assert "last_human_commit_at" not in maintenance["maintenance"]
+    assert [window["human_committed_within"] for window in maintenance["windows"]] == [False, False, False]
+    assert all("human_detail" not in window for window in maintenance["windows"])
+
+
+def test_evidence_reports_standards_blocks_for_a_repository_never_collected(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Report the reason on both blocks for a repository whose state was never collected."""
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)["repositories"][0]
+    assert report["codeowners"] == {"detail": "no repository state has been collected; run metrics collect"}
+    assert report["maintenance"] == {
+        "windows": [],
+        "detail": "no repository state has been collected; run metrics collect",
+    }
 
 
 def test_evidence_reports_open_pull_requests_as_unavailable_offline(

@@ -15,9 +15,12 @@ from metrics.domain import (
     AlertSeverity,
     BehaviourEvidenceCollection,
     BehaviourEvidenceReport,
+    CodeownersReport,
     CohortSummary,
     DistributionObservation,
     EvidenceUnavailable,
+    MaintenanceReport,
+    MaintenanceWindowStatus,
     MergeGateReport,
     ObservationStatus,
     OpenAlertCount,
@@ -263,6 +266,88 @@ def render_security(report: SecurityAlertReport) -> tuple[str, ...]:
     )
 
 
+def render_codeowners(report: CodeownersReport) -> tuple[str, ...]:
+    """Render the stored CODEOWNERS presence, or the reason there is none to show.
+
+    A checked-and-absent repository says "absent" rather than rendering an empty table, because an
+    observation of nothing and no observation must not read alike. The size column keeps an empty
+    file visible as found-but-empty, and the recognised column keeps a `.md` variant — reported
+    because the minimum standard names it, ignored by GitHub — apart from a file GitHub reads.
+    """
+    read = "" if report.fetched_at is None else f", read {instant(report.fetched_at)}"
+    title = f"CODEOWNERS{read}"
+    codeowners = report.codeowners
+    if codeowners is None:
+        return *heading(title), f"  not available: {report.detail}"
+    if not codeowners.files:
+        return *heading(title), "  absent: no CODEOWNERS file at any of the checked locations"
+    rows = tuple(
+        (file.path, str(file.size_bytes), yes_or_no(value=file.recognised_by_github)) for file in codeowners.files
+    )
+    return *heading(title), *table(("Location", "Bytes", "Recognised by GitHub"), rows)
+
+
+def human_window_cell(window: MaintenanceWindowStatus) -> str:
+    """Render one window's three-valued human answer, spelling the undecided value out.
+
+    "unknown" rather than the gate's "not disclosed": nothing was withheld — the bounded search
+    stopped before this window's cutoff — and its reason is printed under the table, where it
+    cannot stretch the column.
+    """
+    if window.human_committed_within is None:
+        return "unknown"
+    return yes_or_no(value=window.human_committed_within)
+
+
+def render_maintenance(report: MaintenanceReport) -> tuple[str, ...]:
+    """Render the stored maintenance instants and their window rows, or the reason there are none.
+
+    Presentation only: the window answers were derived at report assembly against `fetched_at`, so
+    this prints them rather than re-deciding them. The search bound is shown whenever the JSON
+    carries one, because it is what separates "no human commit within the window" from "unknown
+    beyond the commits examined".
+    """
+    read = "" if report.fetched_at is None else f", read {instant(report.fetched_at)}"
+    title = f"Maintenance{read}"
+    maintenance = report.maintenance
+    if maintenance is None:
+        return *heading(title), f"  not available: {report.detail}"
+    bound = maintenance.searched_back_to
+    searched = () if bound is None else (("Searched back to", instant(bound)),)
+    rows = tuple(
+        (f"{window.months} months", yes_or_no(value=window.committed_within), human_window_cell(window))
+        for window in report.windows
+    )
+    reasons = tuple(
+        f"  {window.months} months human answer unknown: {window.human_detail}"
+        for window in report.windows
+        if window.human_detail is not None
+    )
+    return (
+        *heading(title),
+        *pairs(
+            (
+                ("Branch", maintenance.branch),
+                (
+                    "Last commit",
+                    "none: the branch has no commits"
+                    if maintenance.last_commit_at is None
+                    else instant(maintenance.last_commit_at),
+                ),
+                (
+                    "Last human commit",
+                    "none found"
+                    if maintenance.last_human_commit_at is None
+                    else instant(maintenance.last_human_commit_at),
+                ),
+                *searched,
+            ),
+        ),
+        *table(("Window", "Any commit", "Human commit"), rows),
+        *reasons,
+    )
+
+
 def observation_cells(summary: RateObservation | DistributionObservation) -> tuple[str, ...]:
     """Render one metric aggregate into the shared value columns.
 
@@ -378,13 +463,15 @@ def render_repository(
     evidence: RepositoryPracticeEvidence,
     drill_down: RepositoryDrillDown,
 ) -> tuple[str, ...]:
-    """Render one repository's readiness, cohort, gate, behaviour, and findings."""
+    """Render one repository's readiness, cohort, stored current state, behaviour, and findings."""
     return (
         *render_header(organization, evidence.repository, evidence.starts_at, evidence.ends_at, evidence.provenance),
         *render_assessment(evidence.assessment),
         *render_cohort(evidence.cohort),
         *render_merge_gate(evidence.merge_gate),
         *render_security(evidence.security),
+        *render_codeowners(evidence.codeowners),
+        *render_maintenance(evidence.maintenance),
         *render_open_pull_requests(evidence.open_pull_requests),
         *render_behaviour(drill_down.behaviour),
         *render_review_states(drill_down.review_states),

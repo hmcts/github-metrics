@@ -49,6 +49,8 @@ class EvidenceKind(StrEnum):
     BEHAVIOUR = "behaviour"
     CONTINUOUS_INTEGRATION = "continuous_integration"
     SECURITY = "security"
+    CODEOWNERS = "codeowners"
+    MAINTENANCE = "maintenance"
 
 
 class EvidenceSource(StrEnum):
@@ -541,6 +543,156 @@ class SecurityAlertReport(EvidenceModel):
         return self
 
 
+class CodeownersFile(EvidenceModel):
+    """Describe one CODEOWNERS file found at one of the six checked locations.
+
+    `recognised_by_github` says whether GitHub reads a file at this path (`.github/CODEOWNERS`,
+    `CODEOWNERS` or `docs/CODEOWNERS`) rather than merely hosting it: a `CODEOWNERS.md` satisfies
+    the letter of the minimum standard while doing nothing on GitHub, and the two must not read
+    alike. `size_bytes` keeps an empty file visible as found-but-empty rather than silently passing.
+    """
+
+    path: str
+    size_bytes: NonNegativeInt
+    recognised_by_github: bool
+
+
+class CodeownersEvidence(EvidenceModel):
+    """List every CODEOWNERS file one repository holds at the checked locations.
+
+    An empty `files` tuple means every location was checked and no file was found — an OBSERVATION,
+    never a failure. Report-only and ungraded: `ReadinessPolicy` reads none of this, per the rule
+    that a signal becoming visible is not a reason to grade it (architecture.md, "Readiness
+    assessment").
+    """
+
+    files: tuple[CodeownersFile, ...]
+
+
+class CodeownersReport(EvidenceModel):
+    """Report one repository's stored CODEOWNERS state, or why there is none to show.
+
+    Stored current state read at `fetched_at`, exactly like the merge gate beside it. A repository
+    whose state was never collected, or whose query failed, carries the reason instead: an absent
+    block would read as an absent file.
+    """
+
+    fetched_at: AwareDatetime | None = None
+    codeowners: CodeownersEvidence | None = None
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> CodeownersReport:
+        """Require either observed CODEOWNERS state or the reason there is none."""
+        if (self.codeowners is None) == (self.detail is None):
+            message = "a codeowners report must carry either its evidence or the reason it is unavailable"
+            raise ValueError(message)
+        return self
+
+
+class MaintenanceEvidence(EvidenceModel):
+    """Record when one repository's default branch last received a commit, by anyone and by a person.
+
+    `last_commit_at` is the newest commit on the default branch, and None when the branch holds no
+    commits. It is deliberately NOT `pushed_at`/`updated_at`, which move when a bot pushes a
+    pull-request branch that never merges — the insufficiency the minimum-standards request names.
+
+    `last_human_commit_at` is the newest commit whose author passes the shared human predicate, and
+    is None when the bounded search found none. `searched_back_to` is the oldest instant the search
+    examined, recorded exactly when no human commit was found, so a report can keep "none within the
+    window" apart from "unknown beyond the commits examined" — the search is bounded by a page cap,
+    and the two absences are different answers.
+
+    No ordering between `last_human_commit_at` and `last_commit_at` is enforced: history is walked
+    in topological order and `committedDate` is whatever the committer's clock said, so a rebased or
+    skewed commit deeper in the history may legitimately carry the later instant.
+    """
+
+    branch: str
+    last_commit_at: AwareDatetime | None
+    last_human_commit_at: AwareDatetime | None
+    searched_back_to: AwareDatetime | None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> MaintenanceEvidence:
+        """Hold the three instants to the shapes the bounded search can actually produce."""
+        if self.last_commit_at is None:
+            if self.last_human_commit_at is not None or self.searched_back_to is not None:
+                message = "a branch with no commits has nothing to have searched"
+                raise ValueError(message)
+            return self
+        if self.last_human_commit_at is None:
+            if self.searched_back_to is None:
+                message = "an absent human commit must say how far back the search examined"
+                raise ValueError(message)
+            return self
+        if self.searched_back_to is not None:
+            message = "a found human commit carries no search bound"
+            raise ValueError(message)
+        return self
+
+
+MAINTENANCE_WINDOWS: tuple[tuple[int, int], ...] = ((6, 183), (12, 365), (24, 730))
+"""The reported maintenance windows as (months, days): "6 months", "12 months", "24 months".
+
+Day counts, because a month is not a fixed span; each window is the half-open interval
+`[fetched_at - days, fetched_at)` against the stored observation instant, so the derived rows
+reproduce offline from the JSON alone. Declared here, beside the evidence it is derived from, so the
+collector's search bound and the report's widest window are one number rather than two that drift.
+"""
+
+
+class MaintenanceWindowStatus(EvidenceModel):
+    """Answer one maintenance window, derived at report assembly from the stored instants.
+
+    `committed_within` is always decidable once `last_commit_at` is known — an empty branch has no
+    commit within any window. `human_committed_within` is three-valued on purpose: True, False when
+    the search reached the window's cutoff and found nobody, and None when the page cap stopped the
+    search first, carrying `human_detail` so the unknown states its reason. Unavailable data never
+    becomes zero, and here it never becomes False either.
+    """
+
+    months: PositiveInt
+    committed_within: bool
+    human_committed_within: bool | None = None
+    human_detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> MaintenanceWindowStatus:
+        """Require an unknown human answer to carry its reason, and a decided one to carry none."""
+        if (self.human_committed_within is None) == (self.human_detail is None):
+            message = "a window's human answer is either decided or carries the reason it is unknown"
+            raise ValueError(message)
+        return self
+
+
+class MaintenanceReport(EvidenceModel):
+    """Report one repository's stored maintenance state, or why there is none to show.
+
+    Stored current state read at `fetched_at`, exactly like the merge gate beside it. `windows` is
+    DERIVED at report assembly from the stored instants against `fetched_at` — the observation
+    instant, so the JSON reproduces offline — and accompanies the evidence, never a reason. A
+    repository whose state was never collected carries the reason instead: an absent block would
+    read as an unmaintained repository nobody can date.
+    """
+
+    fetched_at: AwareDatetime | None = None
+    maintenance: MaintenanceEvidence | None = None
+    windows: tuple[MaintenanceWindowStatus, ...] = ()
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> MaintenanceReport:
+        """Require either observed maintenance with its window rows or the reason there is none."""
+        if (self.maintenance is None) == (self.detail is None):
+            message = "a maintenance report must carry either its evidence or the reason it is unavailable"
+            raise ValueError(message)
+        if (self.maintenance is None) != (not self.windows):
+            message = "window rows accompany maintenance evidence, never a reason"
+            raise ValueError(message)
+        return self
+
+
 class ReadinessLabel(StrEnum):
     """Judge one repository's readiness for agentic tooling.
 
@@ -784,6 +936,8 @@ class RepositoryPracticeEvidence(EvidenceModel):
     merge_gate: MergeGateReport
     open_pull_requests: OpenPullRequestReport
     security: SecurityAlertReport
+    codeowners: CodeownersReport
+    maintenance: MaintenanceReport
     behaviour: tuple[PracticeFinding, ...]
 
 
@@ -1024,12 +1178,19 @@ class TrendReport(EvidenceModel):
 
 
 class RepositoryInventoryItem(EvidenceModel):
-    """Associate observed repository state with its configured team."""
+    """Associate observed repository state with its configured team.
+
+    `codeowners` and `maintenance` default to None so a row stored before they existed still parses,
+    read back as "not collected when repository state was stored" — never as an absent file or an
+    empty branch.
+    """
 
     team_identifier: str
     repository: RepositoryMetadata
     merge_gate: MergeGateEvidence | None = None
     security: SecurityAlertEvidence | None = None
+    codeowners: CodeownersEvidence | None = None
+    maintenance: MaintenanceEvidence | None = None
     collection: BehaviourProvenance | None = None
 
 
