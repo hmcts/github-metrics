@@ -6,24 +6,23 @@
                                            [--cache .metrics/copilot] [--no-repositories]
 
 Writes the report to stdout and progress to stderr, so stdout can be redirected into a file.
-Requires a token in GH_TOKEN or GITHUB_TOKEN, or `gh` logged in. USER-RUN ONLY: the loop that
-maintains plan.md never holds a GitHub token (architecture.md, "Access"), so neither this report nor
-its numbers can be produced inside it.
+Requires a token in GH_TOKEN or GITHUB_TOKEN, or `gh` logged in. This is user-run only: the loop
+that maintains plan.md never holds a GitHub token (architecture.md, "Access"), so neither this
+report nor its numbers can be produced inside it.
 
-WHICH API THIS USES, AND WHY NOT THE ONE THE PROBE ASKED ABOUT. `scripts/probe-copilot-usage.sh`
-probes `GET /orgs/{org}/copilot/metrics`, which is aggregate-only and short-retention. GitHub has
-since replaced it with a REPORTS API (`X-GitHub-Api-Version: 2026-03-10`) that answers all three
-questions the probe could not:
+`scripts/probe-copilot-usage.sh` probes `GET /orgs/{org}/copilot/metrics`, which is aggregate-only
+and short-retention. GitHub has since replaced it with a reports API
+(`X-GitHub-Api-Version: 2026-03-10`) that answers all three questions the probe could not:
 
-    GRANULARITY  there is a PER-USER report, one record per user per day, naming the login.
-    REACH        reports exist from 2025-10-10 and are served for up to a year back, so a 90-day
+    granularity  there is a per-user report, one record per user per day, naming the login.
+    reach        reports exist from 2025-10-10 and are served for up to a year back, so a 90-day
                  window is readable today and nothing has to be snapshotted to obtain it.
-    MODES        every mode is a field, including the one this report exists to answer: `used_agent`
-                 is IDE chat AGENT MODE, and `chat_panel_agent_mode` is its interaction count.
+    modes        every mode is a field, including the one this report exists to answer: `used_agent`
+                 is IDE chat agent mode, and `chat_panel_agent_mode` is its interaction count.
 
 The endpoints used, all of them read-only:
 
-    /{scope}/copilot/metrics/reports/{aggregate}-1-day?day=  GitHub's own org-wide counts per day
+    /{scope}/copilot/metrics/reports/{aggregate}-1-day?day=  GitHub's org-wide counts per day
     /{scope}/copilot/metrics/reports/users-1-day?day=        one record per user per day
     /{scope}/copilot/metrics/reports/user-teams-1-day?day=   one record per user-team pair
     /{scope}/copilot/metrics/reports/repos-1-day?day=        one record per repository per day
@@ -31,87 +30,84 @@ The endpoints used, all of them read-only:
     /{scope}/copilot/billing/seats                           who this scope pays for, and on what plan
 
 where `{scope}` is `orgs/{org}` or `enterprises/{enterprise}` and `{aggregate}` is `organization`
-or `enterprise` to match. None of these return the data inline: each answers a small object holding
-`download_links`, signed URLs to NDJSON files, which is why the download session carries NO
-Authorization header — a signed URL is already authorised and some object stores reject a request
-that also authenticates.
+or `enterprise` to match. Each answers a small object holding `download_links`, signed URLs to
+NDJSON files. The download session carries no Authorization header: a signed URL is already
+authorised, and some object stores reject a request that also authenticates.
 
-COST. One API call plus one file download per report per day: with `--days 90` that is about 270
-calls against a 5,000/hour limit, and `--no-repositories` drops it to about 180. The seat list adds
-one call per hundred seats, once, whatever the window. The run stays
-sequential because that is well inside the quota and concurrency would only risk the secondary
-limits. `--cache DIR` keeps every downloaded file, so a second run over the same window costs
-nothing and the report can be re-cut without re-fetching.
+The run costs one API call plus one file download per report per day: with `--days 90` that is about
+270 calls against a 5,000/hour limit, and `--no-repositories` drops it to about 180. The seat list
+adds one call per hundred seats, once, whatever the window. The run stays sequential because that is
+well inside the quota and concurrency would only risk the secondary limits. `--cache DIR` keeps
+every downloaded file, so a second run over the same window costs nothing and the report can be
+re-cut without re-fetching.
 
-GROUPINGS ARE ONE CALL, NOT ONE PER TEAM. There is a team-level metrics endpoint, but it would cost
-a call per team per day. Instead the `user-teams-1-day` report gives every user-team pair in a
-single file, and this script rolls the PER-USER records up into teams itself — so team numbers and
-global numbers are the same numbers, added up two ways, rather than two independent measurements
-that can disagree. `--team-days` asks for the most recent few days and unions them, which costs
-those few calls and survives the newest day not being ready yet. TWO THINGS TO KNOW ABOUT IT:
-GitHub OMITS teams with fewer than five seated Copilot users, so an active user may have no team
-row at all and is reported under `(no team reported)`; and a user in several teams is counted in
-each, so team columns sum to more than the global figure and are not a partition.
+Groupings cost one call, not one per team. There is a team-level metrics endpoint, but it would cost
+a call per team per day. The `user-teams-1-day` report gives every user-team pair in a single file,
+and this script rolls the per-user records up into teams itself, so team numbers and global numbers
+are the same numbers added up two ways. `--team-days` asks for the most recent few days and unions
+them, which costs those few calls and survives the newest day not being ready yet. Two things to
+know about the team figures: GitHub omits teams with fewer than five seated Copilot users, so an
+active user may have no team row at all and is reported under `(no team reported)`; and a user in
+several teams is counted in each, so team columns sum to more than the global figure.
 
-THE TWO KINDS OF "MODE", WHICH ARE NOT THE SAME NUMBER AND ARE BOTH REPORTED:
+The data holds two kinds of "mode". They are different numbers and both are reported:
 
-    SURFACES are the per-day `used_*` booleans — did this user touch this surface that day. They
-             count USERS and USER-DAYS, never interactions. `used_agent` is IDE chat agent mode;
+    surfaces are the per-day `used_*` booleans: did this user touch this surface that day. They
+             count users and user-days. `used_agent` is IDE chat agent mode;
              `used_copilot_cloud_agent` (formerly `used_copilot_coding_agent`, and both names are
-             still emitted during the rename, so both are reported) is the cloud agent, a different
-             thing that happens on GitHub rather than in the editor.
-    FEATURES are the `totals_by_feature` breakdown, whose values include `chat_panel_ask_mode`,
+             still emitted during the rename, so both are reported) is the cloud agent, which
+             happens on GitHub and not in the editor.
+    features are the `totals_by_feature` breakdown, whose values include `chat_panel_ask_mode`,
              `chat_panel_edit_mode`, `chat_panel_agent_mode`, `chat_panel_plan_mode` and
-             `code_completion`. These carry INTERACTION and LINE counts.
+             `code_completion`. These carry interaction and line counts.
 
 So "how many used agent mode" is a surface question and "how much agent mode was used" is a feature
 question, and a user can appear in one without the other if GitHub's telemetry saw only one of them.
 
-EVERY BUCKET IS DISCOVERED, NOT LISTED. Nothing here hardcodes the set of surfaces, features, IDEs,
-models, languages or agent apps. Any key beginning `used_` is a surface and any key beginning
+Every bucket is discovered from the records. Nothing here hardcodes the set of surfaces, features,
+IDEs, models, languages or agent apps. Any key beginning `used_` is a surface and any key beginning
 `totals_by_` is a breakdown, keyed on whatever string fields its records carry and summing whatever
 numeric fields they carry. A mode GitHub adds after this was written therefore appears in the report
-by itself, labelled with GitHub's own name for it, instead of being silently dropped by a schema
-this script believed in. `SURFACE_LABELS` only supplies English for the ones known today.
+by itself, labelled with GitHub's name for it. `SURFACE_LABELS` only supplies English for the ones
+known today.
 
-USAGE AND BILLING ARE DIFFERENT POPULATIONS, WHICH IS WHY THE SEAT LIST IS READ. The metrics
-reports cover everyone active in the scope, because activity is attributed to the ORGANISATION whose
-repositories it happened in. Billing is attributed to whoever BOUGHT THE SEAT. Contractors and
-supplier staff working in these repositories on their own employer's subscription therefore appear
-in full in every usage section and in none of the billing ones. `/copilot/billing/seats` is the only
-call that draws the line, and without it a user on somebody else's subscription is indistinguishable
-from one on ours who spent nothing. Two consequences run through the report: `ai_credits_used` is
-reported as NOT APPLICABLE rather than zero for a seat billed elsewhere, since it measures what THIS
-scope was charged; and the models a user reached are a property of THEIR subscription's Copilot
-policy, so a model that appears only under an external subscription is one this scope has not
-enabled, reaching these repositories through a seat somebody else pays for.
+Usage and billing are different populations, which is why the seat list is read. The metrics reports
+cover everyone active in the scope, because activity is attributed to the organisation whose
+repositories it happened in. Billing is attributed to whoever bought the seat. Contractors and
+supplier staff working in these repositories on their employer's subscription therefore appear in
+full in every usage section and in none of the billing ones. `/copilot/billing/seats` is the only
+call that draws the line, and without it a user on somebody else's subscription looks exactly like
+one on ours who spent nothing. Two consequences run through the report: `ai_credits_used` reads
+`n/a` for a seat billed elsewhere, since it measures what this scope was charged; and the models a
+user reached are a property of their subscription's Copilot policy, so a model that appears only
+under an external subscription is one this scope has not enabled, reaching these repositories
+through a seat somebody else pays for.
 
-THE ADOPTION PHASE IS THE ONE COLUMN THAT IS NOT ABOUT THE WINDOW. GitHub assigns `ai_adoption_phase`
-over a TRAILING 28-DAY window and recalculates it daily, so over a short window every other per-user
-column describes the days asked for and this one describes the preceding month. A Phase 3 user can
-therefore show almost no activity on the day reported without anything being wrong. Phases measure
-BREADTH of surfaces rather than volume: Phase 1 is code completion and/or IDE agent mode, Phase 2 is
-one GitHub-based agent surface (cloud agent, code review or CLI), Phase 3 is two or more of those or
-the Copilot app, and No Cohort is below the threshold of two active days in the 28. The record also
-carries GitHub's own English name for the phase and the version of the model that assigned it, both
-of which this reports rather than printing the bare identifier and leaving the criteria to be guessed.
+The adoption phase is the one column that describes a different period from the window. GitHub
+assigns `ai_adoption_phase` over a trailing 28-day window and recalculates it daily, so over a short
+window every other per-user column describes the days asked for and this one describes the preceding
+month. A Phase 3 user can therefore show almost no activity on the day reported. Phases measure
+breadth of surfaces, not volume: Phase 1 is code completion and/or IDE agent mode, Phase 2 is one
+GitHub-based agent surface (cloud agent, code review or CLI), Phase 3 is two or more of those or the
+Copilot app, and No Cohort is below the threshold of two active days in the 28. The record also
+carries GitHub's English name for the phase and the version of the model that assigned it, and the
+report prints both, so a reader does not have to guess the criteria from a bare identifier.
 
-ABSENT IS NOT ZERO, AND NEITHER IS NOT APPLICABLE. A table cell says one of three things and the
-report never merges them: `0` is a measurement GitHub reported, `-` is a field GitHub did not report,
-and `n/a` is a quantity that belongs to a subscription this scope does not pay for. Rendering an
-absence as `0` invents a measurement out of a silence, and a column where both appear as zero cannot
-be read at all - it means "nobody did this" and "we were never told" in the same glyph. Every measure
-therefore reaches `number` as `mapping.get(name)` and never as `mapping.get(name, 0.0)`.
+A table cell says one of three things: `0` is a measurement GitHub
+reported, `-` is a field GitHub did not report, and `n/a` is a quantity that belongs to a
+subscription this scope does not pay for. Rendering an absence as `0` invents a measurement out of a
+silence, and a column where both appear as zero says "nobody did this" and "we were never told" in
+the same glyph. Every measure therefore reaches `number` as `mapping.get(name)` and never as
+`mapping.get(name, 0.0)`.
 
-WHAT IT WILL NOT TELL YOU. Users who never used Copilot are absent by construction: the per-user
-report has no record for them, so an idle user can only be found by SUBTRACTING who was active from
-who holds a seat, which is what the seat list makes possible and why idle seats are named in the JSON
-and counted in the report. Nobody outside this scope's billing can be named that way: a supplier's
-idle staff hold no seat here to subtract from. Distinct-user counts are counts of DISTINCT LOGINS
-over the whole window and
-are never sums of daily counts, which would count the same person once per day; GitHub's own
-`monthly_active_users` is a trailing 28-day count and so is reported as it stands, beside the window
-count, rather than reconciled with it.
+Users who never used Copilot are absent by construction: the per-user report has no record for them,
+so an idle user can only be found by subtracting who was active from who holds a seat, which is what
+the seat list makes possible and why idle seats are named in the JSON and counted in the report.
+Nobody outside this scope's billing can be named that way: a supplier's
+idle staff hold no seat here to subtract from. Distinct-user counts are counts of distinct logins
+over the whole window; summing daily counts would count the same person once per day. GitHub's
+`monthly_active_users` is a trailing 28-day count, so it is reported unadjusted, beside the window
+count.
 """
 
 import argparse
@@ -152,8 +148,8 @@ DEFAULT_TEAM_DAYS = 3
 
 MAXIMUM_NETWORK_ATTEMPTS = 3
 SEAT_PAGE_SIZE = 100
-# A backstop against an endpoint that never says it has finished, not a real ceiling: a hundred
-# pages of a hundred seats is far more than any organisation this reports on holds.
+# A backstop against an endpoint that never says it has finished: a hundred pages of a hundred seats
+# is far more than any organisation this reports on holds.
 MAXIMUM_SEAT_PAGES = 100
 NETWORK_RETRY_SECONDS = 2
 MAXIMUM_RATE_PAUSES = 3
@@ -166,26 +162,26 @@ GZIP_MAGIC = b"\x1f\x8b"
 
 SURFACE_PREFIX = "used_"
 BREAKDOWN_PREFIX = "totals_by_"
-# Nested version stamps describe the client, not the usage, so they are never summed.
+# Nested version stamps describe the client, so they are excluded from every sum.
 VERSION_PREFIX = "last_known"
-# Identifiers happen to be numbers and must not be added up as though they measured something.
+# Identifiers happen to be numbers, so they are excluded from every sum.
 IDENTITY_KEYS = frozenset({"user_id", "team_id", "organization_id", "enterprise_id"})
 # Carried for display only: GitHub warns that agent display names change, so `agent_id` is the key.
 LABEL_KEYS = frozenset({"agent_name"})
-# Averages cannot be added together, so they are dropped rather than summed. See `flatten_measures`.
+# Averages cannot be added together, so they are dropped. See `flatten_measures`.
 AVERAGE_MARKERS = ("avg_", "_per_", "median_")
 # Fields that NAME a bucket while arriving as a number. An adoption-phase record carries `phase` as a
 # small integer beside its English name, and summing it across ninety days would produce a figure
-# that looks like a measurement and is the sum of a label. Named rather than inferred, because
-# nothing about the value distinguishes a phase number from a count.
+# that looks like a measurement and is the sum of a label. Listed by name, because nothing about the
+# value distinguishes a phase number from a count.
 NUMERIC_DIMENSIONS = frozenset({"phase", "phase_id"})
 # Several spellings, because these fields are newer than this script and GitHub has renamed fields in
-# this API before - `used_copilot_coding_agent` to `used_copilot_cloud_agent` within its lifetime.
+# this API before: `used_copilot_coding_agent` became `used_copilot_cloud_agent` within its lifetime.
 PHASE_NAME_KEYS = ("phase_name", "name", "display_name", "label", "title")
 PHASE_VERSION_KEYS = ("version", "model_version", "phase_version", "ai_adoption_phase_version")
-# GitHub's own published criteria, for phases whose record carries no name of its own. A phase absent
+# GitHub's published criteria, for phases whose record carries no name of its own. A phase absent
 # from here still appears, under GitHub's identifier and without a gloss, exactly as a new surface
-# does: this supplies English, it never decides what is reported.
+# does: this table supplies English only.
 PHASE_CRITERIA = {
     "No Cohort": "below the engagement threshold for any phase (needs 2+ active days in the 28)",
     "Phase 1": "code completion and/or IDE agent mode",
@@ -195,25 +191,25 @@ PHASE_CRITERIA = {
 PHASE_BREAKDOWN = "totals_by_ai_adoption_phase"
 NO_TEAM = "(no team reported)"
 
-# THREE THINGS A TABLE CELL CAN SAY, AND THEY ARE NOT THE SAME THING. `0` is a measurement: GitHub
-# reported this quantity and it was zero. ABSENT is the lack of one: GitHub reported no such field,
-# and rendering that as `0` would invent a measurement out of a silence. NOT_APPLICABLE is narrower
-# still: the quantity is real, but it belongs to a subscription this scope does not pay for, so it
-# is not ours to report either way. See `number` and `credits_cell`.
+# The three things a table cell can say. `0` is a measurement: GitHub reported this quantity and it
+# was zero. ABSENT is the lack of one: GitHub reported no such field, and rendering that as `0` would
+# invent a measurement out of a silence. NOT_APPLICABLE is narrower still: the quantity is real, but
+# it belongs to a subscription this scope does not pay for, so it is not ours to report either way.
+# See `number` and `credits_cell`.
 ABSENT = "-"
 NOT_APPLICABLE = "n/a"
 PLACEHOLDER_CELLS = frozenset({ABSENT, NOT_APPLICABLE})
 
-# An active user whose login holds no seat in THIS scope's billing. They are not unlicensed: their
-# seat is paid for somewhere this token cannot see, typically a supplier's own subscription.
+# An active user whose login holds no seat in THIS scope's billing. Their seat is paid for somewhere
+# this token cannot see, typically their employer's subscription.
 EXTERNAL_SUBSCRIPTION = "(billed outside this scope)"
-# The seat list could not be read at all, which must never be reported as everyone being external:
-# that would be a confident answer produced by a failure. See `Seats.subscription`.
+# The seat list could not be read at all. Reporting that as everyone being external would state
+# something specific and wrong. See `Seats.subscription`.
 UNKNOWN_SUBSCRIPTION = "(subscription unknown)"
 SPECIAL_SUBSCRIPTIONS = (EXTERNAL_SUBSCRIPTION, UNKNOWN_SUBSCRIPTION)
 
 # English for the surfaces known when this was written. Anything absent is reported under GitHub's
-# own field name rather than guessed at, and the columns still appear.
+# field name, and the columns still appear.
 SURFACE_LABELS = {
     "used_agent": "IDE chat, agent mode",
     "used_chat": "IDE chat, any mode",
@@ -238,8 +234,8 @@ AGENT_SURFACE = "used_agent"
 # Matches `chat_panel_agent_mode` and anything GitHub names in the same family later.
 AGENT_FEATURE = re.compile(r"agent_mode")
 FEATURE_BREAKDOWN = "totals_by_feature"
-# The breakdowns that have a section of their own below. Anything GitHub adds later is not in here,
-# which is exactly how it earns its own section instead of being dropped.
+# The breakdowns that have a section of their own below. Anything GitHub adds later is absent from
+# this set, which is how it earns a section of its own.
 KNOWN_BREAKDOWNS = frozenset(
     {
         FEATURE_BREAKDOWN,
@@ -257,7 +253,7 @@ GENERATIONS = "code_generation_activity_count"
 ACCEPTANCES = "code_acceptance_activity_count"
 CREDITS = "ai_credits_used"
 
-# A cell holding only a formatted number is right-aligned; anything else is not.
+# A cell holding only a formatted number is right-aligned; anything else is left-aligned.
 NUMERIC_CELL = re.compile(r"[-+]?[\d,]+(?:\.\d+)?%?")
 HEADLINE_MEASURES = (INTERACTIONS, GENERATIONS, ACCEPTANCES, "loc_added_sum", "loc_deleted_sum")
 
@@ -266,7 +262,7 @@ Dimensions = tuple[tuple[str, str], ...]
 
 
 class AccessError(RuntimeError):
-    """The token may not read these reports, which is true of every day and not just this one."""
+    """The token may not read these reports, which is true of every day in the window."""
 
 
 class RateLimitError(RuntimeError):
@@ -292,9 +288,9 @@ class Options:
 class Response:
     """One HTTP response: the status that classifies it, the body it belongs to, and its request.
 
-    The request URL is carried so that every failure can name the call that failed. A status alone is
-    not a diagnosis: 403 on the metrics report and 403 on the billing endpoint are different problems
-    with different fixes, and a report that says only "403" makes the reader guess which one it met.
+    The request URL is carried so that every failure can name the call that failed. 403 on the
+    metrics report and 403 on the billing endpoint are different problems with different fixes, and
+    a message saying only "403" leaves the reader guessing which one it met.
     """
 
     status: int
@@ -311,11 +307,11 @@ class Response:
         return body if isinstance(body, Mapping) else {}
 
     def message(self) -> str:
-        """Return the API's own error message, or an empty string when it gave none."""
+        """Return GitHub's error message, or an empty string when it gave none."""
         return str(self.mapping().get("message", ""))
 
     def failure(self) -> str:
-        """Describe a call that did not answer: the status, the call made, and GitHub's own words.
+        """Describe a call that did not answer: the status, the call made, and GitHub's words.
 
         Used for every outcome other than success, so no failure is ever reported as a bare status.
         """
@@ -328,7 +324,7 @@ class Response:
 class Fetched:
     """How one report request went, and whatever records came back from it.
 
-    `outcome` separates the four answers that must not be conflated: `ok` (records), `empty` (GitHub
+    `outcome` separates the four answers it must keep apart: `ok` (records), `empty` (GitHub
     says there was no activity that day), `absent` (no report for that day) and `failed` (a status
     that answered neither way). An `absent` day is a gap in GitHub's publishing; an `empty` day is
     evidence that nobody used Copilot.
@@ -341,11 +337,11 @@ class Fetched:
 
 @dataclass(frozen=True)
 class Phase:
-    """One user's AI adoption cohort as GitHub classified it, with GitHub's own English for it.
+    """One user's AI adoption cohort as GitHub classified it, with GitHub's English for it.
 
-    GitHub assigns this over a TRAILING 28-DAY window and recalculates it daily, so it is the one
-    per-user field in this report that never describes the window asked for. In a one-day run every
-    other column is that day and this one is the preceding month.
+    GitHub assigns this over a trailing 28-day window and recalculates it daily, so it is the one
+    per-user field in this report that describes a period other than the window asked for. In a
+    one-day run every other column is that day and this one is the preceding month.
     """
 
     identifier: str
@@ -433,9 +429,9 @@ class Seats:
     """Who this scope bills for Copilot, or why that could not be established.
 
     `available` carries the difference between "this user is on somebody else's subscription" and
-    "we could not read our own seat list", which must never be conflated. Without the list every
-    active user holds no seat we can see, so treating a failure as an answer would report the whole
-    organisation as externally billed - a confident, specific and entirely wrong claim.
+    "we could not read the seat list", which the report must keep apart. Without the list, no active
+    user can be seen to hold a seat, so treating a failure as an answer would report the whole
+    organisation as externally billed.
     """
 
     available: bool
@@ -483,7 +479,7 @@ class Collection:
 
 
 def progress(message: str) -> None:
-    """Write a line for the human watching, never onto the report on stdout."""
+    """Write a line to stderr for the human watching, keeping stdout for the report."""
     sys.stderr.write(f"{message}\n")
     sys.stderr.flush()
 
@@ -504,10 +500,10 @@ def is_rate_limited(response: Response) -> bool:
 class Reader:
     """Reads the GitHub API, turning a dropped connection into a status and a rate limit into a stop.
 
-    A call that never answers becomes a pseudo-status rather than an exception, so one unreadable day
-    is one gap in the window rather than the end of the run. A rate limit is the opposite case and
-    raises, because it will apply to every remaining day just as it applied to this one, and days
-    written under it would record this run's exhaustion as the organisation's idleness.
+    A call that never answers becomes a pseudo-status, so one unreadable day leaves one gap in the
+    window and the run carries on. A rate limit raises instead, because it applies to every
+    remaining day just as it applied to this one, and days written under it would record this run's
+    exhaustion as the organisation's idleness.
     """
 
     def __init__(self, token: str) -> None:
@@ -557,9 +553,8 @@ def decode_rows(payload: bytes) -> list[Row]:
     """Read one downloaded report file into records, whatever of three shapes it arrives in.
 
     The files are documented as NDJSON, but a gzipped body and a plain JSON array are both cheap to
-    accept and impossible to confuse with it, so all three are read rather than assumed away. A line
-    that will not parse is skipped rather than failing the day: one malformed record must not cost
-    the other several thousand.
+    accept and impossible to confuse with it, so all three are read. A line that will not parse is
+    skipped, so one malformed record does not cost the other several thousand.
     """
     if payload.startswith(GZIP_MAGIC):
         payload = gzip.decompress(payload)
@@ -591,9 +586,8 @@ def decode_rows(payload: bytes) -> list[Row]:
 def download_session() -> requests.Session:
     """Prepare a session for the signed URLs, deliberately carrying no Authorization header.
 
-    A signed URL is already authorised by its signature. Sending a bearer token alongside it is not
-    merely redundant: some object stores reject a request that authenticates two ways at once, which
-    would look exactly like a report that could not be read.
+    A signed URL is already authorised by its signature, and some object stores reject a request
+    that authenticates two ways at once, which looks exactly like a report that could not be read.
     """
     return requests.Session()
 
@@ -613,8 +607,8 @@ def report_path(options: Options, report: str) -> str:
 def request_links(reader: Reader, options: Options, report: str, day: date) -> Fetched | list[str]:
     """Ask for one day's download links, or classify why there are none.
 
-    A 403 raises rather than returns, because permission is a property of the token and not of the
-    day: carrying on would spend a call per remaining day to learn the same thing ninety times.
+    A 403 raises, because permission is a property of the token and not of the day: carrying on
+    would spend a call per remaining day to learn the same thing ninety times.
     """
     response = reader.get(report_path(options, report), {"day": day.isoformat()})
     if response.status == HTTPStatus.NO_CONTENT:
@@ -637,7 +631,7 @@ def request_links(reader: Reader, options: Options, report: str, day: date) -> F
 def unsigned(url: str) -> str:
     """Strip the query from a signed URL so it can be named in a failure without leaking its key.
 
-    A download link carries its own credentials as query parameters. The path identifies the file
+    A download link carries credentials as query parameters. The path identifies the file
     well enough to debug with, and printing the signature into a log or a report would publish a
     working, if short-lived, credential.
     """
@@ -663,7 +657,7 @@ def fetch_report(reader: Reader, downloads: requests.Session, options: Options, 
     cached = cache_path(options, report, day)
     if cached is not None and cached.exists():
         # Classified from the records, exactly as a fresh fetch is, so a cached day and a fetched day
-        # are counted the same way in the outcome tally rather than differing by where they came from.
+        # are counted the same way in the outcome tally.
         reused = tuple(decode_rows(cached.read_bytes()))
         return Fetched("ok" if reused else "empty", reused, "cached")
 
@@ -675,7 +669,7 @@ def fetch_report(reader: Reader, downloads: requests.Session, options: Options, 
         return rows
 
     # Only a day that produced records is cached. A day GitHub has not published yet must be asked
-    # for again next run, not remembered as a day on which nobody used Copilot.
+    # for again next run; caching it would remember it as a day on which nobody used Copilot.
     if cached is not None and rows:
         cached.parent.mkdir(parents=True, exist_ok=True)
         # Cached as the records this run read, not as the bytes GitHub sent: several links become one
@@ -686,10 +680,10 @@ def fetch_report(reader: Reader, downloads: requests.Session, options: Options, 
 
 
 def read_seats(reader: Reader, options: Options) -> Mapping[str, Any] | None:
-    """Read the seat total, the only honest denominator for "how many of our people used it".
+    """Read the seat total, the only denominator for "how many of our people used it".
 
-    One call, and a failure is not fatal: without it the report gives counts without shares, which is
-    a smaller answer than the one asked for but not a wrong one.
+    One call, and a failure is survivable: without it the report gives counts without shares, which
+    is a smaller answer than the one asked for.
     """
     if options.scope_kind == "orgs":
         response = reader.get(f"/orgs/{options.scope_name}/copilot/billing")
@@ -715,7 +709,7 @@ def describe_seat(record: Mapping[str, Any]) -> Seat | None:
     return Seat(
         login=login,
         plan_type=str(record.get("plan_type") or ""),
-        # The team a seat was ASSIGNED through, which is not the same as the teams its holder is in:
+        # The team a seat was assigned through, which is not the same as the teams its holder is in:
         # membership of a team named after Copilot does not mean the seat came from it.
         assigning_team=str(team.get("slug") or "") if isinstance(team, Mapping) else "",
         last_activity=str(record.get("last_activity_at") or ""),
@@ -725,14 +719,14 @@ def describe_seat(record: Mapping[str, Any]) -> Seat | None:
 def read_seat_assignments(reader: Reader, options: Options) -> Seats:
     """List every seat this scope pays for, so a user we bill can be told from a user we merely see.
 
-    This is the only call that answers WHOSE SUBSCRIPTION a user is on. The metrics reports cover
+    This is the only call that answers whose subscription a user is on. The metrics reports cover
     everyone active in the scope regardless of who pays for them, because activity is attributed to
     the organisation it happened in; billing is attributed to the entity that bought the seat. A
     supplier's staff working in these repositories therefore appear in every usage section and in
     none of the billing ones, and only this endpoint can draw the line between the two.
 
-    A failure is carried rather than raised. The usage half of the report is unaffected by not
-    knowing who pays, and saying so is a smaller answer than the one asked for but not a wrong one.
+    A failure is carried, not raised: the usage half of the report does not depend on knowing who
+    pays, so the report says the subscriptions are unknown and reports the usage anyway.
     """
     path = f"/{options.scope_kind}/{options.scope_name}/copilot/billing/seats"
     seats: dict[str, Seat] = {}
@@ -769,9 +763,9 @@ def collect_teams(
 ) -> tuple[dict[str, tuple[str, ...]], str]:
     """Read the user-team pairs from the most recent days that have them, unioning what they say.
 
-    Team membership is a state rather than a series, so the newest reading wins on principle; the
-    union exists only because the newest day or two may not be published yet. The day actually used
-    is returned so the report can date its own groupings instead of implying they are timeless.
+    Team membership is a state, not a series, so the newest reading wins; the union exists only
+    because the newest day or two may not be published yet. The day actually used is returned so the
+    report can date its groupings.
     """
     memberships: dict[str, set[str]] = defaultdict(set)
     used: list[str] = []
@@ -834,15 +828,14 @@ def collect(reader: Reader, downloads: requests.Session, options: Options) -> Co
 
 
 def flatten_measures(entry: Mapping[str, Any], prefix: str = "") -> Iterator[tuple[str, float]]:
-    """Yield every numeric ADDABLE measure in one record, descending into nested totals.
+    """Yield every numeric addable measure in one record, descending into nested totals.
 
-    Three kinds of number are refused rather than summed. Booleans, because `True` is an int in Python
-    and adding it up would invent a measure out of a flag. Version stamps and identifiers, because
-    they describe the client or name the row rather than measuring anything. And AVERAGES — anything
-    GitHub named `avg_...` or `..._per_...` — because adding averages together produces a number that
-    is not an average of anything: `avg_tokens_per_request` over five days is not five times one day's
-    figure. Recomputing them would need denominators GitHub does not publish per bucket, so they are
-    dropped and their absence is stated in the report rather than being quietly filled with nonsense.
+    Three kinds of number are refused. Booleans, because `True` is an int in Python and adding it up
+    would invent a measure out of a flag. Version stamps and identifiers, because they describe the
+    client or name the row. And averages, anything GitHub named `avg_...` or `..._per_...`, because
+    adding averages together produces a number that is an average of nothing: `avg_tokens_per_request`
+    over five days is not five times one day's figure. Recomputing them would need denominators
+    GitHub does not publish per bucket, so they are dropped and the report says they are dropped.
     """
     for name, value in entry.items():
         if name.startswith(VERSION_PREFIX) or name in IDENTITY_KEYS or name in NUMERIC_DIMENSIONS:
@@ -859,7 +852,7 @@ def flatten_measures(entry: Mapping[str, Any], prefix: str = "") -> Iterator[tup
 
 
 def entry_dimensions(entry: Mapping[str, Any]) -> Dimensions:
-    """Key one breakdown record on every field that NAMES it rather than measures it.
+    """Key one breakdown record on the fields that name it, ignoring the ones that measure it.
 
     Every string field, so a record naming `language` and `feature` keys a different bucket from one
     naming `feature` alone, and a breakdown invented after this was written keys itself correctly
@@ -888,14 +881,13 @@ def absorb_entry(rollup: Rollup, breakdown: str, entry: object, login: str) -> N
 
 
 def describe_phase(entry: Mapping[str, Any]) -> Phase | None:
-    """Read one adoption-phase record, keeping GitHub's own English for it rather than just its id.
+    """Read one adoption-phase record, keeping GitHub's English for it alongside the identifier.
 
     The record carries an identifier, a human-readable name and the version of the model that
-    assigned it. Reading only the identifier - which this did until the name was noticed sitting
-    unread in the file - leaves the report saying `Phase 1` where GitHub said `Phase 1 (Code first)`,
-    and leaves a reader to guess criteria that were shipped alongside the number. The name and
-    version keys are looked for under several spellings rather than one, because they are newer than
-    this script and GitHub has renamed fields in this API before.
+    assigned it. Reading only the identifier leaves the report saying `Phase 1` where GitHub said
+    `Phase 1 (Code first)`, and leaves a reader to guess criteria that were shipped alongside the
+    number. The name and version keys are looked for under several spellings, because they are newer
+    than this script and GitHub has renamed fields in this API before.
     """
     identifier = entry.get("phase")
     # `or ""` would discard a legitimate phase 0, which is the No Cohort classification.
@@ -917,8 +909,8 @@ def first_string(entry: Mapping[str, Any], keys: Sequence[str]) -> str:
 def absorb_phase(rollup: Rollup, row: Row, login: str, day: str) -> None:
     """Record the user's adoption phase, keeping the most recent day's reading.
 
-    A phase is a STATE and not a quantity, and GitHub recalculates it daily over a trailing 28-day
-    window, so the newest reading replaces the older one rather than being added to it.
+    A phase is a state, not a quantity, and GitHub recalculates it daily over a trailing 28-day
+    window, so the newest reading replaces the older one.
     """
     entry = row.get("ai_adoption_phase")
     if not isinstance(entry, Mapping):
@@ -956,7 +948,7 @@ def absorb_row(rollup: Rollup, row: Row) -> None:
 
 @dataclass(frozen=True)
 class Rollups:
-    """The same records added up three ways, so the three can never disagree with each other."""
+    """The same records added up three ways, so the three always agree."""
 
     everyone: Rollup
     people: tuple[Person, ...]
@@ -969,11 +961,11 @@ def build_rollups(
 ) -> Rollups:
     """Add the per-user records up globally, per user, per team and per subscription in one pass.
 
-    Every grouping is built from the same records as the global one rather than from a separate
-    request, so a group column and the global column are one measurement added up two ways. A user
-    in several teams is absorbed into each of them, which is why teams do not partition the
-    population. SUBSCRIPTIONS DO partition it: a login holds a seat in this scope's billing or it
-    does not, so those columns sum to the global figure exactly and any drift is a bug.
+    Every grouping is built from the same records as the global one, so a group column and the global
+    column are one measurement added up two ways. A user in several teams is absorbed into each of
+    them, which is why teams do not partition the population. Subscriptions do partition it: a login
+    holds a seat in this scope's billing or it does not, so those columns sum to the global figure
+    exactly and any drift is a bug.
     """
     everyone = Rollup()
     per_user: dict[str, Rollup] = {}
@@ -1022,15 +1014,15 @@ def rank_people(people: Sequence[Person]) -> list[Person]:
 def is_user_count(name: str) -> bool:
     """Tell GitHub's distinct-user counts apart from its activity totals.
 
-    They must never be added across days: `monthly_active_users` is a trailing 28-day count of
-    distinct people, so summing it over ninety days would count one person up to ninety times.
+    Summing them double-counts: `monthly_active_users` is a trailing 28-day count of distinct
+    people, so adding ninety days of it would count one person up to ninety times.
     """
     return "active_" in name or "passive_" in name
 
 
 @dataclass(frozen=True)
 class AggregateSummary:
-    """GitHub's own org-wide numbers: user counts as they stood, activity totals added up."""
+    """GitHub's org-wide numbers: user counts at the latest day, activity totals added up."""
 
     days: int
     latest_day: str
@@ -1041,18 +1033,18 @@ class AggregateSummary:
 
 
 def aggregate_breakdowns(rows: Sequence[Row]) -> dict[str, dict[Dimensions, defaultdict[str, float]]]:
-    """Add up the breakdown ARRAYS the org-wide records carry, which `flatten_measures` cannot.
+    """Add up the breakdown arrays the org-wide records carry, which `flatten_measures` cannot.
 
-    `flatten_measures` descends into numbers and nested objects and falls through a list in silence,
-    which was fine while every aggregate breakdown was an object - `totals_by_cli` still is - and
-    stopped being fine when GitHub added `totals_by_ai_adoption_phase` as an ARRAY. Those figures
-    were being dropped without trace: the per-phase pull request, review-cycle and line counts that
-    say whether the agent cohorts actually ship more than the completion cohort.
+    `flatten_measures` descends into numbers and nested objects and falls through a list in silence.
+    That worked while every aggregate breakdown was an object (`totals_by_cli` still is), and broke
+    when GitHub added `totals_by_ai_adoption_phase` as an array: the per-phase pull request,
+    review-cycle and line counts were dropped without trace, and those are the figures that say
+    whether the agent cohorts ship more than the completion cohort.
 
-    Summed here rather than by teaching `flatten_measures` about lists, because flattening an array
-    would add every entry together and report the sum of all four phases as though it were one
-    number. A breakdown has to keep its dimensions to mean anything, so it is keyed like every other
-    breakdown in this file, and one GitHub adds tomorrow is picked up without being named here.
+    Summed here, and not by teaching `flatten_measures` about lists, because flattening an array
+    would add every entry together and report the sum of all four phases as one number. A breakdown
+    has to keep its dimensions to mean anything, so it is keyed like every other breakdown in this
+    file, and one GitHub adds tomorrow is picked up without being named here.
     """
     breakdowns: dict[str, dict[Dimensions, defaultdict[str, float]]] = {}
     for row in rows:
@@ -1131,11 +1123,11 @@ def surfaces_json(rollup: Rollup) -> list[dict[str, Any]]:
 def attributed_totals(measures: Mapping[str, float], subscription: str | None) -> dict[str, Any]:
     """Render summed measures for JSON, nulling a credit figure that is not this scope's to report.
 
-    The rule `credits_cell` applies to the table, applied to the data, so the two outputs can never
-    disagree about whose spend a zero belongs to. A measure GitHub never sent stays absent, because
+    The rule `credits_cell` applies to the table, applied to the data, so the two outputs agree
+    about whose spend a zero belongs to. A measure GitHub never sent stays absent, because
     omission is how JSON already says "not reported"; only a zero that belongs to somebody else's
     subscription becomes an explicit null. A non-zero figure survives untouched, for the same reason
-    it does in the table: a charge against a seat we do not bill is worth seeing, not hiding.
+    it does in the table: a charge against a seat we do not bill is worth seeing.
     """
     rendered: dict[str, Any] = dict(measures_json(measures))
     if subscription in SPECIAL_SUBSCRIPTIONS and CREDITS in rendered and not rendered[CREDITS]:
@@ -1166,7 +1158,7 @@ def rollup_json(rollup: Rollup, subscription: str | None = None) -> dict[str, An
 
 
 def person_json(person: Person) -> dict[str, Any]:
-    """Describe one user, including the agent-mode figures this report exists to surface."""
+    """Describe one user, including the agent-mode figures this report exists to answer."""
     phase = person.rollup.phases.get(person.login)
     return {
         "login": person.login,
@@ -1199,11 +1191,10 @@ def person_json(person: Person) -> dict[str, Any]:
 def number(value: float | None) -> str:
     """Format one measure for a table, keeping whole numbers whole and absence absent.
 
-    None is NOT zero and is never rendered as zero. A measure GitHub did not report is a thing this
-    report does not know; a measure GitHub reported as `0` is a thing it does know. Collapsing the
-    two makes a table that cannot be read: a column of zeroes then means "nobody did this" and "we
-    were never told" at the same time, and no reader can tell which cell is which. Every call site
-    therefore passes `mapping.get(name)` rather than `mapping.get(name, 0.0)`.
+    None renders as `-`. A measure GitHub did not report is a thing this report does not
+    know; a measure GitHub reported as `0` is a thing it does know. Collapsing the two makes a column
+    of zeroes that says "nobody did this" and "we were never told" at once, with no way to tell which
+    cell is which. Every call site therefore passes `mapping.get(name)`, never `mapping.get(name, 0.0)`.
     """
     if value is None:
         return ABSENT
@@ -1218,7 +1209,7 @@ def share(count: float, total: float | None) -> str:
 
 
 def plural(count: int, noun: str) -> str:
-    """Count a noun without the report reading as though it were generated, which it is."""
+    """Count a noun, agreeing its plural."""
     return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
 
 
@@ -1234,7 +1225,7 @@ def render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> list[
     columns = list(zip(headers, *rows, strict=True))
     widths = [max(len(cell) for cell in column) for column in columns]
     # A placeholder does not stop a column being a column of numbers, so `-` and `n/a` sit in the
-    # numeric alignment rather than knocking the whole column back to the left.
+    # numeric alignment and the column stays right-aligned.
     numeric = [
         all(cell in PLACEHOLDER_CELLS or NUMERIC_CELL.fullmatch(cell) for cell in column[1:]) for column in columns
     ]
@@ -1265,7 +1256,7 @@ def render_window(options: Options, collection: Collection, rollups: Rollups, da
     """State what was asked for, what came back, and how many people used Copilot at all."""
     seats = collection.seats or {}
     # The seat listing is a second, independent route to the same denominator, so a summary endpoint
-    # this token may not read no longer costs the report every percentage in it.
+    # this token may not read still leaves every percentage computable.
     total_seats = seats.get("total") or collection.seat_assignments.total
     outcomes = collection.day_outcomes.get("users", Counter())
     lines = [
@@ -1282,7 +1273,7 @@ def render_window(options: Options, collection: Collection, rollups: Rollups, da
     if assignments.available:
         # Only users this scope actually bills can be a share of this scope's seats. Dividing every
         # active login by the seat total would count supplier staff against seats nobody bought for
-        # them and can exceed 100%, which is how a denominator quietly stops being one.
+        # them, and can exceed 100%.
         ours = {login for login in rollups.everyone.users if login in assignments.by_login}
         external = len(rollups.everyone.users) - len(ours)
         lines.append(
@@ -1315,10 +1306,10 @@ def render_window(options: Options, collection: Collection, rollups: Rollups, da
 def render_surfaces(rollup: Rollup) -> list[str]:
     """Report each surface by distinct users and user-days, agent mode included.
 
-    Shares are of the ACTIVE population rather than of seats. Active users include people this scope
-    does not buy a seat for, so a seat total is not their denominator: dividing by it counts supplier
-    staff against seats nobody bought for them and can exceed 100%. The seat share that IS meaningful
-    - our seated users as a share of our seats - is stated in the header instead.
+    Shares are of the active population. Active users include people this scope does not buy a seat
+    for, so a seat total is not their denominator: dividing by it counts supplier staff against seats
+    nobody bought for them and can exceed 100%. The meaningful seat share, our seated users as a
+    share of our seats, is stated in the header.
     """
     active = float(len(rollup.users)) or None
     rows = [
@@ -1332,8 +1323,8 @@ def render_surfaces(rollup: Rollup) -> list[str]:
         for flag in ordered_surfaces(rollup)
     ]
     return [
-        heading("SURFACES: DISTINCT USERS AND USER-DAYS"),
-        "  A user-day is one person on one day, so these never count interactions.",
+        heading("USERS AND USER-DAYS PER SURFACE"),
+        "  A user-day is one person on one day.",
         "",
         *render_table(("surface", "field", "users", "of active", "user-days"), rows),
     ]
@@ -1367,7 +1358,7 @@ def render_breakdown(title: str, note: str, rollup: Rollup, breakdown: str) -> l
 def breakdown_measures(buckets: Mapping[Dimensions, Bucket]) -> list[str]:
     """Name the measures one breakdown actually carries, headline ones first.
 
-    Read from the records rather than fixed, because `totals_by_cli` counts sessions and tokens while
+    Read from the records, because `totals_by_cli` counts sessions and tokens while
     `totals_by_feature` counts interactions and lines: a fixed column set would print a column of
     zeroes for one of them and silently omit what the other measures.
     """
@@ -1377,23 +1368,23 @@ def breakdown_measures(buckets: Mapping[Dimensions, Bucket]) -> list[str]:
 
 
 def render_aggregate(summary: AggregateSummary) -> list[str]:
-    """Report GitHub's own org-wide numbers beside the ones this script added up itself."""
+    """Report GitHub's org-wide numbers beside the ones this script added up itself."""
     if not summary.days:
-        return [heading("GITHUB'S OWN ORGANISATION-WIDE COUNTS"), "  (no aggregate report was readable)"]
+        return [heading("GITHUB'S ORGANISATION-WIDE COUNTS"), "  (no aggregate report was readable)"]
     counts = [
         [name, number(summary.latest_counts.get(name)), number(summary.peak_counts.get(name))]
         for name in sorted(summary.peak_counts)
     ]
     sums = [[name, number(value)] for name, value in sorted(summary.sums.items())]
     return [
-        heading("GITHUB'S OWN ORGANISATION-WIDE COUNTS"),
+        heading("GITHUB'S ORGANISATION-WIDE COUNTS"),
         f"  Distinct-user counts as GitHub published them on {summary.latest_day}, and the highest each",
-        "  reached in the window. The monthly figures are TRAILING 28-DAY counts, not window counts, so",
-        "  they are shown as they stand rather than reconciled with the window count above.",
+        "  reached in the window. The monthly figures are trailing 28-day counts, not window counts, so",
+        "  they are shown unadjusted beside the window count above.",
         "",
         *render_table(("count", f"on {summary.latest_day}", "peak in window"), counts),
         "",
-        heading("GITHUB'S OWN ACTIVITY TOTALS, SUMMED OVER THE WINDOW"),
+        heading("GITHUB'S ACTIVITY TOTALS, SUMMED OVER THE WINDOW"),
         *render_table(("total", "window"), sums),
         *aggregate_breakdown_lines(summary),
     ]
@@ -1403,8 +1394,7 @@ def aggregate_breakdown_lines(summary: AggregateSummary) -> list[str]:
     """Report each breakdown array the org-wide records carry, one section apiece.
 
     `totals_by_ai_adoption_phase` is the one that prompted this: it answers whether the agent cohorts
-    actually merge more pull requests than the completion cohort, which is the only question a cohort
-    is useful for and which no per-user section can reach.
+    merge more pull requests than the completion cohort, which no per-user section can reach.
     """
     lines: list[str] = []
     for name, buckets in sorted(summary.breakdowns.items()):
@@ -1417,7 +1407,7 @@ def aggregate_breakdown_lines(summary: AggregateSummary) -> list[str]:
             ]
             for dimensions, measures in sorted(buckets.items())
         ]
-        title = f"GITHUB'S OWN TOTALS BY {name.removeprefix(BREAKDOWN_PREFIX).upper().replace('_', ' ')}"
+        title = f"GITHUB'S TOTALS BY {name.removeprefix(BREAKDOWN_PREFIX).upper().replace('_', ' ')}"
         lines.extend(["", heading(title)])
         if name == PHASE_BREAKDOWN:
             lines.extend(
@@ -1451,11 +1441,11 @@ def render_teams(rollups: Rollups, collection: Collection, flags: Sequence[str])
     ]
     unattributed = len(rollups.teams.get(NO_TEAM, Rollup()).users)
     return [
-        heading("BY TEAM: DISTINCT USERS PER SURFACE"),
-        f"  Team membership as reported on {collection.team_day}. Columns count DISTINCT USERS, and a user in",
-        "  several teams is counted in each, so these columns sum to more than the global figure and are",
-        "  not a partition. GitHub omits teams with fewer than five seated Copilot users from the report,",
-        f"  which is why {unattributed:,} active users appear under {NO_TEAM}.",
+        heading("DISTINCT USERS PER SURFACE, BY TEAM"),
+        f"  Team membership as reported on {collection.team_day}. Columns count distinct users, and a user in",
+        "  several teams is counted in each, so these columns sum to more than the global figure.",
+        "  GitHub omits teams with fewer than five seated Copilot users from the report, which is why",
+        f"  {unattributed:,} active users appear under {NO_TEAM}.",
         "",
         *render_table(headers, rows),
     ]
@@ -1470,7 +1460,7 @@ def subscription_order(groups: Mapping[str, Rollup]) -> list[str]:
 def subscription_models(rollup: Rollup) -> dict[str, set[str]]:
     """Name every model one population used and who used it, from whichever breakdown carries one.
 
-    Discovered rather than read from a fixed breakdown, because `model` appears as a dimension of
+    Discovered from the records, because `model` appears as a dimension of
     `totals_by_model_feature` and `totals_by_language_model` alike, and GitHub may key it into
     another tomorrow. A user is counted once per model however many breakdowns mention it.
     """
@@ -1484,24 +1474,24 @@ def subscription_models(rollup: Rollup) -> dict[str, set[str]]:
 
 
 def render_subscriptions(options: Options, collection: Collection, rollups: Rollups, flags: Sequence[str]) -> list[str]:
-    """Report who pays for each active user, which is not answerable from the usage reports alone.
+    """Report who pays for each active user, which only the seat list can answer.
 
-    THE DISTINCTION THIS SECTION EXISTS FOR. The metrics reports cover everyone active in the scope,
-    because activity is attributed to the organisation whose repositories it happened in. Billing is
-    attributed to whoever bought the seat. Contractors and suppliers working here on their own
-    employer's subscription therefore appear in full in every usage section of this report and in
-    none of its billing figures, and without this section their zero credits read as thrift.
+    The metrics reports cover everyone active in the scope, because activity is attributed to the
+    organisation whose repositories it happened in. Billing is attributed to whoever bought the seat.
+    Contractors and suppliers working here on their employer's subscription therefore appear in full
+    in every usage section of this report and in none of its billing figures, and without this
+    section their zero credits read as thrift.
     """
     seats = collection.seat_assignments
     groups = subscription_order(rollups.subscriptions)
     if not seats.available:
         return [
-            heading("BY SUBSCRIPTION: WHO PAYS FOR EACH ACTIVE USER"),
+            heading("WHO PAYS FOR EACH ACTIVE USER"),
             f"  The seat list could not be read, so no user's subscription is known: {seats.detail}",
-            "  Every user is therefore reported as `?` rather than as externally billed, which would be a",
-            "  confident answer produced by a failure. Reading it needs organisation owner, or the",
-            "  'GitHub Copilot Business' / billing permission on a fine-grained token, or manage_billing:copilot",
-            "  on a classic one. Until it is readable, no credit figure in this report can be attributed.",
+            "  Every user is therefore reported as `?`. Reading the seat list needs organisation owner, or",
+            "  the 'GitHub Copilot Business' / billing permission on a fine-grained token, or",
+            "  manage_billing:copilot on a classic one. Until it is readable, no credit figure in this",
+            "  report can be attributed.",
         ]
     idle = seats.idle(rollups.everyone.users)
     headers = ("subscription", "users", *(surface_column(flag) for flag in flags), "prompts", "credits", "models")
@@ -1518,12 +1508,12 @@ def render_subscriptions(options: Options, collection: Collection, rollups: Roll
     ]
     external = len(rollups.subscriptions.get(EXTERNAL_SUBSCRIPTION, Rollup()).users)
     return [
-        heading("BY SUBSCRIPTION: WHO PAYS FOR EACH ACTIVE USER"),
-        "  Subscriptions PARTITION the active population - a login either holds a seat in this scope's",
-        "  billing or it does not - so unlike the team columns these sum to the global figure exactly.",
+        heading("WHO PAYS FOR EACH ACTIVE USER"),
+        "  Subscriptions partition the active population: a login either holds a seat in this scope's",
+        "  billing or it does not, so these columns, unlike the team columns, sum to the global figure.",
         f"  {external:,} of {len(rollups.everyone.users):,} active users hold no seat {options.scope_name} pays for. They are not unlicensed:",
-        "  their seat is bought somewhere this token cannot see, typically their own employer's. Their usage",
-        f"  is fully visible here and their spend is not visible at all, so credits read `{NOT_APPLICABLE}`, never `0`.",
+        "  their seat is bought somewhere this token cannot see, typically their employer's. Their usage",
+        f"  is fully visible here and their spend is not visible at all, so their credits read `{NOT_APPLICABLE}`.",
         f"  {plural(len(seats.by_login), 'seat')} billed by {options.scope_name}, of which {len(idle):,} saw no activity in this window",
         "  (--format json names them; the per-user report holds no record for a user who did nothing).",
         "",
@@ -1532,13 +1522,12 @@ def render_subscriptions(options: Options, collection: Collection, rollups: Roll
 
 
 def render_models_by_subscription(rollups: Rollups, seats: Seats) -> list[str]:
-    """Report which models each subscription's users reached, which is a policy fact, not a taste.
+    """Report which models each subscription's users reached, which is set by policy.
 
     Model availability is set by the Copilot policy of the subscription that owns the seat, not by
     the organisation the work happens in. A model with users only under an external subscription is
-    therefore one THIS scope has not enabled, being used in this scope's repositories by someone
-    whose employer has enabled it - which is the question this table exists to answer and which no
-    other section of the report can.
+    therefore one this scope has not enabled, being used in this scope's repositories by someone
+    whose employer has enabled it. That is the question this table answers and no other section can.
     """
     if not seats.available:
         return [
@@ -1561,10 +1550,10 @@ def render_models_by_subscription(rollups: Rollups, seats: Seats) -> list[str]:
     ]
     return [
         heading("MODELS BY SUBSCRIPTION"),
-        "  Counts are DISTINCT USERS of each model. A `0` here is a real zero, not a missing value: the",
-        "  model was reported for this window and nobody on that subscription used it. A model with users",
-        "  only under an external subscription is one this scope has not enabled - it is reaching these",
-        "  repositories through a seat somebody else pays for and sets the policy on.",
+        "  Counts are distinct users of each model. A `0` here is a measurement: the model was reported",
+        "  for this window and nobody on that subscription used it. A model with users only under an",
+        "  external subscription is one this scope has not enabled: it is reaching these repositories",
+        "  through a seat somebody else pays for and sets the policy on.",
         "",
         *render_table(headers, rows),
     ]
@@ -1573,12 +1562,11 @@ def render_models_by_subscription(rollups: Rollups, seats: Seats) -> list[str]:
 def credits_cell(subscription: str, value: float | None) -> str:
     """Render one credit figure, refusing to report another subscription's spend as our zero.
 
-    `ai_credits_used` measures what THIS scope was charged for a user. For a seat billed elsewhere
+    `ai_credits_used` measures what this scope was charged for a user. For a seat billed elsewhere
     that quantity does not exist here, so printing the zero GitHub sends would assert that an
-    externally-billed user cost nothing - a claim this report cannot support and which reads as
-    evidence of frugality when it is evidence of nothing. A non-zero figure is still printed,
-    because suppressing a number GitHub did report would be the same error facing the other way,
-    and a charge appearing against a seat we do not bill is exactly the contradiction worth seeing.
+    externally-billed user cost nothing, a claim this report cannot support and which reads as
+    evidence of frugality. A non-zero figure is still printed: a charge against a seat we do not bill
+    is worth seeing.
     """
     if value:
         return number(value)
@@ -1612,7 +1600,7 @@ def person_row(person: Person, flags: Sequence[str]) -> list[str]:
         subscription_column(person.subscription),
         person.seat.assigning_team if person.seat and person.seat.assigning_team else ABSENT,
         # The identifier alone, not the full label: this table already carries fifteen columns, and
-        # the English and the criteria are stated once in the AI ADOPTION PHASE section instead.
+        # the English and the criteria are stated once in the AI ADOPTION PHASE section.
         phase[1].identifier if phase else ABSENT,
         ",".join(dimension_values(rollup, "totals_by_ide", "ide")) or ABSENT,
         ",".join(dimension_values(rollup, "totals_by_model_feature", "model")) or ABSENT,
@@ -1659,7 +1647,7 @@ def render_agent_users(people: Sequence[Person], flags: Sequence[str]) -> list[s
         heading(f"USERS WHO USED IDE CHAT AGENT MODE ({len(users):,})"),
         f"  `agent days` counts days on which {AGENT_SURFACE} was true; `agent prompts` counts interactions in",
         "  every chat feature GitHub names an agent mode. A user can have one without the other, because the",
-        "  two come from different parts of the record; both are shown rather than one being chosen.",
+        "  two come from different parts of the record; both are shown.",
         "",
         *render_table(headers, rows),
     ]
@@ -1669,7 +1657,7 @@ def render_people(people: Sequence[Person], flags: Sequence[str]) -> list[str]:
     """Report every user with any activity. Users who never used Copilot have no record to report."""
     return [
         heading(f"EVERY USER WITH ANY COPILOT ACTIVITY ({len(people):,})"),
-        "  Surface columns count DAYS on which that surface was used, ordered by agent-mode use first.",
+        "  Surface columns count days on which that surface was used, ordered by agent-mode use first.",
         "  Users who never used Copilot are absent: the per-user report holds no record for them.",
         "",
         *render_table(person_headers(flags), [person_row(person, flags) for person in people]),
@@ -1677,23 +1665,23 @@ def render_people(people: Sequence[Person], flags: Sequence[str]) -> list[str]:
 
 
 def render_limits(options: Options, collection: Collection, rollups: Rollups) -> list[str]:
-    """State plainly what these numbers cannot be asked to mean."""
+    """State what these numbers cannot be asked to mean."""
     failures = sum(counts["failed"] + counts["absent"] for counts in collection.day_outcomes.values())
     seats = collection.seat_assignments
     return [
         heading("LIMITS"),
-        f"  - `{ABSENT}` means GitHub reported no value and `0` means it reported zero; they are never merged.",
+        f"  - `{ABSENT}` means GitHub reported no value and `0` means it reported zero.",
         f"  - `{NOT_APPLICABLE}` credits mean the seat is billed outside this scope, so its spend is not ours to see.",
-        "  - Distinct-user counts are distinct logins over the whole window, never sums of daily counts.",
-        "  - A surface count is days touched, not volume; a feature count is volume, not days. They differ.",
-        "  - Usage covers everyone active here; billing covers only seats this scope bought. Not the same set.",
+        "  - Distinct-user counts are distinct logins over the whole window.",
+        "  - A surface count is days touched, not volume; a feature count is volume, not days.",
+        "  - Usage covers everyone active here; billing covers only seats this scope bought.",
         (
             f"  - {plural(len(seats.idle(rollups.everyone.users)), 'seat')} billed here saw no activity; --format json names them."
             if seats.available
             else f"  - The seat list was unreadable, so no subscription and no credit figure can be attributed: {seats.detail}"
         ),
-        "  - Teams are not a partition, and GitHub omits teams under five seated users entirely.",
-        "  - Averages GitHub publishes per day are omitted, not summed: adding averages averages nothing.",
+        "  - A user in several teams counts in each, and GitHub omits teams under five seated users entirely.",
+        "  - Averages GitHub publishes per day are omitted: adding averages averages nothing.",
         f"  - {failures} report-days were absent or unreadable; days with no report are not days with no use.",
         f"  - Reports exist only from {EARLIEST_REPORT_DAY.isoformat()}, and GitHub serves about a year back.",
         f"  - Read from {report_days(collection)} report-days under scope {options.scope_kind}/{options.scope_name}.",
@@ -1701,7 +1689,7 @@ def render_limits(options: Options, collection: Collection, rollups: Rollups) ->
 
 
 def report_days(collection: Collection) -> str:
-    """Count the report-days this run asked for, from the outcomes rather than from an assumption."""
+    """Count the report-days this run asked for, from the outcomes themselves."""
     return str(sum(sum(counts.values()) for counts in collection.day_outcomes.values()))
 
 
@@ -1714,7 +1702,7 @@ def render(options: Options, collection: Collection, rollups: Rollups, days: Seq
         render_surfaces(rollups.everyone),
         render_breakdown(
             "CHAT MODES AND OTHER FEATURES",
-            "GitHub's own feature names. `chat_panel_agent_mode` is IDE chat agent mode.",
+            "GitHub's feature names. `chat_panel_agent_mode` is IDE chat agent mode.",
             rollups.everyone,
             FEATURE_BREAKDOWN,
         ),
@@ -1761,11 +1749,10 @@ def phase_criteria(phase: Phase) -> str:
 def render_phases(rollup: Rollup) -> list[str]:
     """Report how many users sat in each adoption phase on the last day each was seen.
 
-    THE ONE COLUMN IN THIS REPORT THAT IS NOT ABOUT THE WINDOW. GitHub assigns a phase over a
-    trailing 28-day window and recalculates it daily, so a one-day run reports a preceding month's
-    classification beside a single day's activity, and a Phase 3 user can show almost no use on the
-    day asked for. That is not a contradiction and the section says so rather than leaving a reader
-    to find it out by disbelieving the table.
+    GitHub assigns a phase over a trailing 28-day window and recalculates it daily, so a one-day run
+    reports a preceding month's classification beside a single day's activity, and a Phase 3 user can
+    show almost no use on the day asked for. The section says so, so that a reader meeting the
+    mismatch in the table has the explanation to hand.
     """
     seen = [phase for _, phase in rollup.phases.values()]
     counted = Counter(phase.identifier for phase in seen)
@@ -1776,19 +1763,19 @@ def render_phases(rollup: Rollup) -> list[str]:
             named[identifier].label(),
             number(count),
             share(count, len(rollup.users) or None),
-            # The criteria, never the name: `label` has already said the name if the record carried
-            # one. Looked up under the identifier AND the name, because GitHub sends the phase as a
-            # bare integer in some reports and as `Phase 1` in others, and the gloss belongs to both.
+            # The criteria only: `label` has already said the name if the record carried
+            # one. Looked up under the identifier and under the name, because GitHub sends the phase
+            # as a bare integer in some reports and as `Phase 1` in others, and the gloss fits both.
             phase_criteria(named[identifier]),
         ]
         for identifier, count in sorted(counted.items())
     ]
     lines = [
         heading("AI ADOPTION PHASE"),
-        "  GitHub's own classification, taken from each user's most recent day in the window. It is",
-        "  assigned over a TRAILING 28-DAY window and recalculated daily, so it describes the month up to",
-        "  that day and not the window this report covers: over a short window it is the only column here",
-        "  that does. Phases measure BREADTH of surfaces, not volume - heavy completion use with no agent",
+        "  GitHub's classification, taken from each user's most recent day in the window. It is assigned",
+        "  over a trailing 28-day window and recalculated daily, so it describes the month up to that day;",
+        "  over a short window it is the only column here describing anything but the window this report",
+        "  covers. Phases measure breadth of surfaces, not volume: heavy completion use with no agent",
         "  surface stays Phase 1, and light use across two agent surfaces reaches Phase 3.",
     ]
     if versions:
@@ -1803,8 +1790,8 @@ REPOSITORY_ROWS_SHOWN = 100
 def summarise_repositories(rows: Sequence[Row]) -> list[tuple[str, dict[str, float]]]:
     """Add the per-repository records up per repository, whichever field names the repository.
 
-    The naming field is discovered rather than assumed: this report is a later addition to the API
-    than the rest and one wrong guess at its key would silently produce an empty section.
+    The naming field is discovered from the record: this report is a later addition to the API than
+    the rest, and one wrong guess at its key would silently produce an empty section.
     """
     totals: dict[str, defaultdict[str, float]] = {}
     for row in rows:
@@ -1819,7 +1806,7 @@ def summarise_repositories(rows: Sequence[Row]) -> list[tuple[str, dict[str, flo
 
 
 def render_repositories(rows: Sequence[Row]) -> list[str]:
-    """Report the per-repository breakdown, which carries activity but never a user login."""
+    """Report the per-repository breakdown, which carries activity and no user login."""
     ranked = summarise_repositories(rows)
     if not ranked:
         return [heading("BY REPOSITORY"), "  (no per-repository report was readable; --no-repositories skips it)"]
@@ -1863,8 +1850,8 @@ def build_json(options: Options, collection: Collection, rollups: Rollups, days:
             "detail": collection.seat_assignments.detail,
             "seats_billed_here": len(collection.seat_assignments.by_login),
             "note": "a partition: a login either holds a seat this scope bills or it does not. Credits "
-            "measure what this scope was charged, so they are null - never zero - for seats billed "
-            "elsewhere, whose usage is fully visible here and whose spend is not visible at all.",
+            "measure what this scope was charged, so a seat billed elsewhere carries null: its usage "
+            "is fully visible here and its spend is not visible at all.",
             "idle_seats": collection.seat_assignments.idle(rollups.everyone.users),
             "groups": {
                 label: {
@@ -1891,8 +1878,8 @@ def build_json(options: Options, collection: Collection, rollups: Rollups, days:
         "global": rollup_json(rollups.everyone),
         "teams": {
             "membership_day": collection.team_day,
-            "note": "not a partition: a user in several teams is counted in each, and GitHub omits "
-            "teams with fewer than five seated Copilot users",
+            "note": "a user in several teams is counted in each, so these groups sum to more than "
+            "the global figure; GitHub omits teams with fewer than five seated Copilot users",
             "groups": {slug: rollup_json(rollup) for slug, rollup in sorted(rollups.teams.items())},
         },
         "repositories": [
@@ -1911,7 +1898,7 @@ def resolve_token() -> str:
             return token
     executable = shutil.which("gh")
     if executable is not None:
-        # Not a shell, and the path comes from `which` rather than from anything user-supplied.
+        # Not a shell, and the path comes from `which`, not from anything user-supplied.
         completed = subprocess.run(  # noqa: S603
             [executable, "auth", "token"],
             capture_output=True,
@@ -2010,8 +1997,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     except AccessError as refused:
         sys.exit(
             f"refused: {refused}\n"
-            "This is the token's own access and not a property of the day asked for, so the run stopped\n"
-            "rather than spending a call per remaining day to be told the same thing again.\n"
+            "This is the token's access and not a property of the day asked for, so the run stopped\n"
+            "instead of spending a call per remaining day to be told the same thing again.\n"
             "  401  the token was not accepted at all: check it is set, unexpired, and SSO-authorised\n"
             "       for this organisation.\n"
             "  403  the token is accepted but lacks the role: reading these reports needs organisation\n"
