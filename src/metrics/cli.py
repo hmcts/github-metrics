@@ -39,6 +39,7 @@ from metrics.domain import (
 )
 from metrics.evidence import (
     RepositoryEvidence,
+    actor_readiness,
     cached_repository_evidence,
     collected_repository_evidence,
     offline_open_pull_request_report,
@@ -232,18 +233,27 @@ def evidence_report(
         # security alerts, CODEOWNERS presence, maintenance and the SonarCloud measures are five
         # views of the same stored row.
         stored = {item.repository: stored_repository_state(configuration, item.repository) for item in evidence}
-        return PracticeEvidenceReport(
-            organization=configuration.organization,
-            repositories=tuple(
+        # Kept paired rather than zipped back together later: the actor section reads each
+        # repository's authors from the cached facts and its label and findings from the practice
+        # report built out of them, and pairing at the point of construction is what stops one
+        # repository's merges from ever being read against another's assessment.
+        reported = tuple(
+            (
+                item,
                 item.practices(
                     rules,
                     policy,
                     open_pull_requests[item.repository],
                     stored_reports(stored[item.repository]),
-                )
-                for item in evidence
-            ),
+                ),
+            )
+            for item in evidence
+        )
+        return PracticeEvidenceReport(
+            organization=configuration.organization,
+            repositories=tuple(practice for _, practice in reported),
             unavailable=unavailable,
+            actors=actor_readiness(reported),
         )
     metric = behaviour_metric(options.metric, configuration.traceability)
     reports = tuple(item.metric(metric, include_identities=options.include_identities) for item in evidence)

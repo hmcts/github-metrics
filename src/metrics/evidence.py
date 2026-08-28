@@ -5,13 +5,15 @@ from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from metrics.analysis import excluded_authors, in_cohort
+from metrics.analysis import Merge, excluded_authors, in_cohort, is_human_account
 from metrics.assessment import ReadinessPolicy
 from metrics.behaviour import collect_open_pull_request_state, requested_coverage, synchronize_merges
 from metrics.behaviour_metrics.base import BehaviourMetric
 from metrics.config import Configuration
 from metrics.domain import (
     MAINTENANCE_WINDOWS,
+    ActorReadiness,
+    ActorRepositoryReadiness,
     BehaviourEvidenceReport,
     CachedBehaviourFacts,
     CodeownersReport,
@@ -131,6 +133,78 @@ def cohort_summary(changes: Merges, excluded: Collection[str]) -> CohortSummary:
         ),
         direct_commits=sum(in_cohort(commit, excluded) for commit in changes.direct_commits),
     )
+
+
+def authored_logins(changes: Merges) -> tuple[str, ...]:
+    """Return the author login of every merge a person authored, in the order the facts carry.
+
+    Both routes onto the default branch, because a person who pushed straight to it contributed as
+    much as one who merged a pull request. Bot accounts are left out here, which drops MORE accounts
+    than the cohort's own exclusions do: an agent-authored merge stays in the cohort and in every
+    rate measured over it, but an agent is not a person to review. Unattributed changes are left out
+    for the same reason — a commit GitHub matched to no account names nobody.
+    """
+    merges: tuple[Merge, ...] = (*changes.pull_requests, *changes.direct_commits)
+    return tuple(
+        login
+        for change in merges
+        if (login := change.author_login) is not None and is_human_account(login, change.author_type)
+    )
+
+
+def actor_contributions(changes: Merges) -> Counter[str]:
+    """Count how many of one repository's merges each person authored, keyed by case-folded login."""
+    return Counter(login.casefold() for login in authored_logins(changes))
+
+
+def actor_blocking_occurrences(practice: RepositoryPracticeEvidence) -> Counter[str]:
+    """Sum the occurrences behind one repository's practice findings, keyed by case-folded login.
+
+    Occurrences rather than findings: two rules each reporting an actor six times is twelve
+    occurrences, and counting findings would make a person look better the fewer rules ran.
+    """
+    counts: Counter[str] = Counter()
+    for finding in practice.behaviour:
+        counts[finding.actor_login.casefold()] += finding.occurrences
+    return counts
+
+
+def actor_readiness(
+    reported: Iterable[tuple[RepositoryEvidence, RepositoryPracticeEvidence]],
+) -> tuple[ActorReadiness, ...]:
+    """List every person who contributed to the reported repositories, with each repository's label.
+
+    Takes the pairs rather than either side alone: the contributions come from the cached facts and
+    the label and findings come from the practice report built from them, so pairing them at the
+    call site is what keeps one repository's merges from being read against another's assessment.
+    """
+    rows: dict[str, list[ActorRepositoryReadiness]] = {}
+    spellings: dict[tuple[str, str], str] = {}
+    for evidence, practice in reported:
+        blocking = actor_blocking_occurrences(practice)
+        logins = authored_logins(evidence)
+        # Reversed so the earliest spelling seen in this repository is the one left assigned.
+        spelled = {login.casefold(): login for login in reversed(logins)}
+        for actor, contributions in actor_contributions(evidence).items():
+            rows.setdefault(actor, []).append(
+                ActorRepositoryReadiness(
+                    readiness=practice.assessment.label if practice.assessment is not None else None,
+                    repository=practice.repository,
+                    contributions=contributions,
+                    # A finding attributed to somebody who authored nothing here cannot exist, but a
+                    # person with no findings is the ordinary case and blocks nothing.
+                    blocking=blocking.get(actor, 0),
+                ),
+            )
+            spellings[actor, practice.repository] = spelled[actor]
+    actors = []
+    for actor in sorted(rows):
+        # The weightiest repository leads, and it also decides how the login is spelled.
+        repositories = tuple(sorted(rows[actor], key=lambda row: (-row.contributions, row.repository)))
+        actors.append(
+            ActorReadiness(actor_login=spellings[actor, repositories[0].repository], repositories=repositories),
+        )
+    return tuple(actors)
 
 
 def repository_evidence(

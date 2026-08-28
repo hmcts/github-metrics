@@ -1852,6 +1852,197 @@ def test_evidence_reds_a_repository_whose_gate_requires_no_review(
     assert assessment["blocking"][0]["condition"] == "pull-request-review-not-required"
 
 
+def two_repository_configuration(tmp_path: Path) -> Path:
+    """Write a configuration listing two repositories of one team."""
+    path = tmp_path / "metrics.yaml"
+    path.write_text(
+        """\
+version: 1
+organization: hmcts
+database: metrics.sqlite3
+teams:
+  - identifier: divorce
+    display_name: Divorce
+    repositories:
+      - nfdiv-case-api
+      - nfdiv-case-orchestration
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def evidence_authored_by(window: ReportingWindow, repository: str, author: str) -> RepositoryEvidence:
+    """Build one repository's evidence with its single unreviewed merge authored by the given person."""
+    evidence = evidence_for(window, repository)
+    return evidence.model_copy(
+        update={"pull_requests": (evidence.pull_requests[0].model_copy(update={"author_login": author}),)},
+    )
+
+
+def test_evidence_lists_each_actor_beside_the_readiness_of_what_they_contributed_to(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Carry the actor section in the JSON contract, built from the same repositories it reports."""
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    # The label is the one the repository block carries, and the merge counted here is the one the
+    # unreviewed-merge finding beside it is attributed to.
+    assert report["actors"] == [
+        {
+            "actor_login": "author",
+            "repositories": [
+                {
+                    "readiness": "cannot_assess",
+                    "repository": "nfdiv-case-api",
+                    "contributions": 1,
+                    "blocking": 1,
+                },
+            ],
+        },
+    ]
+
+
+def test_evidence_narrows_the_actor_section_to_the_requested_repository(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Report the actors of the one repository asked for, not of every repository configured."""
+    configuration_path = two_repository_configuration(tmp_path)
+    authors = {"nfdiv-case-api": "alice", "nfdiv-case-orchestration": "bob"}
+
+    def cached(_configuration: object, repository: str, window: ReportingWindow) -> RepositoryEvidence:
+        return evidence_authored_by(window, repository, authors[repository])
+
+    with (
+        patch(
+            "sys.argv",
+            [
+                "metrics",
+                "evidence",
+                "--config",
+                str(configuration_path),
+                "--offline",
+                "--repository",
+                "nfdiv-case-api",
+            ],
+        ),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.cli.cached_repository_evidence", side_effect=cached),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert [actor["actor_login"] for actor in report["actors"]] == ["alice"]
+    assert [row["repository"] for row in report["actors"][0]["repositories"]] == ["nfdiv-case-api"]
+
+
+def test_evidence_names_each_actor_against_the_repository_their_merges_were_read_from(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Pair every repository's authors with its own assessment, so no line reads one against another's."""
+    configuration_path = two_repository_configuration(tmp_path)
+    authors = {"nfdiv-case-api": "alice", "nfdiv-case-orchestration": "bob"}
+
+    def cached(_configuration: object, repository: str, window: ReportingWindow) -> RepositoryEvidence:
+        return evidence_authored_by(window, repository, authors[repository])
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.cli.cached_repository_evidence", side_effect=cached),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    # Both repositories are available and both carry one merge, so only correct pairing puts each
+    # author against the repository whose facts named them and the finding raised against it.
+    assert {
+        actor["actor_login"]: [(row["repository"], row["blocking"]) for row in actor["repositories"]]
+        for actor in report["actors"]
+    } == {"alice": [("nfdiv-case-api", 1)], "bob": [("nfdiv-case-orchestration", 1)]}
+
+
+def test_evidence_omits_readiness_from_an_actor_row_when_the_policy_is_disabled(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Leave the key out of the JSON rather than publishing a null, which would read as a label of its own."""
+    configuration_path = tmp_path / "metrics.yaml"
+    configuration_path.write_text(
+        """\
+version: 1
+organization: hmcts
+database: metrics.sqlite3
+assessment:
+  enabled: false
+teams:
+  - identifier: divorce
+    display_name: Divorce
+    repositories:
+      - nfdiv-case-api
+""",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert "readiness" not in report["actors"][0]["repositories"][0]
+
+
+def test_evidence_gives_an_unavailable_repository_no_actors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Leave a repository no facts were read for out of the actor section, as it is left out of the numbers."""
+    configuration_path = two_repository_configuration(tmp_path)
+    unavailable = EvidenceUnavailable(
+        repository="nfdiv-case-orchestration",
+        detail="cached evidence does not cover 2026-08-01",
+    )
+
+    def cached(
+        _configuration: object,
+        repository: str,
+        window: ReportingWindow,
+    ) -> RepositoryEvidence | EvidenceUnavailable:
+        if repository == "nfdiv-case-orchestration":
+            return unavailable
+        return evidence_authored_by(window, repository, "alice")
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.cli.cached_repository_evidence", side_effect=cached),
+    ):
+        assert main() == INCOMPLETE_RUN
+
+    report = json.loads(capsys.readouterr().out)
+    # Whoever contributed to the unavailable repository is unknown, so nobody is listed against it:
+    # the section says as much about that repository as the numbers do, which is nothing.
+    assert [actor["actor_login"] for actor in report["actors"]] == ["alice"]
+    assert [row["repository"] for row in report["actors"][0]["repositories"]] == ["nfdiv-case-api"]
+
+
 def test_evidence_metric_without_repository_reports_all_cached_repositories(
     configuration_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -860,7 +860,60 @@ Behaviour
   checks-passing-at-merge      80.2%  77 of 96      -        -        -        -
   description-quality          72.5%  66 of 91      -        -        -        -
   traceability-reference       58.2%  53 of 91      -        -        -        -
+
+Actors
+------
+  alice  AMBER (cath-service), CANNOT_ASSESS (unreadable-svc)
+  bob    AMBER
+  carol  GREEN
 ```
+
+### Actors: the same evidence read person by person
+
+The report closes with an **actors** section, and `actors` is a field of the JSON whatever `--format` is chosen. The
+per-repository blocks answer "how is this repository doing"; this answers "what is this person working in", by listing
+one line per person who authored a merge in the reported repositories with the readiness label of every repository they
+contributed to. It is the default practice report only: a `--metric` drill-down is unchanged, and a repository reported
+in `unavailable` contributes no actors, because no facts were read for it.
+
+```json
+"actors": [
+  {"actor_login": "alice",
+   "repositories": [
+     {"readiness": "red",   "repository": "project-x", "contributions": 41, "blocking": 12},
+     {"readiness": "green", "repository": "project-z", "contributions": 3,  "blocking": 0}]}
+]
+```
+
+`contributions` counts the merges that person authored in the window, by either route, after the cohort's author
+exclusions. `blocking` sums the `occurrences` behind their practice findings in that repository, so twelve unreviewed
+merges count as twelve rather than as one finding; it reports what a rule already found, gathered per repository.
+`readiness` is the repository's assessed label, and is **absent** when the readiness policy is disabled — there is then
+no label to carry, and inventing one would grade a repository the report deliberately left ungraded. Actors are
+alphabetical by case-folded login, and each actor's repositories are ordered by contributions, largest first, ties
+broken by repository name. Logins are matched case-insensitively, because a GitHub login is unique
+case-insensitively — `Alice` and `alice` are one person — and are spelled as the repository they contributed most to
+spells them.
+
+The rendered line abridges that list. **Each label is tallied once**, wherever the repositories carrying it sit in the
+list, so no line reports the same label twice. Groups are ordered by the contributions behind them, largest first, ties
+broken by the policy's severity precedence — red, cannot assess, amber, green, then not assessed — so a person's
+weightiest label leads and neither a heavy green nor an ordering accident can put a red anywhere else. Repositories
+within a group keep the contribution order. `x N` is dropped when N is 1, a repository with no assessment reads
+`NOT ASSESSED`, and repository names appear only where an actor's labels differ: six red repositories render `RED x 6`,
+because the names would draw no distinction. Where the labels do differ the names are the point, since which of them is
+the red one is the next thing asked.
+
+**Bot accounts get no line**, both those GitHub types as `Bot` and those following the `[bot]` login convention while
+typed as ordinary users — the same test `active-contributors` applies, which drops more accounts than
+`cohort.excluded_authors` does. Their merges **stay in the cohort** and in every rate measured over it, because
+agent-authored work is work this report covers; an agent is simply not a person to review. A repository where an agent
+raised every change therefore reports its merges with nobody named against them.
+
+**Like the index, this is not a roll-up.** It lists labels and combines them nowhere: a person contributing to a red
+repository and a green one has no single readiness, and averaging or reducing the two would invent a per-person verdict
+this tool does not make. There is no worst-label summary and no count of people — see `docs/architecture.md` under
+"Scope boundaries".
 
 ### Trend: measuring periods after enablement
 

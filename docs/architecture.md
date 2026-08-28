@@ -1,8 +1,8 @@
 # Metrics — Settled Architecture Decisions
 
 Durable rulings. Do not re-litigate these; if one is wrong, change it here deliberately and say why.
-The active iteration plan is [plan.md](../plan.md) in the repository root; completed plans are kept
-under [completed/](../completed/).
+Iteration plans live under [plans/](plans/), one dated file per plan (`YYYYMMDD-short-name.md`);
+completed plans are kept under [completed/](../completed/).
 
 Every section describes the code as it stands.
 
@@ -35,7 +35,8 @@ VETO, rather than merely sitting alongside behavioural evidence.
 
 This reverses "no scoring, no RAG labels" as recorded under scope boundaries, which is why it is
 called out here rather than quietly edited. The rest of that boundary is untouched: still no
-dashboards, and no personal rankings beyond the actor-level findings rules already produce.
+dashboards, and no personal rankings — the actor section added on 2026-08-28 lists a person's
+repositories and their labels in alphabetical order of login, precisely so that it is not one.
 
 The judgement layer does NOT belong in `behaviour_metrics/` — metrics stay neutral aggregates with no
 target and no verdict, and that separation is what makes them reusable under a changed policy. It
@@ -1058,7 +1059,8 @@ or nothing". Document the behaviour; do not soften it.
 
 ## Scope boundaries
 
-- No dashboards. No personal rankings beyond the actor-level findings rules already produce.
+- No dashboards. No personal rankings: the actor section lists a person's repositories and the label
+  of each, ordered alphabetically by login, and nothing scores or ranks people.
 - Scoring and RAG labels were previously excluded; that exclusion was REVERSED on 2026-08-13 for the
   readiness assessment only — see "Readiness assessment" above. Metrics themselves stay neutral.
 - No merger-identity collection.
@@ -1077,6 +1079,26 @@ or nothing". Document the behaviour; do not soften it.
     whether the gate's rules could be read. The boundary this respects is exact — the index LISTS
     labels, it does not COMBINE them. It carries no total, no count and no per-team verdict, because
     each of those is the roll-up rule the user declined to choose. If it ever grows one, cut it back.
+  - THE PER-ACTOR LISTING IS IN SCOPE, and was built on 2026-08-28. The evidence report closes with
+    one line per person who authored a merge into a reported repository, giving each repository they
+    contributed to and its readiness label. It respects the same boundary the index does, and for
+    the same reason: it LISTS labels and COMBINES them nowhere. A person contributing to a red
+    repository and a green one has no single readiness, so there is no per-person verdict, no
+    worst-label summary and no count of people. The rulings that hold it in place:
+    - `contributions` and `blocking` are per repository. `blocking` re-reports the occurrences a
+      practice rule already found there, and one repository's findings never reach another's row.
+      The evidence and the practice report are paired at the point of construction in
+      `evidence_report` for exactly this reason.
+    - Bots get no line, by `analysis.is_human_account` — the predicate `is_human_review` and
+      `contributor_logins` already share, and a fourth spelling of "is this a bot" must not appear.
+      Their merges STAY in every cohort, as the `active-contributors` ruling above records.
+    - `readiness` is OMITTED, not defaulted, when the readiness policy is disabled. A null or a
+      stand-in label would grade a repository the report deliberately left ungraded.
+    - The label groups on a rendered line are ordered by the contributions behind them. That sum is
+      an ORDERING KEY and is never printed; it is per person within one line and combines nothing
+      across the report. If it is ever reported as a figure, cut it back.
+    - Actors are ordered alphabetically by case-folded login, never by blocking count. Ordering
+      people by what they blocked is the personal ranking this boundary excludes.
   - NO CROSS-REPOSITORY AVERAGING (decided 2026-08-15, when trend measurement was admitted). AN
     AVERAGE OF DELTAS IS A ROLL-UP. This is recorded beside the entry above because the trend report
     makes the forbidden thing subtler than a team label ever did: "the org improved 12%" reads as a

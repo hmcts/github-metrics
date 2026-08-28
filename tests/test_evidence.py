@@ -1,5 +1,7 @@
 """Test behaviour evidence projections and window loading."""
 
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +41,7 @@ from metrics.domain import (
     DistributionObservation,
     EvidenceSource,
     EvidenceUnavailable,
+    FindingSeverity,
     MaintenanceEvidence,
     MaintenanceReport,
     MergeGateEvidence,
@@ -46,13 +49,17 @@ from metrics.domain import (
     Merges,
     OpenAlertCount,
     OpenPullRequestSummary,
+    PracticeFinding,
     PullRequestFact,
     PullRequestRule,
     RateObservation,
+    ReadinessAssessment,
+    ReadinessLabel,
     ReportingWindow,
     RepositoryInventory,
     RepositoryInventoryItem,
     RepositoryMetadata,
+    RepositoryPracticeEvidence,
     ReviewFact,
     ReviewState,
     SecurityAlertEvidence,
@@ -72,7 +79,10 @@ from metrics.domain import (
 from metrics.evidence import (
     RepositoryEvidence,
     StoredReports,
+    actor_contributions,
+    actor_readiness,
     cached_repository_evidence,
+    cohort_summary,
     collected_repository_evidence,
     maintenance_windows,
     offline_open_pull_request_report,
@@ -1441,3 +1451,234 @@ def test_metric_drill_down_names_direct_commits_only_where_they_are_counted() ->
     assert isinstance(cycle.summary, DistributionObservation)
     assert cycle.summary.sample_size == 2
     assert cycle.direct_commits is None
+
+
+def authored_evidence(
+    repository: str,
+    pull_requests: Sequence[str] = (),
+    direct_commits: Sequence[str] = (),
+) -> RepositoryEvidence:
+    """Build one repository's cached facts from the logins that authored its merges.
+
+    The cohort is accounted the way `cohort_summary` accounts it — `merged` and `reported` over pull
+    requests, direct commits counted apart — so a fixture cannot teach a shape production never
+    produces.
+    """
+    starts_at = datetime(2026, 7, 1, tzinfo=UTC)
+    return RepositoryEvidence(
+        organization="hmcts",
+        repository=repository,
+        starts_at=starts_at,
+        ends_at=starts_at + timedelta(days=30),
+        provenance=WindowProvenance(offline=True, intervals_fetched=0),
+        cohort=CohortSummary(
+            merged=len(pull_requests),
+            reported=len(pull_requests),
+            excluded_authors={},
+            direct_commits=len(direct_commits),
+        ),
+        pull_requests=tuple(
+            PullRequestFact(
+                identifier=index + 1,
+                repository=repository,
+                number=index + 1,
+                created_at=starts_at,
+                merged_at=starts_at + timedelta(days=1),
+                draft=False,
+                author_login=login,
+                author_type="Bot" if login.casefold().endswith("[bot]") else "User",
+                reviews=(),
+            )
+            for index, login in enumerate(pull_requests)
+        ),
+        direct_commits=tuple(
+            direct_commit(f"{repository}-{index}", author_login=login) for index, login in enumerate(direct_commits)
+        ),
+    )
+
+
+def assessed_practices(
+    repository: str,
+    label: ReadinessLabel | None = ReadinessLabel.RED,
+    behaviour: tuple[PracticeFinding, ...] = (),
+) -> RepositoryPracticeEvidence:
+    """Build one repository's practice evidence carrying the given label and findings."""
+    starts_at = datetime(2026, 7, 1, tzinfo=UTC)
+    return RepositoryPracticeEvidence(
+        repository=repository,
+        starts_at=starts_at,
+        ends_at=starts_at + timedelta(days=30),
+        provenance=WindowProvenance(offline=True, intervals_fetched=0),
+        cohort=CohortSummary(merged=0, reported=0, excluded_authors={}),
+        assessment=None if label is None else ReadinessAssessment(label=label, blocking=(), caution=(), clear=()),
+        merge_gate=uncollected_gate(),
+        open_pull_requests=offline_open_pull_request_report(),
+        security=uncollected_security(),
+        codeowners=uncollected_codeowners(),
+        maintenance=uncollected_maintenance(),
+        sonar=uncollected_sonar(),
+        behaviour=behaviour,
+    )
+
+
+def blocking_finding(actor_login: str, occurrences: int, rule: str = "unreviewed-merge") -> PracticeFinding:
+    """Build one actor-level finding carrying the given number of occurrences."""
+    return PracticeFinding(
+        rule=rule,
+        severity=FindingSeverity.MEDIUM,
+        actor_login=actor_login,
+        occurrences=occurrences,
+        authored_merges=occurrences,
+        percentage=100.0,
+        message=f"{actor_login}: {occurrences} of {occurrences} merges had no independent human review (100%)",
+        occurrences_by_size={"unsized": occurrences},
+        pull_requests=(),
+    )
+
+
+def test_actor_contributions_counts_both_routes_onto_the_default_branch() -> None:
+    """Count a person's pull requests and direct pushes as the contributions they both are."""
+    evidence = authored_evidence("cath-service", pull_requests=("alice", "bob"), direct_commits=("alice",))
+
+    assert actor_contributions(evidence) == Counter({"alice": 2, "bob": 1})
+
+
+def test_actor_contributions_skip_unattributed_changes() -> None:
+    """Attribute nothing to a commit GitHub could match to no account, rather than to an empty login."""
+    evidence = authored_evidence("cath-service", pull_requests=("alice",))
+    unattributed = (direct_commit("ccc").model_copy(update={"author_login": None}),)
+
+    assert actor_contributions(evidence.model_copy(update={"direct_commits": unattributed})) == Counter({"alice": 1})
+
+
+def test_actor_readiness_orders_repositories_by_contributions_then_by_name() -> None:
+    """Lead with the repository a person works in most, and settle a tie by repository name."""
+    busiest = authored_evidence("project-x", pull_requests=("alice", "alice", "alice"))
+    tied = authored_evidence("project-u", pull_requests=("alice",))
+    also_tied = authored_evidence("project-b", pull_requests=("alice",))
+
+    actors = actor_readiness(
+        (
+            (tied, assessed_practices("project-u", ReadinessLabel.AMBER)),
+            (busiest, assessed_practices("project-x")),
+            (also_tied, assessed_practices("project-b", ReadinessLabel.GREEN)),
+        ),
+    )
+
+    assert len(actors) == 1
+    assert tuple((row.repository, row.contributions) for row in actors[0].repositories) == (
+        ("project-x", 3),
+        ("project-b", 1),
+        ("project-u", 1),
+    )
+    assert tuple(row.readiness for row in actors[0].repositories) == (
+        ReadinessLabel.RED,
+        ReadinessLabel.GREEN,
+        ReadinessLabel.AMBER,
+    )
+
+
+def test_actor_readiness_lists_actors_alphabetically() -> None:
+    """Order the section by login, so a reader can find a person without reading every line."""
+    evidence = authored_evidence("cath-service", pull_requests=("carol", "alice", "Bob"))
+
+    actors = actor_readiness(((evidence, assessed_practices("cath-service")),))
+
+    assert tuple(actor.actor_login for actor in actors) == ("alice", "Bob", "carol")
+
+
+def test_actor_readiness_merges_two_spellings_of_one_login() -> None:
+    """Treat `Alice` and `alice` as the one person GitHub says they are, spelled as the biggest repository spells it."""
+    busiest = authored_evidence("project-x", pull_requests=("Alice", "Alice"))
+    smaller = authored_evidence("project-z", pull_requests=("alice",))
+
+    actors = actor_readiness(
+        ((smaller, assessed_practices("project-z", ReadinessLabel.GREEN)), (busiest, assessed_practices("project-x"))),
+    )
+
+    assert len(actors) == 1
+    assert actors[0].actor_login == "Alice"
+    assert tuple((row.repository, row.contributions) for row in actors[0].repositories) == (
+        ("project-x", 2),
+        ("project-z", 1),
+    )
+
+
+def test_actor_readiness_carries_no_label_for_an_unassessed_repository() -> None:
+    """Leave the label out where the readiness policy graded nothing, rather than inventing one."""
+    evidence = authored_evidence("cath-service", pull_requests=("alice",))
+
+    actors = actor_readiness(((evidence, assessed_practices("cath-service", label=None)),))
+
+    assert actors[0].repositories[0].readiness is None
+
+
+def test_actor_readiness_reports_an_actor_present_in_one_repository_only() -> None:
+    """List each person against the repositories they contributed to and no others."""
+    first = authored_evidence("project-x", pull_requests=("alice", "bob"))
+    second = authored_evidence("project-z", direct_commits=("bob",))
+
+    actors = actor_readiness(
+        ((first, assessed_practices("project-x")), (second, assessed_practices("project-z", ReadinessLabel.GREEN))),
+    )
+
+    assert {actor.actor_login: [row.repository for row in actor.repositories] for actor in actors} == {
+        "alice": ["project-x"],
+        "bob": ["project-x", "project-z"],
+    }
+
+
+def test_actor_readiness_sums_blocking_occurrences_across_findings() -> None:
+    """Count occurrences rather than findings, so twelve unreviewed merges count as twelve."""
+    evidence = authored_evidence("cath-service", pull_requests=("Alice", "alice", "bob"))
+    practices = assessed_practices(
+        "cath-service",
+        behaviour=(
+            blocking_finding("alice", 4),
+            blocking_finding("Alice", 8, rule="undersized-review"),
+        ),
+    )
+
+    actors = actor_readiness(((evidence, practices),))
+
+    assert {actor.actor_login: actor.repositories[0].blocking for actor in actors} == {"Alice": 12, "bob": 0}
+
+
+def test_actor_readiness_counts_blocking_against_the_repository_that_reported_it() -> None:
+    """Keep one repository's findings out of another's row, so nobody is blamed where they blocked nothing."""
+    blocked = authored_evidence("project-x", pull_requests=("alice", "alice"))
+    clean = authored_evidence("project-z", pull_requests=("alice",))
+
+    actors = actor_readiness(
+        (
+            (blocked, assessed_practices("project-x", behaviour=(blocking_finding("alice", 12),))),
+            (clean, assessed_practices("project-z", ReadinessLabel.GREEN)),
+        ),
+    )
+
+    assert tuple((row.repository, row.blocking) for row in actors[0].repositories) == (
+        ("project-x", 12),
+        ("project-z", 0),
+    )
+
+
+def test_actor_readiness_leaves_out_a_bot_that_merged_into_the_cohort() -> None:
+    """Keep an agent's merges in the cohort while giving the agent no actor line to review."""
+    evidence = authored_evidence(
+        "cath-service",
+        pull_requests=("alice", "copilot-swe-agent[bot]"),
+        direct_commits=("release-bot[bot]",),
+    )
+    practices = assessed_practices("cath-service", behaviour=(blocking_finding("copilot-swe-agent[bot]", 3),))
+
+    actors = actor_readiness(((evidence, practices),))
+
+    assert tuple(actor.actor_login for actor in actors) == ("alice",)
+    # Measured rather than restated from the fixture: the merges the section leaves the bots out of
+    # are the same ones the cohort counts, because the two exclusions answer different questions.
+    assert cohort_summary(evidence, excluded=()) == CohortSummary(
+        merged=2,
+        reported=2,
+        excluded_authors={},
+        direct_commits=1,
+    )

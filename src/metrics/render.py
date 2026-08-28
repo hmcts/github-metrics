@@ -10,7 +10,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from metrics.assessment import ReadinessPolicy
 from metrics.domain import (
+    ActorReadiness,
+    ActorRepositoryReadiness,
     AlertObservation,
     AlertSeverity,
     BehaviourEvidenceCollection,
@@ -30,6 +33,7 @@ from metrics.domain import (
     RateObservation,
     ReadinessAssessment,
     ReadinessCondition,
+    ReadinessLabel,
     RepositoryPracticeEvidence,
     RepositoryTrend,
     SecurityAlertReport,
@@ -587,6 +591,101 @@ def render_index(report: PracticeEvidenceReport, teams: Mapping[str, str]) -> tu
     return *heading("Index"), *table(("Team", "Repository", "Readiness", "Gate observed"), rows)
 
 
+READINESS_ORDER = (*ReadinessPolicy.precedence, ReadinessLabel.GREEN)
+"""Every label worst first, extending the policy's own precedence with the green it falls back to.
+
+Read off the policy rather than written out a second time, so reordering severity there cannot leave
+the tie-break here sorting labels against the order they were assigned under."""
+
+
+@dataclass(frozen=True)
+class ReadinessGroup:
+    """Tally one readiness label across every repository of one actor's that carries it.
+
+    `contributions` is the total behind the group and is what orders it, because the label somebody
+    does most of their work under is the one worth leading with. The number itself is not printed:
+    the line abridges, and the JSON carries the per-repository counts it was summed from.
+    """
+
+    readiness: ReadinessLabel | None
+    repositories: tuple[str, ...]
+    contributions: int
+
+
+def readiness_severity(readiness: ReadinessLabel | None) -> int:
+    """Rank one label for the tie-break, sorting an unassessed repository after every label.
+
+    Last rather than first: a repository with no label is not the mildest finding on a line, it is
+    the absence of one, and ranking it among the labels would read as a grade between them.
+    """
+    return len(READINESS_ORDER) if readiness is None else READINESS_ORDER.index(readiness)
+
+
+def readiness_tally(repositories: Sequence[ActorRepositoryReadiness]) -> tuple[ReadinessGroup, ...]:
+    """Group one actor's repositories by label, tallying each label exactly once.
+
+    Grouped rather than listed in the order they arrive, because the same label twice on a line reads
+    as two separate findings about a person rather than one. Groups are ordered by the contributions
+    behind them and, where those tie, by severity, so neither a heavy green nor an ordering accident
+    can put a red anywhere but where its weight puts it. Repositories keep the contribution order
+    they arrive in, so the repository a group is mostly about names it first.
+    """
+    grouped: dict[ReadinessLabel | None, list[ActorRepositoryReadiness]] = {}
+    for row in repositories:
+        grouped.setdefault(row.readiness, []).append(row)
+    groups = (
+        ReadinessGroup(
+            readiness=readiness,
+            repositories=tuple(row.repository for row in rows),
+            contributions=sum(row.contributions for row in rows),
+        )
+        for readiness, rows in grouped.items()
+    )
+    return tuple(sorted(groups, key=lambda group: (-group.contributions, readiness_severity(group.readiness))))
+
+
+def actor_readiness_label(readiness: ReadinessLabel | None) -> str:
+    """Render one tallied label, naming an unassessed repository rather than leaving a gap.
+
+    Upper case throughout, where `index_readiness` keeps "not assessed" lower to separate it from the
+    labels in its column: here the labels are the whole of the line, and one lower-case entry among
+    them would read as a comment on the line rather than an entry in it.
+    """
+    return "NOT ASSESSED" if readiness is None else readiness.value.upper()
+
+
+def render_readiness_group(group: ReadinessGroup, *, named: bool) -> str:
+    """Render one tallied label, with a count where it covers several repositories."""
+    count = len(group.repositories)
+    label = actor_readiness_label(group.readiness)
+    tally = label if count == 1 else f"{label} x {count}"
+    return f"{tally} ({', '.join(group.repositories)})" if named else tally
+
+
+def actor_line(actor: ActorReadiness) -> str:
+    """Render one person's labels, weightiest first, naming repositories only where they differ.
+
+    An actor whose repositories all carry one label renders `RED x 6` alone: the names would be that
+    person's whole list of repositories printed for no distinction. Where the labels differ the names
+    are the point, because which of them is the red one is the next thing asked.
+    """
+    groups = readiness_tally(actor.repositories)
+    return ", ".join(render_readiness_group(group, named=len(groups) > 1) for group in groups)
+
+
+def render_actors(actors: Sequence[ActorReadiness]) -> tuple[str, ...]:
+    """Render one abridged line per person, saying so where the report covers nobody.
+
+    NOT A ROLL-UP, exactly as `render_index` is not: a person contributing to a red repository and a
+    green one has no single readiness, so the line lists both labels and combines them nowhere. There
+    is no per-person verdict, no worst-label summary and no count of people — see architecture.md,
+    "Scope boundaries".
+    """
+    if not actors:
+        return *heading("Actors"), "  none: no person authored a merge in the reported repositories"
+    return *heading("Actors"), *pairs(tuple((actor.actor_login, actor_line(actor)) for actor in actors))
+
+
 def render_repository(
     organization: str,
     evidence: RepositoryPracticeEvidence,
@@ -636,6 +735,7 @@ def render_practice_report(
                 for line in render_repository(report.organization, evidence, drill_downs[evidence.repository])
             ),
             *render_unavailable(report.unavailable),
+            *render_actors(report.actors),
         ),
     )
 

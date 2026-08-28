@@ -1191,12 +1191,56 @@ class EvidenceUnavailable(EvidenceModel):
     detail: str
 
 
+class ActorRepositoryReadiness(EvidenceModel):
+    """State how much one person contributed to one repository, and how that repository is labelled.
+
+    `readiness` is the repository's assessed label, and is absent when the readiness policy is
+    disabled — there is then no label to carry, and inventing one would grade a repository the
+    report deliberately left ungraded.
+
+    `contributions` counts the merges that person authored in the window, by either route, after the
+    cohort's author exclusions. `blocking` counts the occurrences behind their practice findings in
+    that repository, so twelve unreviewed merges count as twelve rather than as one finding. Neither
+    number judges the person: `blocking` is what a rule already reported, gathered per repository.
+    """
+
+    readiness: ReadinessLabel | None = None
+    repository: str
+    contributions: PositiveInt
+    blocking: NonNegativeInt
+
+
+class ActorReadiness(EvidenceModel):
+    """List the readiness of every repository one person contributed to, weightiest first.
+
+    The section exists to answer "what is this person working in", which is why `repositories` is
+    ordered by contributions descending — ties broken by repository name — rather than by label. It
+    LISTS labels and never combines them: a person contributing to a red repository and a green one
+    has no single readiness, and averaging the two would invent a per-person verdict this tool does
+    not make.
+
+    `actor_login` is spelled as the repository the person contributed most to spells it. Logins are
+    matched case-insensitively, because a GitHub login is unique case-insensitively, so `Alice` and
+    `alice` are one actor rather than two.
+    """
+
+    actor_login: str
+    repositories: tuple[ActorRepositoryReadiness, ...]
+
+
 class PracticeEvidenceReport(EvidenceModel):
-    """Contain practice findings for the selected configured repositories."""
+    """Contain practice findings for the selected configured repositories.
+
+    `actors` re-reads the same reported repositories person by person: the repository blocks answer
+    how each repository is doing, and one reviewer's next question is which repositories a given
+    person works in. Bot accounts carry no actor entry even though their merges stay in every
+    repository's cohort — the section is for reviewing people.
+    """
 
     organization: str
     repositories: tuple[RepositoryPracticeEvidence, ...]
     unavailable: tuple[EvidenceUnavailable, ...]
+    actors: tuple[ActorReadiness, ...]
 
 
 class BehaviourEvidenceCollection(EvidenceModel):

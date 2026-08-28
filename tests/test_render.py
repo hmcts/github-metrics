@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from metrics.domain import (
+    ActorReadiness,
+    ActorRepositoryReadiness,
     AlertFamily,
     AlertObservation,
     AlertSeverity,
@@ -350,12 +352,14 @@ def teams() -> dict[str, str]:
 def practice_report(
     evidence: RepositoryPracticeEvidence | None = None,
     unavailable: tuple[EvidenceUnavailable, ...] = (),
+    actors: tuple[ActorReadiness, ...] = (),
 ) -> PracticeEvidenceReport:
     """Build the default practice report for one repository."""
     return PracticeEvidenceReport(
         organization="hmcts",
         repositories=(practice_evidence() if evidence is None else evidence,),
         unavailable=unavailable,
+        actors=actors,
     )
 
 
@@ -984,7 +988,12 @@ def population_report(
 ) -> str:
     """Render a practice report covering several repositories at once."""
     return render_practice_report(
-        PracticeEvidenceReport(organization="hmcts", repositories=repositories, unavailable=unavailable),
+        PracticeEvidenceReport(
+            organization="hmcts",
+            repositories=repositories,
+            unavailable=unavailable,
+            actors=(),
+        ),
         population_drill_downs(),
         population_teams(),
     )
@@ -1104,6 +1113,141 @@ def test_the_index_combines_nothing_and_counts_nothing() -> None:
         ["opal", "opal-common-lib", "AMBER", "yes"],
         ["opal", "opal-logging-service", "AMBER", "yes"],
     ]
+
+
+def actor_repository(
+    repository: str,
+    contributions: int,
+    readiness: ReadinessLabel | None = ReadinessLabel.RED,
+) -> ActorRepositoryReadiness:
+    """Build one line of an actor's readiness list, defaulting the label the section leads with."""
+    return ActorRepositoryReadiness(
+        readiness=readiness,
+        repository=repository,
+        contributions=contributions,
+        blocking=0,
+    )
+
+
+def actor(login: str, *repositories: ActorRepositoryReadiness) -> ActorReadiness:
+    """Build one person's readiness list, in the contribution order the aggregation emits it in."""
+    return ActorReadiness(actor_login=login, repositories=repositories)
+
+
+def actor_lines(rendered: str) -> list[str]:
+    """Return the actor block's lines, its heading excluded.
+
+    Read to the end of the document rather than to the next blank line: the block is rendered last,
+    so a line escaping past it would otherwise go unread by every assertion here.
+    """
+    lines = rendered.splitlines()
+    return lines[lines.index("Actors") + 2 :]
+
+
+def actors_report(*actors: ActorReadiness) -> str:
+    """Render the practice report carrying the given actor section."""
+    return render_practice_report(practice_report(actors=actors), {"cath-service": drill_down()}, teams())
+
+
+def test_an_actor_whose_repositories_share_one_label_is_not_told_which_they_are() -> None:
+    """Abridge a uniform actor to the tally: six names would draw no distinction between them."""
+    rendered = actors_report(
+        actor("bob", *(actor_repository(f"opal-service-{index}", 10 - index) for index in range(6))),
+    )
+
+    assert actor_lines(rendered) == ["  bob  RED x 6"]
+
+
+def test_one_label_is_tallied_once_however_the_repositories_carrying_it_are_spread() -> None:
+    """Group a label wherever it sits in the list, so no line reports the same label twice."""
+    rendered = actors_report(
+        actor(
+            "alice",
+            actor_repository("project-x", 41),
+            actor_repository("project-z", 30, ReadinessLabel.GREEN),
+            actor_repository("project-u", 20),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  alice  RED x 2 (project-x, project-u), GREEN (project-z)"]
+
+
+def test_groups_are_ordered_by_the_contributions_behind_them_not_by_first_appearance() -> None:
+    """Lead with the label a person does most of their work under, wherever it first appears."""
+    rendered = actors_report(
+        actor(
+            "alice",
+            actor_repository("project-a", 10, ReadinessLabel.GREEN),
+            actor_repository("project-b", 6),
+            actor_repository("project-c", 5),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  alice  RED x 2 (project-b, project-c), GREEN (project-a)"]
+
+
+def test_two_groups_of_equal_weight_are_ordered_worst_label_first() -> None:
+    """Break a tie by the policy's own severity, so equal weight can never bury a red behind a green."""
+    rendered = actors_report(
+        actor(
+            "alice",
+            actor_repository("project-a", 5, ReadinessLabel.GREEN),
+            actor_repository("project-b", 5, ReadinessLabel.CANNOT_ASSESS),
+            actor_repository("project-c", 5),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  alice  RED (project-c), CANNOT_ASSESS (project-b), GREEN (project-a)"]
+
+
+def test_an_actor_in_one_repository_renders_the_bare_label() -> None:
+    """Print neither a count of one nor a name that distinguishes nothing."""
+    rendered = actors_report(actor("carol", actor_repository("cath-service", 4, ReadinessLabel.AMBER)))
+
+    assert actor_lines(rendered) == ["  carol  AMBER"]
+
+
+def test_a_repository_that_was_never_assessed_is_named_rather_than_left_blank() -> None:
+    """Say a repository carries no label, so an unjudged one is never read as a mild one."""
+    rendered = actors_report(
+        actor(
+            "carol",
+            actor_repository("cath-service", 9, None),
+            actor_repository("other-service", 2, ReadinessLabel.AMBER),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  carol  NOT ASSESSED (cath-service), AMBER (other-service)"]
+
+
+def test_an_unassessed_group_sorts_behind_the_label_it_ties_with() -> None:
+    """Rank the absence of a label last on a tie, rather than among the labels as a grade between them."""
+    rendered = actors_report(
+        actor(
+            "carol",
+            actor_repository("cath-service", 5, None),
+            actor_repository("other-service", 5, ReadinessLabel.GREEN),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  carol  GREEN (other-service), NOT ASSESSED (cath-service)"]
+
+
+def test_actors_are_rendered_one_line_each_in_the_order_the_report_lists_them() -> None:
+    """Keep the section's order the JSON's order, so the two renderings cannot disagree."""
+    rendered = actors_report(
+        actor("alice", actor_repository("project-x", 41)),
+        actor("bob", actor_repository("project-x", 6, ReadinessLabel.AMBER)),
+    )
+
+    assert actor_lines(rendered) == ["  alice  RED", "  bob    AMBER"]
+
+
+def test_a_report_with_no_actors_says_so_rather_than_dropping_the_section() -> None:
+    """Distinguish a report nobody contributed to from one whose section was never rendered."""
+    rendered = actors_report()
+
+    assert actor_lines(rendered) == ["  none: no person authored a merge in the reported repositories"]
 
 
 REVIEW_COVERAGE = "independent-review-coverage"
