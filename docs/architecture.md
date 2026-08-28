@@ -250,9 +250,9 @@ Three commands with disjoint responsibilities.
   non-zero. A silently short window is more dangerous than no answer.
 - **`map-sonar` builds the durable `sonar → github` map. It collects no evidence and reports none.**
   The third command that writes to the observations file, and the only one run BY HAND, periodically:
-  it is paced against GitHub's 30-per-minute commit search, so a full rebuild of the organisation's
-  289 projects is tens of minutes. Takes no window flags — the map is not about a period. See
-  "SonarCloud quality evidence".
+  it is paced against whatever commit-search allowance GitHub's `x-ratelimit-*` headers report for
+  the token in use, so a full rebuild of the organisation's 289 projects is tens of minutes. Takes no
+  window flags — the map is not about a period. See "SonarCloud quality evidence".
 
 (`doctor`, `prune` and `trend` take no part in the collect/report split: the first two touch no
 evidence, and the third reports through `evidence`'s own code.)
@@ -543,7 +543,11 @@ So a name rule is not a rung, and adding one back is a fresh ruling that belongs
 
 **THE MAP LIVES IN THE DURABLE OBSERVATIONS FILE, NOT THE CACHE.** Rebuilding it costs one paced
 GitHub commit search per project across 289 projects, against a documented limit of 10 requests a
-minute unauthenticated and 30 authenticated — ten to thirty minutes of calls. The cache is
+minute unauthenticated and 30 authenticated — ten to thirty minutes of calls. THE DOCUMENTED NUMBER
+IS NOT ALWAYS THE ISSUED ONE: a run on 2026-08-27 was given ten a minute while holding a token, so
+the pacing is taken from the `x-ratelimit-*` headers of the previous response rather than from the
+documented figure, and the documented one survives only as the interval used before the first
+response has been seen. The cache is
 DISPOSABLE by ruling ("Cache design"), and `rm metrics.sqlite3` must not silently shrink the next
 evidence run's coverage to whichever repositories happen to declare a properties file. This stretches
 the observations file past its original name — it now holds an alert history that cannot be refetched

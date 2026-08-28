@@ -21,8 +21,9 @@ from metrics.domain import (
     SonarResolution,
     StoredSonarMapping,
 )
-from metrics.github import GitHubClient, GitHubError
+from metrics.github import GitHubClient, GitHubError, RateLimitBudget
 from metrics.sonar import (
+    SEARCH_BUDGET_RESOURCE,
     SEARCH_INTERVAL_SECONDS,
     SONAR_METRIC_KEYS,
     CallPacer,
@@ -37,6 +38,7 @@ from metrics.sonar import (
     declared_project,
     github_to_sonar,
     parse_properties,
+    search_pacer,
     searchable_revisions,
     sonar_to_github,
 )
@@ -536,6 +538,75 @@ def test_call_pacer_does_not_stall_on_a_clock_that_went_backwards() -> None:
     pacer.wait()
 
     assert [call.args for call in pause.call_args_list] == [(SEARCH_INTERVAL_SECONDS,)]
+
+
+def budgeted(limit: int, remaining: int, resets_in: float) -> tuple[CallPacer, MagicMock]:
+    """Build a pacer over one fixed budget and a clock that never advances."""
+    pause = MagicMock()
+    budget = RateLimitBudget(limit=limit, remaining=remaining, used=limit - remaining, resets_at=1000.0 + resets_in)
+    return CallPacer(SEARCH_INTERVAL_SECONDS, clock=lambda: 1000.0, pause=pause, budget=lambda: budget), pause
+
+
+def test_call_pacer_spreads_the_allowance_github_actually_issued_over_the_window_that_is_left() -> None:
+    """Pace off the headers, not off the documented limit, so a smaller allowance is not sprinted through.
+
+    THE BUG THIS EXISTS FOR. `SEARCH_CALLS_PER_MINUTE` says 30 and the token that ran `map-sonar` on
+    2026-08-27 was issued TEN a minute: the fixed two-second interval spent the whole allowance in
+    twenty seconds, took a 403, and slept off the rest of the window — 37 times in one run. Ten calls
+    left over sixty seconds is a six-second gap, which arrives at the reset having spent the
+    allowance exactly and never meets the limit at all.
+    """
+    pacer, pause = budgeted(limit=10, remaining=10, resets_in=60.0)
+    pacer.wait()
+    pacer.wait()
+
+    pause.assert_called_once_with(6.0)
+
+
+def test_call_pacer_never_goes_faster_than_its_floor_however_large_the_allowance_is() -> None:
+    """Keep the configured interval as the fastest this will ever go, whatever the headers permit."""
+    pacer, pause = budgeted(limit=5000, remaining=5000, resets_in=60.0)
+    pacer.wait()
+    pacer.wait()
+
+    pause.assert_called_once_with(SEARCH_INTERVAL_SECONDS)
+
+
+def test_call_pacer_waits_out_a_window_it_has_nothing_left_in() -> None:
+    """Wait for the refill rather than issue a call that is certain to be refused.
+
+    Issuing it costs the same wait AND a retry attempt, which a genuine failure then has none of.
+    """
+    pacer, pause = budgeted(limit=10, remaining=0, resets_in=45.0)
+    pacer.wait()
+    pacer.wait()
+
+    pause.assert_called_once_with(45.0)
+
+
+def test_call_pacer_falls_back_to_the_interval_when_the_recorded_window_has_already_closed() -> None:
+    """Read a stale budget as "nothing known", never as "nothing left".
+
+    GitHub refills at the reset instant and the client's record is only updated by a response, so a
+    budget whose window has passed says nothing about the new one — treating its spent remaining
+    count as current would park the run for a window that has already refilled.
+    """
+    pacer, pause = budgeted(limit=10, remaining=0, resets_in=-30.0)
+    pacer.wait()
+    pacer.wait()
+
+    pause.assert_called_once_with(SEARCH_INTERVAL_SECONDS)
+
+
+def test_search_pacer_reads_the_budget_github_records_under_its_own_resource_name() -> None:
+    """Wire the pacer to `search`, which is what GitHub calls the quota `commit-search` spends."""
+    client = MagicMock()
+    client.budget.return_value = RateLimitBudget(limit=10, remaining=5, used=5, resets_at=2000.0)
+    pacer = search_pacer(client)
+
+    assert pacer.budget is not None
+    assert pacer.budget() == client.budget.return_value
+    client.budget.assert_called_once_with(SEARCH_BUDGET_RESOURCE)
 
 
 def test_searchable_revisions_keeps_one_entry_per_distinct_revision() -> None:

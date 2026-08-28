@@ -51,14 +51,13 @@ from metrics.inventory import SonarSource, collect_inventory
 from metrics.render import RepositoryDrillDown, render_report, render_trend_report
 from metrics.rules import configured_rules
 from metrics.sonar import (
-    SEARCH_INTERVAL_SECONDS,
-    CallPacer,
     SonarClient,
     SonarError,
     SonarMappingOutcome,
     SonarProject,
     SonarResolutionAttempt,
     StoredProjectMap,
+    search_pacer,
     sonar_to_github,
 )
 from metrics.storage import (
@@ -620,7 +619,7 @@ def resolve_listed_projects(
     applies to every project still to come exactly as it applied to this one, so continuing would
     write this run's exhaustion into the map as each remaining project's own dead end.
     """
-    pacer = CallPacer(SEARCH_INTERVAL_SECONDS)
+    pacer = search_pacer(github)
     progress = MappingProgress(listed=len(projects))
     for position, project in enumerate(projects, start=1):
         stored = load_sonar_mapping(database, sonar_organization, project.key)

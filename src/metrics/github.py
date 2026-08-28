@@ -71,7 +71,7 @@ class GitHubClient:
         session: Session,
         pause: Callable[[float], None] = sleep,
         clock: Callable[[], float] = time,
-        rate_limit_reserve: int = 100,
+        rate_limit_reserve: int = 0,
     ) -> None:
         session.headers.update(
             {
@@ -83,6 +83,9 @@ class GitHubClient:
         self.session = session
         self.pause = pause
         self.clock = clock
+        # ZERO BY DEFAULT: a budget with calls left in it is not exhausted, and stopping short of it
+        # buys nothing. See `wait_for_rate_limit`. A caller sharing one token with something else can
+        # still hold quota back by asking for it.
         self.rate_limit_reserve = max(rate_limit_reserve, 0)
         self.rate_limits: dict[str, RateLimitBudget] = {}
         self.maximum_attempts = 3
@@ -226,20 +229,41 @@ class GitHubClient:
             if delay is not None:
                 # The status code is logged because the two causes need telling apart: a 5xx backoff
                 # is 1s then 2s, while a real rate limit waits for retry-after or the reset instant.
+                # GitHub's own message goes with it, because a 403 alone does not say WHICH limit was
+                # hit — a primary quota names the resource and clears at its reset, a secondary limit
+                # names no resource and clears when it feels like it, and the fix differs.
                 logging.warning(
-                    "GitHub returned HTTP %s for %s (attempt %s of %s), retrying in %.0fs",
+                    "GitHub returned HTTP %s for %s (attempt %s of %s), retrying in %.0fs: %s [%s %s/%s, resets in %.0fs]",
                     response.status_code,
                     resource,
                     attempt,
                     self.maximum_attempts,
                     delay,
+                    self.failure_message(response),
+                    response.headers.get("x-ratelimit-resource", "unknown resource"),
+                    response.headers.get("x-ratelimit-remaining", "?"),
+                    response.headers.get("x-ratelimit-limit", "?"),
+                    max((self.header_number(response, "x-ratelimit-reset") or self.clock()) - self.clock(), 0),
                 )
                 self.pause(delay)
                 continue
             return self.validate(response)
 
     def wait_for_rate_limit(self, resource: str) -> None:
-        """Preserve the configured reserve for one known GitHub resource.
+        """Wait out a window this client has nothing left in, before spending a call proving it.
+
+        A BUDGET WITH CALLS LEFT IN IT IS NOT EXHAUSTED, and this used to stop at one that had. The
+        reserve defaulted to 100 and was ABSOLUTE, so `graphql` parked for the rest of its hour with
+        75 of 5000 still in hand — 100 unspent calls and a log line calling a 98%-spent quota
+        "exhausted", which reads as a bug in the reporting rather than a policy nobody asked for.
+        Holding quota back is only meaningful when something ELSE shares the token, and nothing here
+        does, so the default is now zero and the reserve is opt-in.
+
+        WAITING AT ALL IS STILL WORTH IT at genuine zero: the alternative is issuing a call certain to
+        be refused, then sleeping out the same window anyway with one of three retry attempts already
+        spent. What it must never do is decide the window is spent when it is not — GraphQL charges
+        POINTS rather than calls, so `remaining` falls in steps of whatever the last query cost, and
+        a threshold above zero throws away everything between it and zero.
 
         The wait is announced at WARNING rather than DEBUG because it is the one place a collection
         stops for minutes at a time without issuing a request: a silent pause here is indistinguishable
@@ -250,7 +274,7 @@ class GitHubClient:
             return
         delay = max(budget.resets_at - self.clock(), 0)
         logging.warning(
-            "GitHub %s budget exhausted (%s of %s left, reserve %s), waiting %.0fs for the limit to reset",
+            "GitHub %s quota spent (%s of %s left, reserve %s), waiting %.0fs for the window to reset",
             resource,
             budget.remaining,
             budget.limit,
@@ -276,6 +300,18 @@ class GitHubClient:
             return
         logging.debug("GitHub budget %s %s/%s remaining", resource, budget.remaining, budget.limit)
         self.rate_limits[resource] = budget
+
+    def budget(self, resource: str) -> RateLimitBudget | None:
+        """Return the budget GitHub last reported for one of ITS OWN resource names, or None.
+
+        Keyed by what the `x-ratelimit-resource` header says, which is not always the name a caller
+        waits under: the commit search is issued as `commit-search` precisely so that
+        `wait_for_rate_limit` leaves it alone, and GitHub reports it as `search`. A caller that paces
+        a scarce quota by hand reads the real budget through here rather than assuming a limit — the
+        assumed 30-a-minute search limit is 10 a minute for some tokens, and a run pacing to the
+        wrong one spends a minute in a 403 backoff for every ten searches it issues.
+        """
+        return self.rate_limits.get(resource)
 
     def send(self, url: str, parameters: dict[str, str | int] | None) -> Response:
         """Send one HTTP request."""
@@ -366,16 +402,62 @@ class GitHubClient:
         return None
 
     def rate_limit_delay(self, response: Response) -> float | None:
-        """Return GitHub's required delay for a rate-limited response."""
+        """Return GitHub's required delay for a rate-limited response, or None if it is not one.
+
+        A 403 is GitHub's answer both to a spent quota and to a refusal, and the two must never be
+        confused: retrying a refusal spends a minute learning nothing, and reporting a spent quota as
+        a refusal records "nobody may look" as a fact about the repository. Only the three signals
+        GitHub documents are read as a rate limit — `retry-after`, an exhausted `x-ratelimit-remaining`,
+        or a body that says so — and a 403 carrying none of them falls through to `validate`, which
+        classifies it as PERMISSION_DENIED without pausing.
+
+        Both header reads are guarded. `retry-after` is allowed to be an HTTP-date by the HTTP spec
+        (GitHub sends seconds, but a proxy in the path need not), and `x-ratelimit-reset` can be
+        absent on the very response whose `x-ratelimit-remaining` is `0`. Either would have raised
+        out of the retry path as an unclassified crash instead of a graded refusal.
+        """
         if response.status_code not in {HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS}:
             return None
-        if "retry-after" in response.headers:
-            return float(response.headers["retry-after"])
-        if response.headers.get("x-ratelimit-remaining") == "0":
-            return max(float(response.headers["x-ratelimit-reset"]) - self.clock(), 0)
+        seconds = self.header_number(response, "retry-after")
+        if seconds is not None:
+            return max(seconds, 0)
+        resets_at = self.header_number(response, "x-ratelimit-reset")
+        if response.headers.get("x-ratelimit-remaining") == "0" and resets_at is not None:
+            return max(resets_at - self.clock(), 0)
         if response.status_code == HTTPStatus.TOO_MANY_REQUESTS or "rate limit" in response.text.lower():
             return 60
         return None
+
+    @staticmethod
+    def header_number(response: Response, name: str) -> float | None:
+        """Read one numeric response header, or None when it is absent or not a number."""
+        value = response.headers.get(name)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def failure_message(response: Response) -> str:
+        """Return GitHub's own `message` for a failed response, for the log and nothing else.
+
+        THE ONE PIECE OF A BODY THIS CLIENT WILL COPY OUT. Everything else is withheld deliberately —
+        a secret-scanning alert record carries the detected credential itself — but a 403 is
+        undiagnosable without it: "API rate limit exceeded for user 123", "You have exceeded a
+        secondary rate limit", "Resource not accessible by personal access token" and an IP-allow-list
+        refusal are four different problems with four different fixes, and all four look identical in
+        a log that records only the status. It stays out of `GitHubError`, whose message becomes one
+        repository's `detail` in a report meant to be shared.
+        """
+        try:
+            payload: object = response.json()
+        except JSONDecodeError:
+            return "no message"
+        if not isinstance(payload, dict):
+            return "no message"
+        return str(payload.get("message", "no message"))
 
     def validate(self, response: Response) -> Response:
         """Classify terminal GitHub HTTP responses."""
@@ -385,6 +467,15 @@ class GitHubClient:
             message, reason = self.http_failures.get(
                 response.status_code,
                 (f"GitHub returned HTTP {response.status_code}", AvailabilityReason.COLLECTION_FAILED),
+            )
+            # Logged, not carried: `message` becomes a repository's `detail` in a shared report and
+            # stays the fixed string the suite pins, while the log gets GitHub's own reason so a
+            # refused token can be told from a missing repository without re-running the collection.
+            logging.warning(
+                "GitHub refused %s %s: %s",
+                response.status_code,
+                response.url,
+                self.failure_message(response),
             )
             raise GitHubError(message, reason, response.status_code) from exception
         return response

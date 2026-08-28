@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from requests import ConnectionError as RequestsConnectionError
-from requests import Response, Session
+from requests import HTTPError, Response, Session
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
 from metrics.domain import AvailabilityReason
@@ -165,6 +165,115 @@ def test_get_uses_secondary_rate_limit_default() -> None:
         assert client.get("https://api.github.com/example") is success
 
     pause.assert_called_once_with(60)
+
+
+def test_get_never_retries_a_403_that_is_a_refusal_rather_than_a_rate_limit() -> None:
+    """Refuse a permission denial immediately: a 403 carrying no rate-limit signal is not one.
+
+    GitHub answers both a spent quota and "you may not read this" with 403, and the commit search
+    meets both. Waiting a minute for a refusal to change its mind buys nothing and is indistinguishable
+    from a hang in a log, so only `retry-after`, an exhausted remaining count, or a body that says
+    "rate limit" may cost a pause.
+    """
+    session = Session()
+    refused = MagicMock(
+        status_code=403,
+        headers={"x-ratelimit-remaining": "27", "x-ratelimit-limit": "30", "x-ratelimit-resource": "search"},
+        text='{"message":"Resource not accessible by personal access token"}',
+    )
+    refused.raise_for_status.side_effect = HTTPError(response=refused)
+    refused.json.return_value = {"message": "Resource not accessible by personal access token"}
+    pause = MagicMock()
+    client = GitHubClient("secret", session, pause=pause)
+    with (
+        patch.object(session, "get", return_value=refused) as get,
+        pytest.raises(GitHubError, match="GitHub permission denied") as captured,
+    ):
+        client.get("https://api.github.com/search/commits")
+
+    assert captured.value.reason is AvailabilityReason.PERMISSION_DENIED
+    assert get.call_count == 1
+    pause.assert_not_called()
+
+
+def test_get_logs_githubs_own_message_for_a_refusal_without_carrying_it_into_the_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Diagnose a 403 from the log, while the exception keeps the fixed shareable message.
+
+    "API rate limit exceeded", "secondary rate limit", "not accessible by personal access token" and
+    an IP-allow-list refusal are four different problems with four different fixes, and every one of
+    them is HTTP 403. The exception message becomes a repository's `detail` in a report meant to be
+    shared, so GitHub's text goes to the log instead of into it.
+    """
+    session = Session()
+    refused = MagicMock(status_code=403, headers={}, text="", url="https://api.github.com/search/commits")
+    refused.raise_for_status.side_effect = HTTPError(response=refused)
+    refused.json.return_value = {"message": "Although you appear to have the correct authorization credentials"}
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        caplog.at_level(logging.WARNING),
+        patch.object(session, "get", return_value=refused),
+        pytest.raises(GitHubError) as captured,
+    ):
+        client.get("https://api.github.com/search/commits")
+
+    assert "Although you appear to have the correct authorization credentials" in caplog.text
+    assert "Although you appear" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"},
+        {"x-ratelimit-remaining": "0"},
+    ],
+)
+def test_get_survives_rate_limit_headers_it_cannot_read_as_numbers(headers: dict[str, str]) -> None:
+    """Grade a 403 whose delay headers are unusable, rather than crashing out of the retry path.
+
+    `retry-after` is allowed to be an HTTP-date, and `x-ratelimit-reset` can be missing from the very
+    response whose remaining count is `0`. Both used to raise out of `rate_limit_delay` as a
+    ValueError or KeyError — an unclassified crash in place of a graded refusal.
+    """
+    session = Session()
+    refused = MagicMock(status_code=403, headers=headers, text="")
+    refused.raise_for_status.side_effect = HTTPError(response=refused)
+    refused.json.return_value = {"message": "Resource not accessible"}
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        patch.object(session, "get", return_value=refused),
+        pytest.raises(GitHubError) as captured,
+    ):
+        client.get("https://api.github.com/example")
+
+    assert captured.value.reason is AvailabilityReason.PERMISSION_DENIED
+
+
+def test_the_client_reports_the_budget_github_named_so_a_scarce_quota_can_be_paced() -> None:
+    """Expose the recorded budget under GitHub's OWN resource name, which need not be the caller's.
+
+    The commit search is issued under `commit-search` so that `wait_for_rate_limit` — whose reserve
+    of 100 is tuned to a 5,000-an-hour quota — leaves a 30-a-minute one alone. GitHub reports it as
+    `search`, and the hand pacer needs the real numbers to pace off.
+    """
+    session = Session()
+    response = MagicMock(
+        status_code=200,
+        headers={
+            "x-ratelimit-resource": "search",
+            "x-ratelimit-limit": "10",
+            "x-ratelimit-remaining": "7",
+            "x-ratelimit-used": "3",
+            "x-ratelimit-reset": "160",
+        },
+    )
+    client = GitHubClient("secret", session, pause=MagicMock(), clock=lambda: 100)
+    with patch.object(session, "get", return_value=response):
+        client.get("https://api.github.com/search/commits", resource="commit-search")
+
+    assert client.budget("search") == RateLimitBudget(limit=10, remaining=7, used=3, resets_at=160.0)
+    assert client.budget("commit-search") is None
 
 
 def test_get_stops_retrying_rate_limit() -> None:
@@ -409,7 +518,7 @@ def test_graphql_stops_retrying_rate_limit() -> None:
 
 
 def test_client_preserves_resource_specific_rate_limit_reserve() -> None:
-    """Wait for a low REST budget without delaying a separate GraphQL resource."""
+    """Wait for a spent REST budget without delaying a separate GraphQL resource."""
     session = Session()
     rest = MagicMock(status_code=200)
     rest.headers = {
@@ -422,7 +531,7 @@ def test_client_preserves_resource_specific_rate_limit_reserve() -> None:
     graphql = MagicMock(status_code=200, headers={})
     graphql.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100, rate_limit_reserve=100)
     with (
         patch.object(session, "get", return_value=rest),
         patch.object(session, "post", return_value=graphql),
@@ -435,6 +544,52 @@ def test_client_preserves_resource_specific_rate_limit_reserve() -> None:
         "core": RateLimitBudget(limit=5000, remaining=100, used=4900, resets_at=112),
     }
     pause.assert_called_once_with(12)
+
+
+def test_the_client_spends_a_budget_to_its_last_call_rather_than_stopping_at_a_reserve() -> None:
+    """Never park a window that still has calls in it — the default reserve is zero.
+
+    THE BUG THIS EXISTS FOR. The reserve defaulted to an ABSOLUTE 100, so a `graphql` budget of
+    5,000 stopped the run with 75 still in hand and slept out the rest of the hour: 100 calls thrown
+    away, and a log line calling a 98%-spent quota "exhausted". Holding quota back means something
+    only when another consumer shares the token, so it is now asked for rather than assumed.
+    """
+    session = Session()
+    low = MagicMock(status_code=200)
+    low.headers = {
+        "x-ratelimit-resource": "core",
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": "75",
+        "x-ratelimit-used": "4925",
+        "x-ratelimit-reset": "585",
+    }
+    pause = MagicMock()
+    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    with patch.object(session, "get", return_value=low):
+        client.get("https://api.github.com/example")
+        client.get("https://api.github.com/example")
+
+    pause.assert_not_called()
+
+
+def test_the_client_waits_only_once_the_window_has_genuinely_nothing_left() -> None:
+    """Wait at zero, where the next call is certain to be refused and would cost a retry to prove it."""
+    session = Session()
+    spent = MagicMock(status_code=200)
+    spent.headers = {
+        "x-ratelimit-resource": "core",
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-used": "5000",
+        "x-ratelimit-reset": "585",
+    }
+    pause = MagicMock()
+    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    with patch.object(session, "get", return_value=spent):
+        client.get("https://api.github.com/example")
+        client.get("https://api.github.com/example")
+
+    pause.assert_called_once_with(485)
 
 
 @pytest.mark.parametrize(

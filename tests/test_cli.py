@@ -596,7 +596,7 @@ def map_sonar_run(configuration_path: Path, respond: Callable[..., MagicMock]) -
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         # The commit-search pacing is asserted in tests/test_sonar.py; a real pacer here would make
         # every one of these tests wait two seconds per search for nothing.
-        patch("metrics.cli.CallPacer"),
+        patch("metrics.cli.search_pacer"),
         patch("metrics.cli.Session") as session_class,
     ):
         session = session_class.return_value.__enter__.return_value

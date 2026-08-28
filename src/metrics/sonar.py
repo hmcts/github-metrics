@@ -48,7 +48,7 @@ from metrics.domain import (
     SonarResolution,
     StoredSonarMapping,
 )
-from metrics.github import GitHubClient, GitHubError
+from metrics.github import GitHubClient, GitHubError, RateLimitBudget
 from metrics.storage import load_sonar_mapping, repository_project
 
 SONAR_URL = "https://sonarcloud.io"
@@ -60,10 +60,16 @@ MAXIMUM_PAGE_SIZE = 500
 # scanner documentation names first.
 TOKEN_VARIABLES = ("SONAR_TOKEN", "SONARCLOUD_TOKEN")
 
-# GitHub's documented commit-search limit for an authenticated caller, measured against the live API
-# on 2026-08-27: 30 requests a minute, against 10 unauthenticated. Every other quota this project
-# spends is counted in thousands per hour, so this is the scarcest thing a run can consume and the
-# only one paced by hand.
+# GitHub's DOCUMENTED commit-search limit for an authenticated caller: 30 requests a minute, against
+# 10 unauthenticated. Every other quota this project spends is counted in thousands per hour, so this
+# is the scarcest thing a run can consume and the only one paced by hand.
+#
+# THE DOCUMENTED NUMBER IS NOT ALWAYS THE ISSUED ONE, which is why it is a bootstrap value here and
+# not the pacing rule. Measured over a full `map-sonar` run on 2026-08-27, the token in use was given
+# a limit of TEN a minute: the run took a 403 after every tenth search, 37 times, and paid a 60-second
+# backoff for each — slower than pacing correctly would have been, and it spent the retry budget a
+# genuine failure then had none of. `CallPacer` therefore paces off the `x-ratelimit-*` headers GitHub
+# actually returns and falls back to this interval only until the first response reports a budget.
 SEARCH_CALLS_PER_MINUTE = 30
 SEARCH_INTERVAL_SECONDS = 60 / SEARCH_CALLS_PER_MINUTE
 # The resource name the commit search is logged and waited under. Deliberately NOT "search", which is
@@ -72,6 +78,10 @@ SEARCH_INTERVAL_SECONDS = 60 / SEARCH_CALLS_PER_MINUTE
 # pause for the window to reset before the second search of the run. Pacing for this quota is done
 # here, by interval, and the name keeps the client's logs honest about which call is waiting.
 COMMIT_SEARCH_RESOURCE = "commit-search"
+# What GitHub's own headers call the quota the commit search spends, and so the key its budget is
+# recorded under. The pair above and this one are deliberately different strings: one names the call
+# for the client's waiting and logging, this one names the quota for reading what is left of it.
+SEARCH_BUDGET_RESOURCE = "search"
 # How many of a project's analyses may be searched before it is given up on. More than one, because a
 # pull-request analysis can name a commit on a branch since force-pushed or deleted, and that commit
 # is then in no repository at all; bounded, because every attempt spends the scarcest quota there is.
@@ -318,6 +328,14 @@ class CallPacer:
     takes a full minute to clear, so a run that sprints into the limit is slower than one that never
     reaches it — and it burns a retry budget that a genuine failure then has none of. The clock and
     the pause are injected so the suite can assert the spacing without waiting for it.
+
+    PACED OFF WHAT GITHUB REPORTS, NOT OFF WHAT GITHUB DOCUMENTS. `budget` reads the client's record
+    of the live `x-ratelimit-*` headers for the quota being spent, and the spacing is recomputed
+    before every call as "the calls left, spread over the time left in the window". A fixed interval
+    cannot do this: `SEARCH_CALLS_PER_MINUTE` says 30 and the observed allowance for the token that
+    ran `map-sonar` on 2026-08-27 was 10, so the run tripped a 403 every tenth search and waited a
+    minute each time. `interval` survives as the FLOOR — the fastest this will ever go, and the
+    spacing used for the first call of a run, before any header has been seen.
     """
 
     def __init__(
@@ -325,24 +343,53 @@ class CallPacer:
         interval: float,
         clock: Callable[[], float] = time,
         pause: Callable[[float], None] = sleep,
+        budget: Callable[[], RateLimitBudget | None] | None = None,
     ) -> None:
         self.interval = interval
         self.clock = clock
         self.pause = pause
+        self.budget = budget
         self.issued_at: float | None = None
+
+    def spacing(self) -> float:
+        """Return the gap to leave before the next call, from the live budget where there is one.
+
+        Three cases, and the floor applies to all of them:
+
+        NO BUDGET YET, or one whose window has already closed — the headers say nothing usable, so
+        the configured interval stands. A closed window is not read as "0 remaining": GitHub refills
+        at the reset instant and the record is simply stale.
+
+        SOMETHING LEFT — spread it. `remaining` calls over the seconds until the window resets is the
+        pace that arrives at the reset instant having spent exactly the allowance, and it self-corrects
+        every call because the next response reports both numbers again.
+
+        NOTHING LEFT — wait out the window. The alternative is issuing a call that is certain to be
+        refused, and then sleeping through the same window anyway with a retry spent.
+        """
+        budget = self.budget() if self.budget is not None else None
+        if budget is None:
+            return self.interval
+        window = budget.resets_at - self.clock()
+        if window <= 0:
+            return self.interval
+        if budget.remaining <= 0:
+            return max(window, self.interval)
+        return max(window / budget.remaining, self.interval)
 
     def wait(self) -> None:
         """Pause until the interval since the previous call has passed, then claim this call's slot.
 
-        No single wait ever exceeds the interval, because the elapsed time is floored at zero: a wall
-        clock being corrected backwards would otherwise stall a run for as long as the correction was
-        large, which is a hang and not a pause.
+        No single wait ever exceeds the current spacing, because the elapsed time is floored at zero:
+        a wall clock being corrected backwards would otherwise stall a run for as long as the
+        correction was large, which is a hang and not a pause.
         """
         now = self.clock()
         if self.issued_at is None:
             self.issued_at = now
             return
-        delay = self.interval - max(now - self.issued_at, 0)
+        interval = self.spacing()
+        delay = interval - max(now - self.issued_at, 0)
         if delay <= 0:
             self.issued_at = now
             return
@@ -350,7 +397,12 @@ class CallPacer:
         self.pause(delay)
         # Whichever is later: a real clock has advanced past the slot the pause bought, and a frozen
         # clock must still be seen to have consumed it or every later call would pause all over again.
-        self.issued_at = max(self.clock(), self.issued_at + self.interval)
+        self.issued_at = max(self.clock(), self.issued_at + interval)
+
+
+def search_pacer(client: GitHubClient, interval: float = SEARCH_INTERVAL_SECONDS) -> CallPacer:
+    """Build the commit-search pacer, wired to the search budget that client has last been told."""
+    return CallPacer(interval, budget=lambda: client.budget(SEARCH_BUDGET_RESOURCE))
 
 
 def sonar_token(environment: Mapping[str, str]) -> str | None:
@@ -741,7 +793,7 @@ def sonar_to_github(
     classified: it will apply to every remaining project exactly as it applied to this one, so
     writing it into the map would record this run's exhaustion as the project's own dead end.
     """
-    pacer = CallPacer(SEARCH_INTERVAL_SECONDS) if pacer is None else pacer
+    pacer = search_pacer(github_client) if pacer is None else pacer
     try:
         analyses = sonar_client.project_analyses(project, attempts)
     except SonarError as exception:
