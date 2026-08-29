@@ -1,5 +1,6 @@
 """Test configured repository inventory collection."""
 
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -55,6 +56,7 @@ from metrics.inventory import (
     enforcing_rules,
     fetch_ruleset,
     find_human_commit,
+    named_list,
     repository_standards_query,
 )
 from metrics.inventory import RepositoryRule as InventoryRule
@@ -523,12 +525,90 @@ def test_collect_merge_gate_treats_missing_classic_protection_as_unprotected() -
     assert result.evidence.rules_observed
 
 
-def test_collect_merge_gate_preserves_classic_protection_failure() -> None:
-    """Do not hide classic protection failures unrelated to permissions or absence."""
+@pytest.mark.parametrize("endpoint", ["rules", "protection"])
+def test_collect_merge_gate_reads_a_plan_limited_repository_as_unprotected(endpoint: str) -> None:
+    """Report a repository whose plan carries no branch protection as unprotected, with no failure.
+
+    "Upgrade to GitHub Pro or make this repository public to enable this feature" from either
+    endpoint means a gate cannot be configured here at all. That is an observation about the plan,
+    not a permission problem, so it takes the same route as a `404` from classic protection.
+
+    The rules endpoint answering it does not settle the question on its own — a repository can carry
+    classic protection instead — so it falls through and classic protection answers the same 403.
+    """
+    client = GitHubClient("secret", Session())
+    error = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
+
+    def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
+        """Answer the rules endpoint with the plan message, or with no rules to fall through on."""
+        del url, parameters
+        if endpoint == "rules":
+            raise error
+        return ()
+
+    with (
+        patch.object(client, "get_paginated", side_effect=paginated),
+        patch.object(client, "get", side_effect=error),
+    ):
+        result = collect_merge_gate(client, "hmcts", "divorce", repository_metadata())
+
+    assert isinstance(result.evidence, MergeGateEvidence)
+    assert result.failure is None
+    assert not result.evidence.protected
+    # GitHub answered the question, so readiness can veto on it rather than calling it a blind spot.
+    assert result.evidence.rules_observed
+
+
+def test_collect_merge_gate_reads_classic_protection_when_rules_report_disabled() -> None:
+    """Ask classic protection when the rules endpoint says rules are off, rather than assuming a gate.
+
+    A repository can be gated by classic protection alone, and a 403 about rulesets says nothing
+    about it. Reading "unprotected" straight off that message would publish a fact nobody observed —
+    and readiness vetoes on it, so the repository would be graded red for a gate it does have.
+    """
+    client = GitHubClient("secret", Session())
+    error = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
+    protection = MagicMock()
+    protection.json.return_value = {
+        "required_pull_request_reviews": {
+            "dismiss_stale_reviews": False,
+            "require_code_owner_reviews": True,
+            "require_last_push_approval": True,
+            "required_approving_review_count": 2,
+        },
+        "required_status_checks": {"strict": True, "contexts": ["build"], "checks": [{"context": "build"}]},
+        "required_conversation_resolution": {"enabled": True},
+        "allow_force_pushes": {"enabled": False},
+        "allow_deletions": {"enabled": False},
+    }
+    with (
+        patch.object(client, "get_paginated", side_effect=error),
+        patch.object(client, "get", return_value=protection) as get,
+    ):
+        result = collect_merge_gate(client, "hmcts", "divorce", repository_metadata())
+
+    assert isinstance(result.evidence, MergeGateEvidence)
+    assert result.failure is None
+    assert result.evidence.protected
+    assert result.evidence.pull_requests[0].required_approving_review_count == 2
+    get.assert_called_once_with("https://api.github.com/repos/hmcts/nfdiv-case-api/branches/master/protection")
+
+
+@pytest.mark.parametrize("rules", ["none", "disabled"])
+def test_collect_merge_gate_preserves_classic_protection_failure(rules: str) -> None:
+    """Do not hide classic protection failures unrelated to permissions or absence.
+
+    Both routes to classic protection, because a rate limit met on the second call must stay one
+    repository's failure whichever route reached it. The disabled route is the one that can regress:
+    reading the plan message inside the handler for it would put the fallback where this function's
+    own `except` clauses no longer apply, and the exception would leave `collect_inventory` — killing
+    a 1850-repository run over one repository, with every repository already collected discarded.
+    """
     client = GitHubClient("secret", Session())
     error = GitHubError("GitHub rate limit exceeded", AvailabilityReason.RATE_LIMITED)
+    disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
     with (
-        patch.object(client, "get_paginated", return_value=()),
+        patch.object(client, "get_paginated", side_effect=disabled if rules == "disabled" else None, return_value=()),
         patch.object(client, "get", side_effect=error),
     ):
         result = collect_merge_gate(client, "hmcts", "divorce", repository_metadata())
@@ -859,10 +939,12 @@ def test_collect_security_alerts_treats_a_disabled_family_as_an_observation_not_
 
 
 def test_collect_security_alerts_still_records_a_refused_family_as_a_failure_beside_a_disabled_one() -> None:
-    """Keep `403` a refusal even when another family is merely off, so the two never collapse.
+    """Keep an unexplained `403` a refusal even when another family is merely off.
 
-    GitHub returns `403` both for a token without the scope and for Advanced Security being
-    disabled, and only the response text tells them apart — too fragile a thing to grade a run on.
+    GitHub returns `403` both for a token without the scope and for a feature nobody turned on, and
+    only its own message tells them apart. A message this tool does not recognise arrives here as
+    `PERMISSION_DENIED` and is recorded — the failure direction is deliberate, so a real refusal is
+    never hidden by a phrase we guessed at.
     """
     client = alert_client(
         dependabot=GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED),
@@ -877,6 +959,74 @@ def test_collect_security_alerts_still_records_a_refused_family_as_a_failure_bes
     assert [(issue.reason, issue.detail) for issue in result.failures] == [
         (AvailabilityReason.PERMISSION_DENIED, "dependabot/alerts: GitHub permission denied"),
     ]
+
+
+def test_collect_security_alerts_reads_a_disabled_feature_403_as_a_family_that_is_off() -> None:
+    """Report a `403` GitHub explained as a disabled feature exactly as it reports a `404`.
+
+    Superseding the 2026-08-15 ruling: across 1850 repositories all 945 of these were feature or
+    plan messages and not one was a genuine refusal, so grading them as refusals exited `3` on every
+    run and buried whatever real permission problem was among them.
+    """
+    client = alert_client(
+        dependabot=GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED),
+        code_scanning=GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED),
+        secret_scanning=[{"number": 1}],
+    )
+
+    result = collect_security_alerts(client, "hmcts", "divorce", "cath-service")
+
+    assert result.failures == ()
+    assert result.evidence.dependabot.open is None
+    assert result.evidence.dependabot.detail == "dependabot/alerts is not enabled for this repository"
+    assert result.evidence.code_scanning.detail == "code-scanning/alerts is not enabled for this repository"
+    assert result.evidence.secret_scanning.open == 1
+
+
+def test_collect_inventory_stays_complete_when_a_feature_is_disabled() -> None:
+    """Leave a run `COMPLETE` when every 403 it met was GitHub saying the feature is off.
+
+    The exit status is computed from `failures`, so this is the whole point of the split: a
+    population where most repositories simply do not use code scanning must not exit `3`.
+    """
+    configuration = Configuration(
+        version=1,
+        organization="hmcts",
+        database=Path("metrics.sqlite3"),
+        teams=(TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=("nfdiv-case-api",)),),
+    )
+    client = GitHubClient("secret", Session())
+    repository_response = MagicMock()
+    repository_response.json.return_value = repository_metadata().model_dump(mode="json")
+    disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
+
+    def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
+        """Answer the branch rules with none, and every alert family with a disabled feature."""
+        del parameters
+        if "/rules/branches/" in url:
+            return ()
+        raise disabled
+
+    with (
+        patch.object(client, "get_repository", return_value=repository_response),
+        patch.object(client, "get_paginated", side_effect=paginated),
+        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window())
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    assert inventory.failures == ()
+    security = inventory.repositories[0].security
+    assert security is not None
+    assert security.dependabot.detail == "dependabot/alerts is not enabled for this repository"
 
 
 def test_collect_security_alerts_records_a_failure_for_records_that_did_not_parse() -> None:
@@ -2212,3 +2362,189 @@ def test_collect_sonar_dates_nothing_for_a_project_that_has_never_been_analysed(
     assert result.measures.analysis_at is None
     assert result.measures.gate is None
     assert result.measures.coverage is None
+
+
+def progress_configuration(*repositories: str) -> Configuration:
+    """Configure one team over several repositories, which is the sequence a progress line counts."""
+    return Configuration(
+        version=1,
+        organization="hmcts",
+        database=Path("metrics.sqlite3"),
+        teams=(TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=repositories),),
+    )
+
+
+def progress_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the progress lines a phase logged, with the elapsed figure normalised.
+
+    The seconds are replaced rather than matched: a mocked collection takes microseconds, and a test
+    that asserted the reading itself would be asserting the speed of the machine it runs on.
+    """
+    return [re.sub(r"\d+\.\ds\)$", "0.0s)", message) for message in caplog.messages if message.startswith("[")]
+
+
+def metadata_answer(client: GitHubClient, cost: int) -> Callable[[str, str], MagicMock]:
+    """Answer each metadata request for the repository it names, at a fixed cost in calls.
+
+    `issued` is what `requests_issued` exposes, so incrementing it is exactly what a live call does,
+    and it is what puts a figure other than zero on the line the meter reports.
+    """
+
+    def answer(organization: str, repository: str) -> MagicMock:
+        """Answer one repository's metadata request."""
+        del organization
+        client.issued += cost
+        response = MagicMock()
+        metadata = repository_metadata().model_copy(update={"name": repository})
+        response.json.return_value = metadata.model_dump(mode="json")
+        return response
+
+    return answer
+
+
+def test_collect_inventory_logs_one_progress_line_per_repository(caplog: pytest.LogCaptureFixture) -> None:
+    """Say where the current-state phase has reached, what it established and what it cost.
+
+    One line per repository and no more: a phase that visits 1850 of them is the reason the line
+    exists, and a phase that logged two lines for each would be twice as long as the report.
+    """
+    client = GitHubClient("secret", Session())
+    with (
+        patch.object(client, "get_repository", side_effect=metadata_answer(client, 3)),
+        patch.object(client, "get_paginated", return_value=()),
+        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+        caplog.at_level("INFO"),
+    ):
+        inventory = collect_inventory(
+            progress_configuration("nfdiv-case-api", "nfdiv-frontend"),
+            client,
+            collection_window(),
+        )
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    assert progress_lines(caplog) == [
+        "[1/2] nfdiv-case-api  state ok (3 calls, 0.0s)",
+        "[2/2] nfdiv-frontend  state ok (3 calls, 0.0s)",
+    ]
+
+
+def test_collect_inventory_progress_names_each_alert_family_that_is_not_enabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Explain a blank in the report without grading it: a family nobody turned on is not a fault."""
+    client = GitHubClient("secret", Session())
+    disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
+
+    def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
+        """Answer the branch rules with none, and two of the three alert families as switched off."""
+        del parameters
+        if "/rules/branches/" in url or "secret-scanning" in url:
+            return ()
+        raise disabled
+
+    with (
+        patch.object(client, "get_repository", side_effect=metadata_answer(client, 0)),
+        patch.object(client, "get_paginated", side_effect=paginated),
+        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+        caplog.at_level("INFO"),
+    ):
+        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+
+    assert inventory.status is CollectionStatus.COMPLETE
+    assert progress_lines(caplog) == [
+        "[1/1] nfdiv-case-api  state ok, dependabot and code scanning not enabled (0 calls, 0.0s)",
+    ]
+
+
+def test_collect_inventory_progress_keeps_a_refused_family_out_of_the_not_enabled_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report a refused family as unavailable and a disabled one as not enabled, on the same line.
+
+    The whole point of the 403 split, in one line: a family nobody turned on explains a blank, and a
+    family a token may not read is a fault. Naming the refused one as "not enabled" would tell an
+    operator to go and enable a feature that is already on.
+    """
+    client = GitHubClient("secret", Session())
+    refused = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
+    disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
+
+    def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
+        """Answer the branch rules with none, dependabot with a refusal and code scanning as off."""
+        del parameters
+        if "dependabot" in url:
+            raise refused
+        if "code-scanning" in url:
+            raise disabled
+        return ()
+
+    with (
+        patch.object(client, "get_repository", side_effect=metadata_answer(client, 0)),
+        patch.object(client, "get_paginated", side_effect=paginated),
+        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+        caplog.at_level("INFO"),
+    ):
+        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+
+    assert inventory.status is CollectionStatus.PARTIAL
+    expected = "[1/1] nfdiv-case-api  state 1 unavailable: security permission denied, code scanning not enabled"
+    assert progress_lines(caplog) == [f"{expected} (0 calls, 0.0s)"]
+
+
+def test_collect_inventory_progress_names_the_evidence_a_repository_could_not_supply(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name the kind and the reason of each unavailable piece, which is the part a reader acts on."""
+    client = GitHubClient("secret", Session())
+    with (
+        patch.object(
+            client,
+            "get_repository",
+            side_effect=GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED),
+        ),
+        caplog.at_level("INFO"),
+    ):
+        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+
+    assert inventory.status is CollectionStatus.FAILED
+    assert progress_lines(caplog) == [
+        "[1/1] nfdiv-case-api  state 1 unavailable: repository permission denied (0 calls, 0.0s)",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("names", "phrase"),
+    [
+        ((), ""),
+        (("dependabot",), "dependabot"),
+        (("dependabot", "code scanning"), "dependabot and code scanning"),
+        (("dependabot", "code scanning", "secret scanning"), "dependabot, code scanning and secret scanning"),
+    ],
+)
+def test_named_list_joins_names_as_a_person_writes_them(names: tuple[str, ...], phrase: str) -> None:
+    """Read as a sentence, so that a log line is read rather than parsed."""
+    assert named_list(names) == phrase

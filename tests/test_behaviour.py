@@ -34,10 +34,12 @@ from metrics.behaviour import (
     review_query,
     synchronize_merges,
     synchronize_pull_request_facts,
+    window_progress,
 )
 from metrics.config import Configuration, TeamConfiguration
 from metrics.domain import (
     AvailabilityReason,
+    BehaviourProvenance,
     CacheStatus,
     CheckConclusion,
     CheckRollupState,
@@ -944,3 +946,97 @@ def test_collect_window_adds_what_the_window_cost_to_what_current_state_cost(tmp
     # The window failed on its first call, and the attempt still cost that call and those seconds.
     assert result.status is CollectionStatus.PARTIAL
     assert result.costs == (RepositoryCollectionCost(repository="cath-service", requests=7, elapsed_seconds=4.0),)
+
+
+def progress_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the progress lines the phase logged, with the elapsed figure normalised.
+
+    The seconds are replaced rather than matched: a mocked window takes microseconds, and a test
+    that asserted the reading itself would be asserting the speed of the machine it runs on.
+    """
+    return [re.sub(r"\d+\.\ds\)$", "0.0s)", message) for message in caplog.messages if message.startswith("[")]
+
+
+def test_collect_window_logs_one_progress_line_per_repository(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Say where the window phase has reached, how each window was satisfied and what it cost."""
+    database = tmp_path / "metrics.sqlite3"
+    window = ReportingWindow(starts_at=datetime(2026, 7, 1, tzinfo=UTC), ends_at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    with caplog.at_level("INFO"):
+        collect_window(
+            population_configuration(database, "cath-service", "opal-common-lib"),
+            refusing_client("no-repository-of-this-name"),
+            population_inventory("cath-service", "opal-common-lib"),
+            window,
+            datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+    assert progress_lines(caplog) == [
+        "[1/2] cath-service  window fetched 2 intervals (0 calls, 0.0s)",
+        "[2/2] opal-common-lib  window fetched 2 intervals (0 calls, 0.0s)",
+    ]
+
+
+def test_collect_window_progress_reports_a_window_taken_entirely_from_the_cache(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report a second run over a settled window as reuse, so a reader knows it paid nothing."""
+    database = tmp_path / "metrics.sqlite3"
+    window = ReportingWindow(starts_at=datetime(2026, 7, 1, tzinfo=UTC), ends_at=datetime(2026, 8, 1, tzinfo=UTC))
+    arguments = (
+        population_configuration(database, "cath-service", "opal-common-lib"),
+        refusing_client("no-repository-of-this-name"),
+        population_inventory("cath-service", "opal-common-lib"),
+        window,
+        datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    collect_window(*arguments)
+
+    with caplog.at_level("INFO"):
+        collect_window(*arguments)
+
+    assert progress_lines(caplog) == [
+        "[1/2] cath-service  window fully reused (0 calls, 0.0s)",
+        "[2/2] opal-common-lib  window fully reused (0 calls, 0.0s)",
+    ]
+
+
+def test_collect_window_progress_reports_why_a_refused_window_is_missing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name the reason on the line, so a refusal is visible without reading the report."""
+    window = ReportingWindow(starts_at=datetime(2026, 7, 1, tzinfo=UTC), ends_at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    with caplog.at_level("INFO"):
+        collect_window(
+            population_configuration(tmp_path / "metrics.sqlite3", "cath-service", "opal-common-lib"),
+            refusing_client("opal-common-lib"),
+            population_inventory("cath-service", "opal-common-lib"),
+            window,
+            datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+    assert progress_lines(caplog)[1] == "[2/2] opal-common-lib  window unavailable: rate limited (0 calls, 0.0s)"
+
+
+def test_window_progress_counts_the_intervals_of_both_windowed_sources() -> None:
+    """Report a window that reused every pull-request interval and still paid for a commit one.
+
+    `stable_history` alone would call this fully reused, which would tell a reader the window cost
+    nothing while the figures beside it said otherwise.
+    """
+    provenance = BehaviourProvenance(
+        stable_history=CacheStatus.FULLY_REUSED,
+        stable_intervals_fetched=0,
+        mutable_starts_at=datetime(2026, 7, 25, tzinfo=UTC),
+        pull_request_facts_loaded=4,
+        review_facts_loaded=2,
+        direct_commit_intervals_fetched=1,
+    )
+
+    assert window_progress(provenance) == "window partially reused 1 interval"

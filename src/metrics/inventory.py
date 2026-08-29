@@ -37,6 +37,7 @@ from metrics.domain import (
     StatusChecksRule,
 )
 from metrics.github import GitHubClient, GitHubError
+from metrics.progress import log_progress
 from metrics.sonar import (
     SONAR_PROPERTIES_PATH,
     SonarClient,
@@ -304,6 +305,32 @@ class SecurityAlertResult:
     failures: tuple[RepositoryInventoryIssue, ...]
 
 
+FEATURE_NOT_CONFIGURED = frozenset(
+    {
+        AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+        AvailabilityReason.FEATURE_DISABLED,
+    },
+)
+"""The two answers that describe the REPOSITORY rather than the caller, and so are observations.
+
+Both readers of this set have already read the repository's metadata with the same token, so
+neither can be looking at a repository that is missing or private. A 404 from an alert or a
+protection endpoint is GitHub saying the feature is not turned on; a 403 whose own message says the
+feature is off, or that the plan does not carry it, says the same thing in a different status. Each
+is reported on the block and neither records a failure — recording one would exit `3` for a
+repository that has no problem, only an unused feature.
+"""
+
+FEATURE_NOT_ENABLED = "is not enabled for this repository"
+"""GitHub's "you never turned this on" answer, in the words two readers share.
+
+Spelled once because both of them depend on it: `open_alerts` writes it onto the block of a family
+GitHub says is off, and `unused_alert_families` names those families on the progress line by
+recognising it. A refused family's detail is GitHub's own refusal message and never ends this way,
+which is what keeps the two apart on the line.
+"""
+
+
 def merge_gate_from_classic_protection(branch: str, protection: ClassicBranchProtection) -> MergeGateEvidence:
     """Normalise classic branch protection into merge-gate evidence."""
     reviews = protection.required_pull_request_reviews
@@ -380,8 +407,9 @@ def collect_classic_merge_gate(
     try:
         response = client.get(protection_url)
     except GitHubError as exception:
-        if exception.reason is AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE:
-            # GitHub answered: the branch has no protection. That is an observation, not a blind spot.
+        if exception.reason in FEATURE_NOT_CONFIGURED:
+            # GitHub answered: the branch has no protection, either because none is set or because
+            # the repository's plan cannot carry any. Both are observations, not blind spots.
             return MergeGateResult(
                 evidence=merge_gate_without_rule_details(
                     repository.default_branch,
@@ -496,9 +524,15 @@ def open_alerts(
     branch is unprotected. Reporting it as `not found or inaccessible` would assert a permission
     problem that is not there, and counting it as a collection failure would make `collect` exit `3`
     for every repository that simply does not use the feature — which is most of them, and which
-    would empty the three-valued exit status of the signal it was built to carry. A 403 stays a
-    refusal: GitHub returns it both for a token without the scope and for Advanced Security being
-    off, and only the response text tells them apart, which is too fragile a thing to grade a run on.
+    would empty the three-valued exit status of the signal it was built to carry.
+
+    A 403 GITHUB EXPLAINED AS A DISABLED FEATURE IS READ THE SAME WAY (decided 2026-08-29,
+    superseding the 2026-08-15 ruling that every 403 stays a refusal). GitHub answers 403 both for a
+    token without the scope and for a feature nobody turned on, and only its own message tells them
+    apart; the evidence that the message is worth reading is that across 1850 repositories all 945
+    of these were feature or plan messages and not one was a genuine refusal. `GitHubClient.classify`
+    draws the line on a small set of phrases anchored on `for this repository`, and an unrecognised
+    403 still arrives here as `PERMISSION_DENIED` and is still recorded as a failure.
     """
     try:
         records = client.get_paginated(
@@ -506,9 +540,9 @@ def open_alerts(
             {"state": "open"},
         )
     except GitHubError as exception:
-        if exception.reason is AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE:
+        if exception.reason in FEATURE_NOT_CONFIGURED:
             return AlertFamilyResult(
-                count=OpenAlertCount(detail=f"{family} is not enabled for this repository"),
+                count=OpenAlertCount(detail=f"{family} {FEATURE_NOT_ENABLED}"),
                 reason=None,
             )
         return AlertFamilyResult(count=OpenAlertCount(detail=str(exception)), reason=exception.reason)
@@ -1247,9 +1281,22 @@ def collect_merge_gate(
     """Collect default-branch merge rules or describe why they are unavailable."""
     try:
         branch = quote(repository.default_branch, safe="")
-        records = client.get_paginated(
-            f"{client.api_url}/repos/{organization}/{repository.name}/rules/branches/{branch}",
-        )
+        try:
+            records = client.get_paginated(
+                f"{client.api_url}/repos/{organization}/{repository.name}/rules/branches/{branch}",
+            )
+        except GitHubError as exception:
+            if exception.reason is not AvailabilityReason.FEATURE_DISABLED:
+                raise
+            # "Upgrade to GitHub Pro or make this repository public to enable this feature": rules
+            # cannot be configured on this repository at all, so there is no gate to be refused a
+            # sight of. READ AS NO RULES, which is literally what it says, so that the branch takes
+            # the route below that a ruleset endpoint returning an empty array takes — CLASSIC
+            # PROTECTION IS STILL ASKED, and answers the same 403 for a plan that carries neither,
+            # which `FEATURE_NOT_CONFIGURED` reads as unprotected and observed. Asserting that here
+            # instead would publish "this branch is unprotected" off a message about rulesets, for a
+            # branch classic protection may well be gating.
+            records = ()
         rules = tuple(RepositoryRule.model_validate(record) for record in records)
         if not rules:
             return collect_classic_merge_gate(client, organization, team_identifier, repository, branch)
@@ -1380,6 +1427,42 @@ def collect_repository_state(
     return item, failures + (() if quality is None or quality.failure is None else (quality.failure,))
 
 
+def unused_alert_families(security: SecurityAlertEvidence | None) -> tuple[str, ...]:
+    """Name each alert family GitHub reported as not turned on, in the order every reader lists them.
+
+    Read back off the block rather than passed alongside it, because the block is where the answer
+    was recorded and a second channel carrying the same fact is a second channel to get wrong. A
+    family that was REFUSED is deliberately not named here: it is a failure, and the progress line
+    reports it as one.
+    """
+    return tuple(
+        family.value.replace("-", " ")
+        for family, count in (() if security is None else security.families())
+        if count.detail is not None and count.detail.endswith(FEATURE_NOT_ENABLED)
+    )
+
+
+def named_list(names: tuple[str, ...]) -> str:
+    """Join names the way a person writes them, so a log line reads as a sentence."""
+    return f"{', '.join(names[:-1])} and {names[-1]}" if len(names) > 1 else "".join(names)
+
+
+def state_progress(item: RepositoryInventoryItem | None, issues: tuple[RepositoryInventoryIssue, ...]) -> str:
+    """Say in one clause what the current-state phase established for one repository.
+
+    Unavailable evidence is NAMED, by kind and reason, not merely counted: `merge_gate permission
+    denied` is the part a reader acts on, and the count in front of it is what tells them whether the
+    line is the whole story. A family GitHub says is not turned on is reported beside either answer,
+    because it explains a blank in the report without being a fault — the distinction this run's 403
+    split exists to draw.
+    """
+    unavailable = ", ".join(f"{issue.evidence.value} {issue.reason.value.replace('_', ' ')}" for issue in issues)
+    state = f"{len(issues)} unavailable: {unavailable}" if issues else "ok"
+    families = unused_alert_families(None if item is None else item.security)
+    note = f", {named_list(families)} not enabled" if families else ""
+    return f"state {state}{note}"
+
+
 def collect_inventory(
     configuration: Configuration,
     client: GitHubClient,
@@ -1400,7 +1483,8 @@ def collect_inventory(
     failures: tuple[RepositoryInventoryIssue, ...] = ()
     costs: tuple[RepositoryCollectionCost, ...] = ()
     excluded = excluded_authors(configuration.cohort.excluded_authors)
-    for team_identifier, repository in owned_repositories(configuration):
+    owned = owned_repositories(configuration)
+    for position, (team_identifier, repository) in enumerate(owned, start=1):
         meter = CostMeter(client, None if sonar is None else sonar.client)
         with meter.measure():
             item, issues = collect_repository_state(
@@ -1411,12 +1495,14 @@ def collect_inventory(
                 excluded,
                 sonar,
             )
-        repositories += () if item is None else (item,)
-        failures += issues
         # Keyed on the name GitHub answered with, which is what the window phase meters against: a
         # repository renamed since `hmcts.yml` was written is followed by the API, and keying the two
         # phases differently would split one repository's cost across two rows in the same report.
-        costs += (meter.cost(repository if item is None else item.repository.name),)
+        cost = meter.cost(repository if item is None else item.repository.name)
+        log_progress(position, len(owned), cost, state_progress(item, issues))
+        repositories += () if item is None else (item,)
+        failures += issues
+        costs += (cost,)
     if not failures:
         status = CollectionStatus.COMPLETE
     elif repositories:

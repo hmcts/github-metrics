@@ -176,6 +176,86 @@ describe the run rather than the repository, so two runs over identical evidence
 cache and is cheaper. They are deliberately absent from `evidence`, which is a reproducible contract, and they are not
 stored: nothing in the cache remembers what a previous run cost.
 
+**`collect` reports where it has reached, one line per repository per phase.** A collection visits every repository twice —
+current state first, then the window — and at 1850 repositories each pass is long enough that a run printing nothing
+until it finishes cannot be told apart from one that has hung. Each line carries the position, the total, the
+repository, what that phase established, and the calls and seconds it cost, at `INFO`:
+
+```
+[   1/1850] cath-service  state ok (37 calls, 12.4s)
+[   2/1850] rpx-shared-infrastructure  state ok, dependabot and code scanning not enabled (9 calls, 1.1s)
+[   3/1850] cp-amp-terraform  state 1 unavailable: merge_gate permission denied (11 calls, 2.0s)
+[   1/1850] cath-service  window fetched 2 intervals (14 calls, 8.1s)
+[   2/1850] rpx-shared-infrastructure  window fully reused (0 calls, 0.0s)
+```
+
+The two sequences run one after the other, not interleaved: all current state is collected before any window. `evidence`
+collects too and prints no progress lines: it fills its window one repository at a time through a different path, and
+both these lines and the call summary below were left off it deliberately rather than missed.
+
+**Every GitHub call logs exactly one line, at a level chosen by what came back** — `GitHub ok` and `GitHub disabled` at
+`DEBUG`, `GitHub errors`, `GitHub refused` and `GitHub failed` at `WARNING`. `--logging` sets the level and defaults to
+`info`, so a default run shows the progress lines, the call summary and any failure, and nothing per successful call;
+`--logging debug` adds the line for every call. GitHub answers `403` both for a feature nobody enabled and for a token
+that may not look, and only its message tells them apart, so a `403` explaining that the feature is off is logged beside
+a `200` rather than as a warning. **At the default level, a `403` in the log is always a genuine permission problem.**
+
+**The status alone never decides the word.** `refused` is reserved for the three statuses that are an access decision —
+`401`, `403`, `404` — and every other error status is `failed`, because nobody refused a `502`; calling a bad gateway a
+refusal put a transient in the summary under the word that means a permission to chase. In the other direction, a
+GraphQL failure arrives as HTTP `200` with an `errors` array, so the body is read before the call is counted and it is
+logged and counted as `errors` rather than as a success. One exception is left: a call being retried after a rate limit
+or a `5xx` logs its retry warning instead, one per attempt.
+
+**A GraphQL refusal is reported at the `403` it is, not at the `200` it arrived in**, marked `(equivalent)` so nobody
+reads it as a status GitHub returned:
+
+```
+GitHub errors 403 (equivalent) POST https://api.github.com/graphql {"searchQuery": "repo:hmcts/cath-service is:pr is:merged merged:2026-05-25T00:00:00Z..2026-06-24T00:00:00Z"}: FORBIDDEN: Resource not accessible by personal access token (x76)
+```
+
+One line carrying the equivalent status, the variables naming the repository the call was about, and each kind of error
+once with its count. **Grepping a log for `403` is how a permission problem is found**, and while these were reported as
+the `200` they travelled in, the largest one on the estate was invisible to that search. The equivalence is the same
+judgement the caller is handed — a body classified as a permission denial — so a failure that stops being read as a
+refusal stops being reported as one. Every other GraphQL error keeps the response's own status: a repository that was
+renamed is not a `403`, and a collection failure names no status worth searching for.
+
+Response bodies are never logged — a secret-scanning alert record carries the detected credential itself — so a success
+logs its byte count and a failure logs GitHub's own `message` and nothing else of the body. GraphQL errors are logged as
+`TYPE: message`, **each kind once with its count**, because GitHub returns one error per node it will not answer for: a
+single search returned `FORBIDDEN: Resource not accessible by personal access token` 76 times, and one run wrote that
+sentence out 6,880 times, which buries the error that appears once. Only the `403` is split by message: a `404` is
+`refused` at `WARNING` as it always was, including from the endpoints that read one as "not enabled" or "not protected",
+because the client cannot tell those from a `404` on a repository that really is unreadable. At `DEBUG`, `--logging
+debug` also turns on the `urllib3` connection line beside ours, which is not this tool's and is left alone; dropping
+back to `info` silences it.
+
+**A retried call is counted once, at the response it ended on.** A `502` retried twice and answered on the third attempt
+is one `200 ok`; a `502` that never recovers is one `502 failed`, and its three round trips are three retry warnings
+and one counted call. The summary reports what the run acted on, never a response it superseded.
+
+**`collect` ends with a summary of what GitHub did with the whole run's calls**, counted by status, by outcome, and by
+endpoint, with the organisation, repository, id, branch, commit and pagination values in each URL replaced by placeholders so
+that one endpoint read for 1850 repositories is one line. Highest status first, and within one status refusals before
+GraphQL errors before failures before disabled features before successes, then the largest count — within one status,
+ordering by count alone would bury twelve refused calls under hundreds of disabled ones, and 181 failed GraphQL queries
+under the 1977 that worked:
+
+```
+GitHub calls issued for 1850 repositories:
+     2  502  failed    POST https://api.github.com/graphql
+    12  403  refused   GET https://api.github.com/repos/{organization}/{repository}/secret-scanning/alerts?state=open&per_page=100
+   181  403  errors    POST https://api.github.com/graphql
+   830  403  disabled  GET https://api.github.com/repos/{organization}/{repository}/code-scanning/alerts?state=open&per_page=100
+   113  403  disabled  GET https://api.github.com/repos/{organization}/{repository}/dependabot/alerts?state=open&per_page=100
+  1848  200  ok        GET https://api.github.com/repos/{organization}/{repository}
+  1977  200  ok        POST https://api.github.com/graphql
+```
+
+The `403 errors` line is the GraphQL refusals, counted at their equivalent status so they sit with the refusals they
+are rather than under the successes they arrived among.
+
 Not everything `collect` fetches is windowed. Pull-request, review, and direct-commit facts are historical and
 accumulate in the cache.
 Repository metadata, merge-gate state, CODEOWNERS presence, default-branch maintenance instants and the SonarCloud
@@ -340,8 +420,13 @@ Three details matter when reading it:
   use, and by then its metadata has already been read with the same token, so this is an observation and not a
   permission problem. It reports `not enabled for this repository` and still never reports zero, but it records no
   failure and does not make the run partial — otherwise `collect` would exit `3` for every repository that simply does
-  not use the feature. A `403` is still a refusal, because GitHub returns it both for a token without the scope and for
-  Advanced Security being disabled, and only the response text tells those apart.
+  not use the feature. **A `403` whose message says the feature is off is read the same way**, as of 2026-08-29: GitHub
+  returns `403` both for a token without the scope and for a feature or plan that does not cover the repository, and
+  across 1850 hmcts repositories every `403` was the second kind — `Code Security must be enabled for this repository to
+  use code scanning`, `Dependabot alerts are disabled for this repository`, `Upgrade to GitHub Pro …`. Only a short list
+  of phrases anchored on `for this repository` counts, so an organisation-level refusal can never match one, and a `403`
+  whose message is not recognised stays a refusal: an unfamiliar "disabled" message is reported as a permission problem
+  a human can read in the log, rather than a real refusal being hidden by a phrase this tool guessed at.
 
 Collection costs one call per family plus one more per additional hundred open alerts. Measured against
 hmcts/cath-service on 2026-08-14: three calls, against a whole-repository GitHub collection of roughly fourteen. That
@@ -734,6 +819,14 @@ neither `restricts_branch_names` nor an `unmodelled_rules` entry: a classic repo
 which is accurate rather than a gap. If GitHub denies access to those classic details, collection falls back to the branch metadata
 protection indicator. When that indicator confirms protection, the basic evidence is retained and `failures` records the
 permission-limited merge-gate detail, making the run partial. An unprotected indicator does not create a failure.
+
+Where GitHub answers `403` because the repository's plan carries no branch protection at all — `Upgrade to GitHub Pro or
+make this repository public to enable this feature` — the gate is reported as **observed and unprotected**, with no
+failure and no effect on the exit status: there is no gate for a token to have been refused a sight of. That is the same
+reading a `404` from the classic protection endpoint gets. A rulesets `403` is not taken as the answer on its own, since
+a repository can be gated by classic protection alone, so classic protection is still asked and answers the same `403`.
+Being an observation rather than a blind spot, readiness grades on it: such a repository is vetoed `red` for an
+unprotected default branch rather than reported as `cannot_assess`.
 
 GitHub requests use bounded retries for transient failures, honour rate-limit response headers, and follow HTTPS
 pagination links only within `api.github.com`. Pull-request behaviour uses 30-day GraphQL search shards, paginates search

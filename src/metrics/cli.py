@@ -47,7 +47,7 @@ from metrics.evidence import (
     stored_reports,
     stored_repository_state,
 )
-from metrics.github import GitHubClient, GitHubError
+from metrics.github import CallOutcome, GitHubClient, GitHubError
 from metrics.inventory import SonarSource, collect_inventory
 from metrics.render import RepositoryDrillDown, render_report, render_trend_report
 from metrics.rules import configured_rules
@@ -490,6 +490,50 @@ def sonar_source(configuration: Configuration, session: Session) -> SonarSource:
     )
 
 
+CALL_OUTCOME_ORDER: Mapping[str, int] = {"refused": 0, "errors": 1, "failed": 2, "disabled": 3, "ok": 4}
+"""Which kind of call a reader needs to see first, whatever the run spent most of its calls on.
+
+Status alone is not enough to order by: one 403 is a refusal, another is a feature nobody turned on,
+and a third is a GraphQL refusal counted at the status it is equivalent to. The refusals are what the
+summary exists to surface, and sorting by count alone would put the twelve calls a token was refused,
+and the 181 GraphQL queries it was refused, under 943 lines of features nobody turned on.
+"""
+
+
+def log_call_summary(outcomes: Mapping[CallOutcome, int], repositories: int) -> None:
+    """Say what GitHub did with a whole run's calls, one line per kind of call.
+
+    A collection issues tens of thousands of calls and logs one line each at DEBUG, which nobody
+    reads and nobody can total. This is the same record counted: every response the client saw, by
+    status, by what it was, and by the endpoint template it was issued against, so 830 repositories
+    with code scanning switched off are one line rather than 830.
+
+    Highest status first, and within one status refusals before disabled features before successes,
+    then the largest count, so the top of the summary is the part of a run that did not work rather
+    than the part it spent most of its calls on. The counts and the outcomes are padded to their own
+    widest value, which lines the methods up in one column for whatever mix of calls a run made.
+
+    One record, not one per line: a run's summary is a single thing to read, and a logger writing a
+    timestamp and a level in front of each row would break the columns it just built.
+    """
+    counted = sorted(
+        outcomes.items(),
+        # Indexed, not `.get`: the three words come from `log_outcome` and a fourth one added there
+        # without a rank here should fail loudly rather than silently sort as urgently as a refusal.
+        key=lambda item: (-item[0][0], CALL_OUTCOME_ORDER[item[0][1]], -item[1], item[0][2:]),
+    )
+    calls = max((len(str(count)) for _, count in counted), default=0)
+    outcomes_width = max((len(outcome) for (_, outcome, _, _), _ in counted), default=0)
+    logging.info(
+        "GitHub calls issued for %s repositories:%s",
+        repositories,
+        "".join(
+            f"\n  {count:>{calls}}  {status}  {outcome:<{outcomes_width}}  {method} {endpoint}"
+            for (status, outcome, method, endpoint), count in counted
+        ),
+    )
+
+
 def collect_evidence(configuration: Configuration, options: Namespace, token: str) -> int:
     """Fill the cache for one collection window and report what was fetched or reused.
 
@@ -525,6 +569,11 @@ def collect_evidence(configuration: Configuration, options: Namespace, token: st
         except StorageError as exception:
             logging.error("Storage failed: %s", exception)
             return 1
+        finally:
+            # In a `finally`, so a run that could not store what it collected still says what it
+            # spent and what GitHub answered. That run is the one whose summary matters most: it has
+            # a non-zero status, no report on stdout, and this is the only account of its calls.
+            log_call_summary(client.call_outcomes, len(configured_repositories(configuration)))
     logging.info("Appended %s alert observations", appended)
     sys.stdout.write(f"{inventory.model_dump_json(indent=2)}\n")
     return run_status(inventory.status)

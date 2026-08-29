@@ -324,15 +324,149 @@ not a refusal, exactly as a `404` from the branch-protection endpoint is. The re
 was read with the same token moments earlier, so the family is not enabled rather than missing; it
 is reported on the block as "not enabled for this repository" and records no failure. Treating it as
 one would have exited `3` for every repository that simply does not use the feature — most of them —
-which empties the status of the signal this ruling built. A `403` stays a failure: GitHub returns it
-both for a token without the scope and for Advanced Security being off, and only the response text
-tells them apart, which is too fragile a thing to grade a run on. A partial
+which empties the status of the signal this ruling built. A `403` STAYS A FAILURE ONLY WHERE GITHUB
+DOES NOT SAY THE FEATURE IS OFF (superseded 2026-08-29). The ruling this replaces read: "a `403`
+stays a failure: GitHub returns it both for a token without the scope and for Advanced Security being
+off, and only the response text tells them apart, which is too fragile a thing to grade a run on."
+The evidence overturned it. Across 1850 repositories every single 403 was a feature or a plan
+message — 830 `Code Security must be enabled for this repository to use code scanning`, 113
+`Dependabot alerts are disabled for this repository`, 2 `Upgrade to GitHub Pro or make this
+repository public to enable this feature` — and not one was a genuine refusal. Grading all 945 as
+refusals is what exited `3` over the whole population and buried the real permission problem among
+them: the same emptying of the signal the 404 correction above was made to avoid.
+
+The text is read through a short anchored list, `GitHubClient.feature_disabled_phrases`, matched
+case-folded: `is disabled for this repository`, `are disabled for this repository`, `must be enabled
+for this repository`, `is not enabled for this repository`, `upgrade to github pro`. Every phrase but
+the last is anchored on `for this repository`, so an organisation-level refusal can never match one —
+GitHub does not say a token was refused "for this repository" — and the last is anchored on GitHub's
+own product name. A matching 403 classifies as `FEATURE_DISABLED`, AN OBSERVATION AND NOT A
+`RepositoryInventoryIssue` AT THE THREE ENDPOINTS THAT READ IT: it is reported on the block, records
+no failure, and does not move the exit status, exactly as a 404 from the same endpoint does. The three
+are `open_alerts`, `collect_merge_gate` and `collect_classic_merge_gate`, through
+`FEATURE_NOT_CONFIGURED`; anywhere else the reason travels onto an issue like any other, because only
+an endpoint whose repository has already been read with the same token can say that a 403 describes
+the repository rather than the caller.
+
+The merge gate reads it the same way, with one call in between: a rules endpoint answering "upgrade to
+GitHub Pro" takes the same route as a rules endpoint that returned no rules and ASKS CLASSIC
+PROTECTION, which answers the same 403 for a plan that carries neither and lands on `protected=False`,
+`rules_observed=True`, no failure. The message is about rulesets, and a repository can be gated by
+classic protection alone, so reading "this branch is unprotected" straight off it would publish a fact
+nobody observed — and readiness vetoes on that fact, grading the repository red for a gate it has.
+Where the plan genuinely carries no protection the answer is unchanged and costs one extra call on the
+two repositories in 1850 that are in that position.
+
+THE FAILURE DIRECTION IS DELIBERATE: AN UNRECOGNISED 403 STAYS `PERMISSION_DENIED`. A disabled
+message nobody has listed yet is reported as a refusal, which a human then reads in the log and adds
+to the list; a real refusal is never hidden by a phrase we guessed at. Do not widen the list to
+unanchored words like `disabled` or `enabled` — that fragility is what the superseded ruling was
+right about, and the anchors are the only reason this one is safe. A partial
 run exiting `0` would let every downstream denominator read as covering the whole population when
 repositories are missing from it, which at fourteen is no longer a hypothetical. `3` rather than `2`
 because `argparse` already exits `2` for a usage error, and "you invoked me wrongly" is not "part of
 the org would not answer". Both a partial and a wholly failed run still write their report: naming
 the repositories that refused is the most useful thing a failed run produces. `evidence --offline`
 is the deliberate exception and keeps refusing outright, per the ruling above.
+
+## Run logging (decided 2026-08-29)
+
+EXACTLY ONE LINE PER GITHUB CALL, AT A LEVEL CHOSEN BY WHAT CAME BACK. A failed call used to emit
+three lines of ours — a pre-request line, a response line, and a refusal warning — and at 1850
+repositories that is a log nobody reads to the end of. `GitHubClient.log_outcome` emits the single
+line, and the three words it logs under are the three the call is counted under, so the log and the
+end-of-run summary can never disagree about a call:
+
+```
+DEBUG    GitHub ok 200 GET https://api.github.com/repos/hmcts/batch-audio-transcription/rulesets/17187159 (1393 bytes)
+DEBUG    GitHub disabled 403 GET https://api.github.com/repos/hmcts/jaia-client/code-scanning/alerts?state=open&per_page=100: Code Security must be enabled for this repository to use code scanning.
+WARNING  GitHub refused 403 GET https://api.github.com/repos/hmcts/x/secret-scanning/alerts?state=open&per_page=100: Resource not accessible by personal access token
+```
+
+A DISABLED 403 LOGS AT DEBUG, THE SAME LEVEL AS A 200. That is the point of the split: at the default
+level, a `403` in the log is always a genuine permission problem, rather than one refusal in among 943
+features nobody turned on. The GraphQL line carries its variables, because every GraphQL call is a
+POST to the same URL and the variables are the only part of the request that names the repository it
+is about. Bodies are still never logged — see "Semantics" below.
+
+TWO EXCEPTIONS, DOCUMENTED RATHER THAN ENGINEERED AWAY. A retried response — a rate limit, a 5xx —
+logs the existing retry WARNING instead of the outcome line, one per attempt, because the call has
+not ended yet and only the response it ends on is logged and counted. That warning NAMES THE CALL as
+well as the status: with the pre-request line gone, it is the only thing that can say which endpoint
+a run that died on retries was reading. A GraphQL 200 carrying `errors`
+logs the DEBUG outcome line *and* the existing errors WARNING, because those errors are only visible
+after the call returned and the line describing the HTTP response is still true. At INFO and above it
+is always exactly one line per call — apart from the `GitHub budget` line at DEBUG, which is
+`record_rate_limit` reporting the quota rather than the call.
+
+A RESPONSE THE RETRIES RAN OUT ON IS LOGGED AND COUNTED LIKE ANY OTHER. It is not retried, so the
+outcome line is its line. It used to be neither: the rate-limit exhaustion raises from inside
+`retry_delay`, which left the run a rate limit killed — the run whose summary is the only account of
+what it spent — with its final calls in `requests_issued` and absent from the summary. It is counted
+at the status HTTP returned, which for a GraphQL rate limit is the 200 its body arrived in.
+
+URLLIB3'S OWN CONNECTION LINE IS NOT OURS AND IS LEFT ALONE. `--logging info` silences it. Do not add
+a filter for it: a third-party logger this project reconfigures behind a reader's back is a worse
+surprise than a duplicate line at DEBUG.
+
+THE ENDPOINT TEMPLATE IS DERIVED FROM THE REQUESTED URL, NOT PASSED IN. `endpoint_template` replaces
+the values a URL carries — `/repos/{organization}/{repository}`, `/orgs/{organization}`, all-digit
+segments to `{id}`, the segment after `branches` to `{branch}`, and the `page`, `after`, `before` and
+`cursor` query values with placeholders — and leaves everything else exactly as it was. GraphQL
+collapses to the bare `POST https://api.github.com/graphql`. Reading the URL rather than taking a
+name from each caller means none of the several dozen call sites has to be told what it is asking
+for, and a template cannot drift from the request it claims to describe. It is the URL asked for
+rather than the one answered, so a call GitHub redirects — a renamed repository — is counted and
+logged under the name this tool used, which is the name its configuration and its report use. The
+pagination placeholders matter as much as the path ones: left alone, one paginated read fragments into
+a counted endpoint per page, and a Link header carrying a cursor rather than a page fragments it into
+one per repository — the same failure as counting one endpoint read 1850 times as 1850 endpoints. Page
+one carries no `page` parameter at all, so a read that paginated is two lines rather than one; that is
+the intended floor, and it does not grow with the number of pages or repositories.
+
+`collect` LOGS THE CALL SUMMARY AFTER THE RUN, INCLUDING A RUN THAT FAILED, from the counter the
+client keeps beside `requests_issued`. Sorted by status descending, then `refused` before `disabled`
+before `ok`, then count descending: within one status, count alone would bury twelve refused calls
+under 943 disabled ones, which is the one thing the summary exists to surface. It is one log record
+rather than one per row, because a logger writing a timestamp and a level in front of each row would
+break the columns it just built.
+
+```
+GitHub calls issued for 1850 repositories:
+    12  403  refused   GET https://api.github.com/repos/{organization}/{repository}/secret-scanning/alerts?state=open&per_page=100
+   830  403  disabled  GET https://api.github.com/repos/{organization}/{repository}/code-scanning/alerts?state=open&per_page=100
+   113  403  disabled  GET https://api.github.com/repos/{organization}/{repository}/dependabot/alerts?state=open&per_page=100
+  1848  200  ok        GET https://api.github.com/repos/{organization}/{repository}
+  1848  200  ok        POST https://api.github.com/graphql
+```
+
+ONLY THE 403 IS SPLIT. Every other failed status is `refused`, which includes the 404 that
+`open_alerts` and `collect_classic_merge_gate` read as an observation: the client sees one endpoint's
+404 and cannot tell it from a 404 on repository metadata, which is a real failure, so the outcome word
+and the WARNING level for a 404 are exactly what they were before this ruling. The cost is that those
+404s sort above the 403 refusals in the summary, which sorts by status first. Left as it is
+deliberately — the alternative is a fourth outcome word decided per endpoint, threading the meaning of
+a status back into a client whose whole design keeps it out (see `http_failures`).
+
+`collect` ONLY, FOR BOTH THE SUMMARY AND THE PROGRESS LINES. `evidence` collects too and meets the
+same 403s: it fills its window through `synchronize_merges` rather than through the two phases, and
+neither was left off it by accident. Adding the summary there is one more call to `log_call_summary`.
+
+PROGRESS IS ONE LINE PER REPOSITORY PER PHASE, AT INFO, formatted in `metrics/progress.py` so that
+both phases and any later caller pad and order it identically. Each line carries the position, the
+total, the repository, what the phase established, and the calls and seconds the `CostMeter` already
+measured for the `costs` table — the same reading, so a line and the table cannot disagree. The two
+phases are separate loops, all current state before any window, so this is two sequences of 1850
+lines rather than one line per repository. Joining them was tried before and rejected for the
+complexity it adds to the run; the phases stay apart.
+
+```
+[   1/1850] cath-service  state ok (37 calls, 12.4s)
+[   2/1850] rpx-shared-infrastructure  state ok, dependabot and code scanning not enabled (9 calls, 1.1s)
+[   3/1850] cp-amp-terraform  state 1 unavailable: merge_gate permission denied (11 calls, 2.0s)
+[   1/1850] cath-service  window fetched 2 intervals (14 calls, 8.1s)
+[   2/1850] rpx-shared-infrastructure  window fully reused (0 calls, 0.0s)
+```
 
 ## Source taxonomy (decided 2026-08-11)
 
@@ -954,11 +1088,13 @@ or nothing". Document the behaviour; do not soften it.
 ## Semantics (do not revisit)
 
 - RESPONSE BODIES ARE NEVER LOGGED (decided 2026-08-14, when security alerts were collected).
-  `GitHubClient.request` logs the status, the URL and the BYTE COUNT at DEBUG, deliberately not
+  `GitHubClient.log_outcome` logs the status, the URL and the BYTE COUNT at DEBUG, deliberately not
   `response.text`: secret-scanning alert records carry the literal detected credential in a `secret`
   field, so one debug run would copy live keys out of GitHub's access controls into a plain file on
   disk. The byte count is enough to tell an empty page from a full one. DO NOT "restore" the body
-  for diagnostics — add a targeted, redacted log at the call site that needs it instead.
+  for diagnostics — add a targeted, redacted log at the call site that needs it instead. A FAILED
+  RESPONSE LOGS GITHUB'S OWN `message` AND NOTHING ELSE OF THE BODY (`failure_message`), which is the
+  single exception and the reason a 403 is diagnosable at all — see "Run logging" above.
 - Merger identity is NOT collected and NOT relevant. "Who clicked merge" was explicitly rejected;
   the signal is `unreviewed-merge` — no eligible independent review by merge time.
 - Cohort: EVERY MERGE INTO THE DEFAULT BRANCH in a half-open UTC window `[starts_at, ends_at)` —
@@ -1196,6 +1332,10 @@ in the COLLECTION report — which is a per-run summary, already carrying per-ru
 repository state, which describes the repository rather than the run. A log line was considered and
 rejected: the table has to be diffable and pasteable to be argued with, and the run that most needs
 its cost read is the one nobody thought to keep the logs of.
+AMENDED 2026-08-29: the same figures are now ALSO logged live, one line per repository per phase, from
+the same `CostMeter` reading (see "Run logging"). That does not reopen the ruling. The line reports
+PROGRESS, cannot be diffed and is gone with the terminal; the `costs` table stays the reported figure,
+and both are still absent from the evidence report and from stored repository state.
 
 This measures; it does not optimise. The priority order above is unchanged, and the performance task
 it eventually justifies must be written against the repository the measured table blames.
@@ -1296,7 +1436,10 @@ carries the per-family answer for all 14 configured repositories, so the table t
 asked for already existed as a by-product of ordinary use. Of 14: `dependabot` readable on 3,
 `code-scanning` on 1 with 2 more reporting the feature simply not enabled, `secret-scanning` on 1.
 The "reports the reason, never zeroes" path has therefore now met real 403s in production, on 11
-repositories, and is no longer exercised by tests alone.
+repositories, and is no longer exercised by tests alone. RE-READ AFTER 2026-08-29: most 403s of that
+shape carry a feature-disabled message and are now observations rather than failures, so the 11 above
+measures alert ACCESS, not the failure path — that path is met by whatever 403 the phrase list does
+not recognise.
 
 WHY THOSE THREE, AND THE RULE IT ESTABLISHES. The readable repositories are not a random three. A
 fine-grained PAT cannot exceed the access of the USER who owns it — its permission list is a

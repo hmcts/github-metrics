@@ -33,6 +33,7 @@ from metrics.domain import (
     SourceCoverage,
 )
 from metrics.github import GitHubClient, GitHubError
+from metrics.progress import log_progress
 from metrics.storage import (
     cache_direct_commit_facts,
     cache_pull_request_facts,
@@ -1071,6 +1072,24 @@ def collect_repository_window(
         )
 
 
+def window_progress(result: BehaviourProvenance | RepositoryInventoryIssue) -> str:
+    """Say in one clause how one repository's window was satisfied, or why it was not.
+
+    The intervals of both windowed sources are counted TOGETHER and the reuse verdict is taken from
+    the total rather than from `stable_history` alone: pull requests and direct commits are cached
+    under separate coverage, so a repository can reuse every settled pull-request interval while
+    still paying for commit ones, and reporting that as "fully reused" would tell a reader the
+    window cost nothing when the figures beside it say otherwise.
+    """
+    if isinstance(result, RepositoryInventoryIssue):
+        return f"window unavailable: {result.reason.value.replace('_', ' ')}"
+    intervals = result.stable_intervals_fetched + result.direct_commit_intervals_fetched
+    if not intervals:
+        return "window fully reused"
+    reuse = "fetched" if result.stable_history is CacheStatus.FETCHED else "partially reused"
+    return f"window {reuse} {intervals} interval{'' if intervals == 1 else 's'}"
+
+
 def collect_window(
     configuration: Configuration,
     client: GitHubClient,
@@ -1086,11 +1105,14 @@ def collect_window(
     """
     results: list[tuple[RepositoryInventoryItem, BehaviourProvenance | RepositoryInventoryIssue]] = []
     costs = inventory.costs
-    for item in inventory.repositories:
+    for position, item in enumerate(inventory.repositories, start=1):
         meter = CostMeter(client)
         with meter.measure():
-            results.append((item, collect_repository_window(configuration, client, item, window, reference)))
-        costs += (meter.cost(item.repository.name),)
+            result = collect_repository_window(configuration, client, item, window, reference)
+        results.append((item, result))
+        cost = meter.cost(item.repository.name)
+        log_progress(position, len(inventory.repositories), cost, window_progress(result))
+        costs += (cost,)
     repositories = tuple(
         item.model_copy(update={"collection": result}) if isinstance(result, BehaviourProvenance) else item
         for item, result in results

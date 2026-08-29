@@ -1,6 +1,7 @@
 """Test GitHub REST and GraphQL API access."""
 
 import logging
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,7 +10,7 @@ from requests import HTTPError, Response, Session
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
 from metrics.domain import AvailabilityReason
-from metrics.github import GitHubClient, GitHubError, RateLimitBudget
+from metrics.github import CallOutcome, GitHubClient, GitHubError, RateLimitBudget, endpoint_template
 
 
 def test_get_repository_sends_authenticated_request() -> None:
@@ -75,8 +76,13 @@ def test_get_leaves_a_422_unclassified_for_every_reader_but_the_one_that_knows_i
     assert captured.value.status == 422
 
 
-def test_get_reports_network_failure() -> None:
-    """Preserve the cause of network failures."""
+def test_get_reports_network_failure(caplog: pytest.LogCaptureFixture) -> None:
+    """Preserve the cause of network failures, and say which call they happened to.
+
+    A failure that never produced a response has no URL of its own to log, so the warning carries
+    the description built before the request. Without it a run that died on read timeouts recorded
+    three timeouts and no endpoint.
+    """
     session = Session()
     pause = MagicMock()
     client = GitHubClient("secret", session, pause=pause)
@@ -88,6 +94,12 @@ def test_get_reports_network_failure() -> None:
 
     assert get.call_count == 3
     assert [call.args for call in pause.call_args_list] == [(1,), (2,)]
+    named = [
+        record
+        for record in caplog.records
+        if "GET https://api.github.com/repos/hmcts/nfdiv-case-api" in record.getMessage()
+    ]
+    assert len(named) == len(caplog.records) == 2
 
 
 def test_repository_failure_has_structured_reason() -> None:
@@ -276,8 +288,12 @@ def test_the_client_reports_the_budget_github_named_so_a_scarce_quota_can_be_pac
     assert client.budget("commit-search") is None
 
 
-def test_get_stops_retrying_rate_limit() -> None:
-    """Classify a rate limit that remains after bounded retries."""
+def test_get_stops_retrying_rate_limit(caplog: pytest.LogCaptureFixture) -> None:
+    """Classify a rate limit that remains after bounded retries, and still report the call it ended on.
+
+    The response the retries ran out on is a call like any other: it is logged once and counted, or
+    the summary of the run a rate limit killed omits the very calls that killed it.
+    """
     session = Session()
     limited = Response()
     limited.status_code = 429
@@ -285,6 +301,7 @@ def test_get_stops_retrying_rate_limit() -> None:
     pause = MagicMock()
     client = GitHubClient("secret", session, pause=pause)
     with (
+        caplog.at_level(logging.DEBUG),
         patch.object(session, "get", return_value=limited),
         pytest.raises(GitHubError, match="rate limit exceeded after 3 attempts") as captured,
     ):
@@ -292,6 +309,12 @@ def test_get_stops_retrying_rate_limit() -> None:
 
     assert captured.value.reason is AvailabilityReason.RATE_LIMITED
     assert [call.args for call in pause.call_args_list] == [(1,), (1,)]
+    # `failed`, not `refused`: a spent quota is not an access decision, and `refused` is the word
+    # reserved for the three statuses GitHub answers one with.
+    assert client.call_outcomes == {(429, "failed", "GET", "https://api.github.com/example"): 1}
+    # One line per attempt: two retry warnings, then the outcome of the response it gave up on.
+    assert [record.levelno for record in caplog.records] == [logging.WARNING] * 3
+    assert caplog.records[2].getMessage().startswith("GitHub failed 429 GET https://api.github.com/example")
 
 
 def test_get_paginated_follows_link_headers() -> None:
@@ -475,6 +498,148 @@ def test_graphql_logs_the_error_detail_it_keeps_out_of_the_report(caplog: pytest
 
     assert "NOT_FOUND: Could not resolve to a Repository with the name 'hmcts/gone'." in caplog.text
     assert '{"repository": "gone"}' in caplog.text
+    # Only a refusal has an equivalent status: a repository that was renamed is not a 403, and
+    # `COLLECTION_FAILED` names no status a reader would search a log for.
+    assert "GitHub errors 200 POST" in caplog.text
+    assert "equivalent" not in caplog.text
+
+
+def test_a_graphql_failure_is_counted_rather_than_hidden_inside_the_successes() -> None:
+    """Count a query GitHub refused as a failure, though HTTP answered it 200.
+
+    THE BUG THIS EXISTS FOR. A GraphQL failure arrives as HTTP 200 with an `errors` array, and the
+    status was read on its own: one run reported `2158 200 ok POST /graphql` and no GraphQL problem
+    whatever, when 181 of those calls had failed FORBIDDEN and cost the run 181 repository windows.
+
+    Counted at the 403 the refusal IS, beside the refusals of the REST endpoints, rather than at the
+    200 GitHub wrapped it in — which is the status nobody looking for a permission problem searches.
+    """
+    session = Session()
+    refused = MagicMock(status_code=200, headers={}, content=b"{}")
+    refused.json.return_value = {"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]}
+    answered = MagicMock(status_code=200, headers={}, content=b"{}")
+    answered.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
+    client = GitHubClient("secret", session)
+
+    with patch.object(session, "post", side_effect=[answered, refused]):
+        client.graphql("query { repository { name } }", {"repository": "cath-service"})
+        with pytest.raises(GitHubError, match="GitHub GraphQL returned errors"):
+            client.graphql("query { repository { name } }", {"repository": "hidden"})
+
+    assert client.call_outcomes == {
+        (200, "ok", "POST", "https://api.github.com/graphql"): 1,
+        (403, "errors", "POST", "https://api.github.com/graphql"): 1,
+    }
+
+
+def test_a_graphql_failure_logs_one_warning_carrying_the_variables_it_failed_for(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report the failure once, under the status and word it is counted by, naming the repository.
+
+    One line, not two: the errors used to be logged by `graphql` on top of the `200 ok` line
+    `log_outcome` had already written, so one failed call said it had worked and then said it had not.
+
+    `403 (equivalent)` rather than `403`, because HTTP did not return one — but it IS greppable for
+    `403`, which is how a permission problem is looked for in a log of twenty thousand calls.
+    """
+    session = Session()
+    refused = MagicMock(status_code=200, headers={}, content=b"{}")
+    refused.json.return_value = {"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]}
+    client = GitHubClient("secret", session)
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch.object(session, "post", return_value=refused),
+        pytest.raises(GitHubError, match="GitHub GraphQL returned errors"),
+    ):
+        client.graphql("query { repository { name } }", {"repository": "hidden"})
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.WARNING,
+            (
+                "GitHub errors 403 (equivalent) POST https://api.github.com/graphql "
+                '{"repository": "hidden"}: FORBIDDEN: Resource not accessible'
+            ),
+        ),
+    ]
+
+
+def test_repeated_graphql_errors_are_counted_rather_than_written_out_one_by_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report each kind of error once with its count, keeping a rare kind above a common one.
+
+    GitHub returns one error per node it will not answer for, so a single search returned the same
+    FORBIDDEN sentence 76 times and one run wrote it out 6,880 times. The 76th copy says nothing the
+    first did, and the error that appears once is the one worth reading.
+    """
+    session = Session()
+    refused = MagicMock(status_code=200, headers={}, content=b"{}")
+    refused.json.return_value = {
+        "errors": [
+            {"type": "NOT_FOUND", "message": "Could not resolve to a User"},
+            *({"type": "FORBIDDEN", "message": "Resource not accessible"} for _ in range(76)),
+        ],
+    }
+    client = GitHubClient("secret", session)
+
+    with (
+        caplog.at_level(logging.WARNING),
+        patch.object(session, "post", return_value=refused),
+        pytest.raises(GitHubError, match="GitHub GraphQL returned errors"),
+    ):
+        client.graphql("query { repository { name } }", {"repository": "hidden"})
+
+    summarised = "NOT_FOUND: Could not resolve to a User; FORBIDDEN: Resource not accessible (x76)"
+    assert caplog.text.count("Resource not accessible") == 1
+    assert caplog.records[0].getMessage().endswith(summarised)
+
+
+def test_a_graphql_body_that_is_not_a_json_object_carries_no_counted_errors() -> None:
+    """Grade only an `errors` array as a failure this classified, leaving the rest to `graphql`.
+
+    A body that is not JSON, or that is not an object at all, is a failure `graphql` raises on. The
+    outcome does not claim to have read errors it never saw.
+    """
+    session = Session()
+    client = GitHubClient("secret", session)
+    unreadable = MagicMock(status_code=200, headers={}, content=b"[]")
+    unreadable.json.return_value = []
+    invalid = MagicMock(status_code=200, headers={}, content=b"{")
+    invalid.json.side_effect = RequestsJSONDecodeError("invalid", "{", 1)
+
+    assert client.graphql_body_failure(unreadable) is None
+    assert client.graphql_body_failure(invalid) is None
+
+
+def test_a_bad_gateway_is_a_failed_call_rather_than_a_refused_one(caplog: pytest.LogCaptureFixture) -> None:
+    """Keep `refused` for an access decision: nobody refused a 502.
+
+    A bad gateway was counted under the word reserved for a token that may not look, which reads in
+    the summary as a permission problem to chase rather than the transient it is. It is retried
+    first — three attempts — and only the response those ended on is counted.
+    """
+    session = Session()
+    unavailable = MagicMock(status_code=502, headers={}, text="", url="https://api.github.com/graphql")
+    unavailable.raise_for_status.side_effect = HTTPError(response=unavailable)
+    unavailable.json.return_value = {}
+    pause = MagicMock()
+    client = GitHubClient("secret", session, pause=pause)
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch.object(session, "post", return_value=unavailable) as post,
+        pytest.raises(GitHubError, match="GitHub returned HTTP 502") as captured,
+    ):
+        client.graphql("query { viewer { login } }")
+
+    assert captured.value.reason is AvailabilityReason.COLLECTION_FAILED
+    assert post.call_count == 3
+    assert [call.args for call in pause.call_args_list] == [(1,), (2,)]
+    assert client.call_outcomes == {(502, "failed", "POST", "https://api.github.com/graphql"): 1}
+    assert caplog.records[-1].getMessage().startswith("GitHub failed 502 POST https://api.github.com/graphql")
 
 
 @pytest.mark.parametrize(
@@ -499,6 +664,35 @@ def test_graphql_honors_rate_limit_headers(headers: dict[str, str], clock: int, 
     pause.assert_called_once_with(delay)
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"},
+        {"x-ratelimit-remaining": "0"},
+    ],
+)
+def test_graphql_survives_rate_limit_headers_it_cannot_read_as_numbers(headers: dict[str, str]) -> None:
+    """Fall back to the flat wait when GraphQL's delay headers are unusable, rather than crashing.
+
+    The same two shapes `rate_limit_delay` already guards against, on the path that reaches GitHub's
+    GraphQL rate limit: `retry-after` may be an HTTP-date, and `x-ratelimit-reset` can be missing
+    from the very response whose remaining count is `0`. Unguarded, both raised out of `request`'s
+    `retry_delay` call as a ValueError or KeyError — neither of which is a `GitHubError`, so a header
+    this client merely could not parse ended the whole collection in a traceback.
+    """
+    session = Session()
+    limited = MagicMock(status_code=200, headers=headers)
+    limited.json.return_value = {"errors": [{"type": "RATE_LIMITED"}]}
+    success = MagicMock(status_code=200)
+    success.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
+    pause = MagicMock()
+    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    with patch.object(session, "post", side_effect=[limited, success]):
+        client.graphql("query { viewer { login } }")
+
+    pause.assert_called_once_with(60)
+
+
 def test_graphql_stops_retrying_rate_limit() -> None:
     """Classify a GraphQL rate limit that remains after bounded retries."""
     session = Session()
@@ -515,6 +709,10 @@ def test_graphql_stops_retrying_rate_limit() -> None:
     assert captured.value.reason is AvailabilityReason.RATE_LIMITED
     assert post.call_count == 3
     assert [call.args for call in pause.call_args_list] == [(60,), (60,)]
+    # Counted at the status HTTP answered, under the outcome the BODY answered: a GraphQL rate limit
+    # arrives inside a 200, and counting it `ok` would report the call that killed the run as one
+    # that worked.
+    assert client.call_outcomes == {(200, "errors", "POST", "https://api.github.com/graphql"): 1}
 
 
 def test_client_preserves_resource_specific_rate_limit_reserve() -> None:
@@ -677,6 +875,178 @@ def test_the_client_counts_a_call_that_failed() -> None:
     assert client.requests_issued == 1
 
 
+def refused_response(message: str) -> MagicMock:
+    """Build one 403 carrying GitHub's own message, with no rate-limit signal in it."""
+    response = MagicMock(status_code=403, headers={}, text="", url="https://api.github.com/example")
+    response.raise_for_status.side_effect = HTTPError(response=response)
+    response.json.return_value = {"message": message}
+    return response
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Code Security must be enabled for this repository to use code scanning.",
+        "Dependabot alerts are disabled for this repository.",
+        "Advanced Security is disabled for this repository.",
+        "Secret scanning is not enabled for this repository.",
+        "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+    ],
+)
+def test_a_403_that_says_the_feature_is_off_is_not_a_refusal(message: str) -> None:
+    """Read GitHub's "the feature is off" 403 as a disabled feature, not as a permission denial.
+
+    THE BUG THIS EXISTS FOR. Across 1850 repositories every single 403 was one of these messages —
+    830 code scanning, 113 Dependabot, 2 plan-limited — and not one was a genuine refusal. Grading
+    them all as refusals exited the run 3 and buried any real permission problem among 945 that were
+    not one.
+    """
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        patch.object(session, "get", return_value=refused_response(message)),
+        pytest.raises(GitHubError) as captured,
+    ):
+        client.get("https://api.github.com/example")
+
+    assert captured.value.reason is AvailabilityReason.FEATURE_DISABLED
+    assert captured.value.status == 403
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Resource not accessible by personal access token",
+        (
+            "Although you appear to have the correct authorization credentials, the `hmcts` organization "
+            "has an IP allow list enabled, and 10.0.0.1 is not permitted to access this resource."
+        ),
+        "Sorry, this feature is temporarily unavailable.",
+    ],
+)
+def test_a_403_this_client_does_not_recognise_stays_a_refusal(message: str) -> None:
+    """Fail towards the refusal: an unlisted message is reported, never quietly excused.
+
+    The phrases are anchored on `for this repository` so an organisation-level refusal can never
+    match one, and a disabled message nobody listed is graded as a refusal — which a human reads in
+    the log and adds. The reverse direction would hide a real refusal behind a phrase we guessed at.
+    """
+    session = Session()
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        patch.object(session, "get", return_value=refused_response(message)),
+        pytest.raises(GitHubError, match="GitHub permission denied") as captured,
+    ):
+        client.get("https://api.github.com/example")
+
+    assert captured.value.reason is AvailabilityReason.PERMISSION_DENIED
+
+
+def test_a_successful_call_logs_one_debug_line(caplog: pytest.LogCaptureFixture) -> None:
+    """Emit one line per call, naming what was asked for and how much came back."""
+    session = Session()
+    response = MagicMock(status_code=200, headers={}, content=b'[{"number": 1}]')
+    client = GitHubClient("secret", session)
+    with caplog.at_level(logging.DEBUG), patch.object(session, "get", return_value=response):
+        client.get("https://api.github.com/repos/hmcts/cath-service/rulesets/17187159")
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.DEBUG,
+            "GitHub ok 200 GET https://api.github.com/repos/hmcts/cath-service/rulesets/17187159 (15 bytes)",
+        ),
+    ]
+
+
+def test_a_disabled_feature_logs_one_debug_line_beside_the_calls_that_worked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep a disabled feature out of the warnings, so a 403 at INFO is always a real access problem."""
+    session = Session()
+    disabled = refused_response("Code Security must be enabled for this repository to use code scanning.")
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch.object(session, "get", return_value=disabled),
+        pytest.raises(GitHubError),
+    ):
+        client.get("https://api.github.com/repos/hmcts/jaia-client/code-scanning/alerts", {"state": "open"})
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.DEBUG,
+            (
+                "GitHub disabled 403 GET https://api.github.com/repos/hmcts/jaia-client/code-scanning/alerts"
+                "?state=open: Code Security must be enabled for this repository to use code scanning."
+            ),
+        ),
+    ]
+
+
+def test_a_refused_call_logs_one_warning_line_and_no_other(caplog: pytest.LogCaptureFixture) -> None:
+    """Report a genuine refusal once, at the level a run is read at.
+
+    Three of the four lines a failed call used to emit were ours — a pre-request line, a response
+    line and this warning — which is what made a 1850-repository log unreadable.
+    """
+    session = Session()
+    refused = refused_response("Resource not accessible by personal access token")
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch.object(session, "get", return_value=refused),
+        pytest.raises(GitHubError),
+    ):
+        client.get("https://api.github.com/repos/hmcts/x/secret-scanning/alerts")
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.WARNING,
+            (
+                "GitHub refused 403 GET https://api.github.com/repos/hmcts/x/secret-scanning/alerts: "
+                "Resource not accessible by personal access token"
+            ),
+        ),
+    ]
+
+
+def test_a_graphql_call_names_the_repository_its_variables_carry(caplog: pytest.LogCaptureFixture) -> None:
+    """Log the variables of a GraphQL call: every one is a POST to the same URL, so nothing else names it."""
+    session = Session()
+    response = MagicMock(status_code=200, headers={}, content=b"{}")
+    response.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
+    client = GitHubClient("secret", session)
+    with caplog.at_level(logging.DEBUG), patch.object(session, "post", return_value=response):
+        client.graphql("query { viewer { login } }", {"organization": "hmcts", "repository": "cath-service"})
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.DEBUG,
+            (
+                'GitHub ok 200 POST https://api.github.com/graphql {"organization": "hmcts", '
+                '"repository": "cath-service"} (2 bytes)'
+            ),
+        ),
+    ]
+
+
+def test_a_retried_call_logs_its_retry_warning_rather_than_an_outcome_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log one line per attempt: a retried response is reported by the retry warning, not twice."""
+    session = Session()
+    unavailable = MagicMock(status_code=503, headers={}, text="", content=b"")
+    success = MagicMock(status_code=200, headers={}, content=b"{}")
+    client = GitHubClient("secret", session, pause=MagicMock())
+    with caplog.at_level(logging.DEBUG), patch.object(session, "get", side_effect=[unavailable, success]):
+        client.get("https://api.github.com/example")
+
+    levels = [record.levelno for record in caplog.records]
+    assert levels == [logging.WARNING, logging.DEBUG]
+    assert "GitHub returned HTTP 503" in caplog.records[0].getMessage()
+    assert caplog.records[1].getMessage() == "GitHub ok 200 GET https://api.github.com/example (2 bytes)"
+
+
 def test_the_client_counts_a_retried_call_once() -> None:
     """Count calls issued rather than HTTP round trips, so a retry is not read as more work."""
     session = Session()
@@ -689,3 +1059,106 @@ def test_the_client_counts_a_retried_call_once() -> None:
 
     assert post.call_count == 2
     assert client.requests_issued == 1
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (
+            "https://api.github.com/repos/hmcts/nfdiv-case-api",
+            "https://api.github.com/repos/{organization}/{repository}",
+        ),
+        (
+            "https://api.github.com/orgs/hmcts/rulesets/17187159",
+            "https://api.github.com/orgs/{organization}/rulesets/{id}",
+        ),
+        (
+            "https://api.github.com/repos/hmcts/cath-service/branches/master/protection",
+            "https://api.github.com/repos/{organization}/{repository}/branches/{branch}/protection",
+        ),
+        (
+            "https://api.github.com/repos/hmcts/cath-service/commits/3fa85f64571b4ee2a1c9d3f8e7b6a2c1d0e9f8a7",
+            "https://api.github.com/repos/{organization}/{repository}/commits/{sha}",
+        ),
+        (
+            "https://api.github.com/repos/hmcts/jaia-client/code-scanning/alerts?state=open&per_page=100&page=3",
+            (
+                "https://api.github.com/repos/{organization}/{repository}/code-scanning/alerts"
+                "?state=open&per_page=100&page={page}"
+            ),
+        ),
+        (
+            "https://api.github.com/repos/hmcts/jaia-client/issues?after=Y3Vyc29yOjE%3D&per_page=100",
+            "https://api.github.com/repos/{organization}/{repository}/issues?after={after}&per_page=100",
+        ),
+        ("https://api.github.com/graphql", "https://api.github.com/graphql"),
+        ("https://api.github.com/rate_limit", "https://api.github.com/rate_limit"),
+    ],
+)
+def test_an_endpoint_is_templated_by_the_values_its_url_carries(target: str, expected: str) -> None:
+    """Replace the organisation, repository, id, branch, commit and page a URL names, and nothing else.
+
+    Without this, one endpoint read once per repository is 1850 endpoints in a summary, and the page
+    a paginated read stopped on splits it further still. A commit SHA fragments it just as badly and
+    is never repeated: the Sonar mapping confirms a declared key against one, once per repository.
+    """
+    assert endpoint_template(target) == expected
+
+
+def test_two_repositories_reading_one_endpoint_are_counted_as_one() -> None:
+    """Count what GitHub was asked for rather than who it was asked about.
+
+    The point of the summary: 830 repositories with code scanning switched off is one line, and the
+    one call that was genuinely refused is another — at the same status, told apart by the outcome.
+    """
+    session = Session()
+    repository = MagicMock(status_code=200, headers={}, content=b"{}")
+    disabled = refused_response("Dependabot alerts are disabled for this repository.")
+    refused = refused_response("Resource not accessible by personal access token")
+    client = GitHubClient("secret", session, pause=MagicMock())
+
+    with patch.object(session, "get", side_effect=[repository, repository, disabled, refused]):
+        client.get_repository("hmcts", "cath-service")
+        client.get_repository("hmcts", "nfdiv-case-api")
+        for name in ("cath-service", "nfdiv-case-api"):
+            with pytest.raises(GitHubError):
+                client.get(f"https://api.github.com/repos/hmcts/{name}/dependabot/alerts", {"state": "open"})
+
+    alerts = "https://api.github.com/repos/{organization}/{repository}/dependabot/alerts?state=open"
+    assert client.call_outcomes == {
+        (200, "ok", "GET", "https://api.github.com/repos/{organization}/{repository}"): 2,
+        (403, "disabled", "GET", alerts): 1,
+        (403, "refused", "GET", alerts): 1,
+    }
+
+
+def test_a_graphql_call_is_counted_without_the_variables_that_name_its_repository() -> None:
+    """Collapse GraphQL to its one URL: the variables are in the log line, not in the counted endpoint."""
+    session = Session()
+    response = MagicMock(status_code=200, headers={}, content=b"{}")
+    response.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
+    client = GitHubClient("secret", session)
+
+    with patch.object(session, "post", return_value=response):
+        client.graphql("query { repository { name } }", {"organization": "hmcts", "repository": "cath-service"})
+        client.graphql("query { repository { name } }", {"organization": "hmcts", "repository": "nfdiv-case-api"})
+
+    assert client.call_outcomes == {(200, "ok", "POST", "https://api.github.com/graphql"): 2}
+
+
+def test_the_counted_outcomes_cannot_be_rewritten_by_a_reader() -> None:
+    """Hand out a copy: a caller that could decrement this would be rewriting the record of a run.
+
+    The mapping handed back is emptied itself, cast past its read-only type the way a careless
+    caller reaches past it. Copying it first and emptying the copy would pass whatever the property
+    returned, which is the one thing this test exists to tell apart.
+    """
+    session = Session()
+    response = MagicMock(status_code=200, headers={}, content=b"{}")
+    client = GitHubClient("secret", session)
+
+    with patch.object(session, "get", return_value=response):
+        client.get_repository("hmcts", "cath-service")
+    cast("dict[CallOutcome, int]", client.call_outcomes).clear()
+
+    assert sum(client.call_outcomes.values()) == 1

@@ -13,7 +13,7 @@ import pytest
 from requests import ConnectionError as RequestsConnectionError
 from requests import Response
 
-from metrics.cli import INCOMPLETE_RUN, main
+from metrics.cli import INCOMPLETE_RUN, log_call_summary, main
 from metrics.config import load_configuration
 from metrics.domain import (
     AlertSeverity,
@@ -511,6 +511,203 @@ def test_collect_exits_one_and_still_says_why_when_nothing_could_be_collected(
     assert output["status"] == "failed"
     assert output["repositories"] == []
     assert len(output["failures"]) == 3
+
+
+def pair_configuration_path(tmp_path: Path) -> Path:
+    """Configure two repositories, so one endpoint read for both can be seen counted as one line."""
+    path = tmp_path / "metrics.yaml"
+    path.write_text(
+        """\
+version: 1
+organization: hmcts
+database: metrics.sqlite3
+teams:
+  - identifier: opal
+    display_name: Opal
+    repositories:
+      - opal-common-lib
+      - opal-logging-service
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def alert_403(message: str) -> Response:
+    """Build the 403 an alert endpoint answers with, carrying GitHub's own explanation of it."""
+    response = Response()
+    response.status_code = 403
+    response._content = json.dumps({"message": message}).encode()  # noqa: SLF001
+    return response
+
+
+def empty_alert_page() -> MagicMock:
+    """Build one alert family's answer of no open alerts at all."""
+    response = MagicMock(status_code=200, links={})
+    response.json.return_value = []
+    return response
+
+
+def partly_refused_repository_responses(name: str) -> list[object]:
+    """Build one repository's current-state calls with a disabled family beside a refused one.
+
+    The two 403s are the pair the summary exists to keep apart: GitHub answers the same status for a
+    feature nobody turned on and for a token that may not look, and only its message tells them
+    apart.
+    """
+    metadata, rules, protection, *_ = collectable_repository_responses(name)
+    return [
+        metadata,
+        rules,
+        protection,
+        alert_403("Dependabot alerts are disabled for this repository."),
+        empty_alert_page(),
+        alert_403("Resource not accessible by personal access token"),
+    ]
+
+
+def call_summary(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return every line of the one end-of-run summary the run logged."""
+    summaries = [record.getMessage() for record in caplog.records if record.getMessage().startswith("GitHub calls")]
+    assert len(summaries) == 1
+    return summaries[0].splitlines()
+
+
+def test_the_call_summary_pads_its_columns_and_ranks_refusals_above_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Render the counted calls as columns a person reads down, worst first.
+
+    Asserted as whole lines rather than split into fields, because the padding IS the feature: a
+    summary whose counts and outcomes do not line up is read one row at a time instead of scanned.
+    """
+    caplog.set_level(logging.INFO)
+    alerts = "https://api.github.com/repos/{organization}/{repository}/code-scanning/alerts"
+
+    log_call_summary(
+        {
+            (200, "ok", "GET", "https://api.github.com/repos/{organization}/{repository}"): 1850,
+            (403, "disabled", "GET", alerts): 830,
+            (403, "refused", "GET", "https://api.github.com/repos/{organization}/{repository}/dependabot/alerts"): 12,
+            (200, "ok", "POST", "https://api.github.com/graphql"): 1848,
+        },
+        1850,
+    )
+
+    assert caplog.records[0].getMessage().splitlines() == [
+        "GitHub calls issued for 1850 repositories:",
+        "    12  403  refused   GET https://api.github.com/repos/{organization}/{repository}/dependabot/alerts",
+        f"   830  403  disabled  GET {alerts}",
+        "  1850  200  ok        GET https://api.github.com/repos/{organization}/{repository}",
+        "  1848  200  ok        POST https://api.github.com/graphql",
+    ]
+
+
+def test_the_call_summary_ranks_a_graphql_refusal_with_the_refusals_it_is_one_of(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rank the three answers one 403 carries, and keep a bad gateway out of the refusals.
+
+    A GraphQL refusal is counted at the 403 it is equivalent to, so a single status now holds a
+    refusal, a GraphQL refusal and a feature nobody turned on — and count alone would bury the first
+    two under the third. `failed` is its own word for the same reason: nobody refused a 502.
+    """
+    caplog.set_level(logging.INFO)
+    graphql = "https://api.github.com/graphql"
+    alerts = "https://api.github.com/repos/{organization}/{repository}/code-scanning/alerts"
+
+    log_call_summary(
+        {
+            (200, "ok", "POST", graphql): 1977,
+            (403, "errors", "POST", graphql): 181,
+            (403, "disabled", "GET", alerts): 830,
+            (403, "refused", "GET", alerts): 12,
+            (502, "failed", "POST", graphql): 2,
+        },
+        1863,
+    )
+
+    assert caplog.records[0].getMessage().splitlines() == [
+        "GitHub calls issued for 1863 repositories:",
+        f"     2  502  failed    POST {graphql}",
+        f"    12  403  refused   GET {alerts}",
+        f"   181  403  errors    POST {graphql}",
+        f"   830  403  disabled  GET {alerts}",
+        f"  1977  200  ok        POST {graphql}",
+    ]
+
+
+def test_collect_summarises_every_call_by_status_outcome_and_endpoint(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Total a whole run's calls into one line per kind, worst first, whatever it spent them on.
+
+    The log holds one DEBUG line per call, which at 1850 repositories nobody reads and nobody can
+    total. This is the same record counted: two repositories reading one endpoint are one line, the
+    refused call sits above the 830 features nobody turned on, and both sit above everything that
+    worked.
+    """
+    caplog.set_level(logging.INFO)
+    configuration_path = pair_configuration_path(tmp_path)
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = [
+            *partly_refused_repository_responses("opal-common-lib"),
+            *partly_refused_repository_responses("opal-logging-service"),
+        ]
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == INCOMPLETE_RUN
+
+    lines = call_summary(caplog)
+    assert lines[0] == "GitHub calls issued for 2 repositories:"
+    repository = "https://api.github.com/repos/{organization}/{repository}"
+    alerts = "?state=open&per_page=100"
+    assert [line.split(maxsplit=3) for line in lines[1:]] == [
+        ["2", "404", "refused", f"GET {repository}/branches/{{branch}}/protection"],
+        ["2", "403", "refused", f"GET {repository}/secret-scanning/alerts{alerts}"],
+        ["2", "403", "disabled", f"GET {repository}/dependabot/alerts{alerts}"],
+        ["10", "200", "ok", "POST https://api.github.com/graphql"],
+        ["2", "200", "ok", f"GET {repository}"],
+        ["2", "200", "ok", f"GET {repository}/code-scanning/alerts{alerts}"],
+        ["2", "200", "ok", f"GET {repository}/rules/branches/{{branch}}?per_page=100"],
+    ]
+
+
+def test_collect_summarises_the_calls_of_a_run_that_could_not_store_what_it_collected(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report what a failed run spent: it writes no report, so this is the only account of its calls."""
+    caplog.set_level(logging.INFO)
+    configuration_path = pair_configuration_path(tmp_path)
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+        patch("metrics.cli.record_repository_state", side_effect=StorageError("disk full")),
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = [
+            *collectable_repository_responses("opal-common-lib"),
+            *collectable_repository_responses("opal-logging-service"),
+        ]
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 1
+
+    lines = call_summary(caplog)
+    assert lines[0] == "GitHub calls issued for 2 repositories:"
+    # The body, not just the header: a summary of a failed run that listed no calls would be no
+    # account of them at all, and this run's report never reaches stdout to be read instead.
+    counts = [int(line.split()[0]) for line in lines[1:]]
+    assert len(counts) == 7
+    assert sum(counts) == 22
 
 
 def test_prune_reports_removed_intervals(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
