@@ -2,7 +2,7 @@
 
 Durable rulings. Do not re-litigate these; if one is wrong, change it here deliberately and say why.
 Iteration plans live under [plans/](plans/), one dated file per plan (`YYYYMMDD-short-name.md`);
-completed plans are kept under [completed/](../completed/).
+completed plans are kept under [completed/](plans/completed/).
 
 Every section describes the code as it stands.
 
@@ -259,8 +259,10 @@ Three commands with disjoint responsibilities.
 evidence, and the third reports through `evidence`'s own code.)
 
 **The JSON is the contract; `--format report` is a rendering of it (2026-08-13).** `evidence --format report` prints
-the same evidence as plain ASCII and is PRESENTATION ONLY: `render.py` consumes report models and computes nothing, so
-the two renderings cannot disagree. The report shows the metric aggregates and the cohort's review-state counts beside
+the same evidence as plain ASCII and is PRESENTATION ONLY: `render.py` measures nothing and collects nothing, so
+the two renderings cannot disagree. Since 2026-08-31 it does derive presentation-only figures — how many repositories
+or people carry each label the models already state, and each count's share of the population it was counted over —
+which a reader could arrive at from the JSON by hand; nothing it prints depends on data the JSON does not carry. The report shows the metric aggregates and the cohort's review-state counts beside
 the practice report, which the default JSON does not carry — both are built at the CLI boundary from existing models
 (`BehaviourEvidenceReport`, and `PullRequestFact.reviews` via `analysis.review_state_counts`) and both are already
 emitted by a `--metric` drill-down, so the report still claims nothing the JSON cannot corroborate. A number that exists
@@ -1196,7 +1198,8 @@ or nothing". Document the behaviour; do not soften it.
 ## Scope boundaries
 
 - No dashboards. No personal rankings: the actor section lists a person's repositories and the label
-  of each, ordered alphabetically by login, and nothing scores or ranks people.
+  of each, ordered alphabetically by login within the group their labels put them under, and nothing
+  scores or ranks people.
 - Scoring and RAG labels were previously excluded; that exclusion was REVERSED on 2026-08-13 for the
   readiness assessment only — see "Readiness assessment" above. Metrics themselves stay neutral.
 - No merger-identity collection.
@@ -1213,14 +1216,40 @@ or nothing". Document the behaviour; do not soften it.
     configuration file cannot reorder a report and make two runs undiffable, and `--format report`
     opens with an index: one row per configured repository giving its team, its readiness label and
     whether the gate's rules could be read. The boundary this respects is exact — the index LISTS
-    labels, it does not COMBINE them. It carries no total, no count and no per-team verdict, because
+    labels, it does not COMBINE them. No index row carries a total or a per-team verdict, because
     each of those is the roll-up rule the user declined to choose. If it ever grows one, cut it back.
+  - A PER-LABEL COUNT IS IN SCOPE, and the no-count half of the ruling above was REVERSED on
+    2026-08-31 at the user's instruction. `--format report` now opens with a `Repository Summary`
+    block — named `Summary` until the actor block below it needed the two told apart, renamed
+    2026-09-01 — giving how many repositories carry each readiness label and each label's share of
+    the population the report covers, above the index. A DISTRIBUTION IS NOT A
+    VERDICT, which is where the line now sits: `RED 612` counts the rows a reader could count by
+    hand, while a team label, an organisation score or a worst-of rule would decide something the
+    user declined to decide. What forced it is scale — the hmcts configuration carries 1,863
+    non-archived repositories, so the index is 1,863 rows and unreadable as a shape. Still excluded,
+    unchanged: any combined label, any per-team figure, any score, and any ordering of teams or
+    people by what they carry.
+    All four labels print at every run, zero included, so the block diffs line for line; the two
+    non-labels the index column can hold — `not assessed`, `unavailable` — print only where something
+    carries them, because a zero there is the absence of a state rather than a count of one. Each
+    row's percentage is over every repository the report covers, the ones that reported and the ones
+    that could not, so the counts account for all of it. Each share is rounded to a tenth on its own,
+    so the printed column can read 99.9 or 100.1 rather than exactly a hundred — the counts are what
+    reconcile against the index, not the shares. A report covering nothing prints dashes rather than
+    a `0%` it never divided, and a count too small to round to a tenth prints `<0.1%` rather than a
+    `0%` that would read as a row nobody is in.
   - THE PER-ACTOR LISTING IS IN SCOPE, and was built on 2026-08-28. The evidence report closes with
     one line per person who authored a merge into a reported repository, giving each repository they
     contributed to and its readiness label. It respects the same boundary the index does, and for
     the same reason: it LISTS labels and COMBINES them nowhere. A person contributing to a red
-    repository and a green one has no single readiness, so there is no per-person verdict, no
-    worst-label summary and no count of people. The rulings that hold it in place:
+    repository and a green one has no single readiness, so there is no per-person verdict and no
+    worst-label summary. Since 2026-09-01 THE RENDERED SECTION IS GROUPED: each line prints under the
+    Enable, Review or Blocked name the entry below puts its combination of labels under, groups in
+    that order with `Ungrouped` last, alphabetical login order kept within each group and a group
+    nobody is in left out rather than printed empty. The group name is still not a per-person verdict:
+    it names what to do next about a combination of labels, and the line beneath it lists the labels
+    unchanged. The count of people that ruling once excluded is now reported too — see the entry
+    below. The rulings that hold it in place:
     - `contributions` and `blocking` are per repository. `blocking` re-reports the occurrences a
       practice rule already found there, and one repository's findings never reach another's row.
       The evidence and the practice report are paired at the point of construction in
@@ -1233,8 +1262,58 @@ or nothing". Document the behaviour; do not soften it.
     - The label groups on a rendered line are ordered by the contributions behind them. That sum is
       an ORDERING KEY and is never printed; it is per person within one line and combines nothing
       across the report. If it is ever reported as a figure, cut it back.
-    - Actors are ordered alphabetically by case-folded login, never by blocking count. Ordering
-      people by what they blocked is the personal ranking this boundary excludes.
+    - Actors are ordered alphabetically by case-folded login within their group, never by blocking
+      count. Ordering people by what they blocked is the personal ranking this boundary excludes, and
+      the groups are ordered by the ruling that names them rather than by anything a person did.
+    - `cannot_assess` REPOSITORIES ARE LEFT OUT OF THE RENDERED SECTION, by the user's instruction of
+      2026-08-31. The label reports that a half of the question could not be read — most often a
+      merge gate a non-administrator cannot see — so beside a person's name it names somebody else's
+      missing permission, and across hmcts it names it for most repositories most people work in,
+      crowding out the labels the section exists to show. Two consequences kept deliberately: a
+      person left with no other repository gets NO LINE, because a name with no label beside it reads
+      as a finding about them, and the heading says the exclusion outright, so a shortened list is
+      never read as the whole of somebody's work. RENDERING ONLY — `actors` in the JSON, the index
+      and the repository blocks are all unchanged, and the counts in `Repository Summary` still cover
+      the whole population. It is `render.actor_repositories`, the one place to change if it is ever
+      reversed, and the counts in `Actor Summary` are taken from what it returns, so no combination
+      can carry `CANNOT_ASSESS` and nobody it leaves with no repository is counted.
+  - A PER-COMBINATION ACTOR COUNT IS IN SCOPE, AND ITS GROUPS CARRY SUBTOTALS (2026-09-01, at the
+    user's instruction). `--format report` prints an `Actor Summary` block immediately above the
+    actor list — mirroring `Repository Summary` sitting immediately above the index — counting how
+    many people carry each combination of readiness labels, with each count's share of the people the
+    section reports. Multiplicity is not part of a combination: `RED x 6` and `RED` say the same
+    thing about a person, so they are one row, and splitting them would divide the population by how
+    many repositories somebody happens to author in. This is the count of people the entry above
+    excluded, so it is a REVERSAL of that ruling and dated as one, admitted on the same grounds the
+    per-label count was — a distribution is not a verdict.
+    The combinations are grouped under three named actions. The table is a RULING about what to do
+    next rather than a property of the labels, which is why it is written out rather than derived:
+
+    | group | combinations |
+    | --- | --- |
+    | `Enable` | `GREEN`; `GREEN, AMBER` |
+    | `Review` | `AMBER`; `GREEN, AMBER, RED`; `GREEN, RED` |
+    | `Blocked` | `AMBER, RED`; `RED` |
+
+    `GREEN, AMBER` enables while `AMBER` alone is reviewed, which no severity or ordering of the
+    labels yields. All seven non-empty subsets of the three graded labels are mapped, so only a
+    combination carrying `NOT ASSESSED` reaches the `Ungrouped` fallback; a label added to
+    `ReadinessLabel` lands there too, deliberately, rather than being grouped by a guess.
+    EACH GROUP PRINTS ITS OWN SUBTOTAL, by the user's instruction of the same day. A subtotal is a
+    roll-up, so this is a FURTHER dated reversal of the no-roll-up ruling above, and it admits
+    exactly one thing: a count of people per named action. Still excluded, unchanged — no per-team
+    figure, no score, no verdict on any individual, and no ordering of people by what they carry. The
+    seven listed rows print at every run, zero included, so two runs diff line for line; `Ungrouped`
+    and its rows print only where something carries them, because it is not one of the actions the
+    user named and an empty heading would offer a fourth.
+    PERCENTAGES ARE ON THE TWO SUMMARY BLOCKS ONLY. `Repository Summary` takes its share of every
+    repository the report covers, `Actor Summary` of the people the actor section reports. The
+    `Review breakdown`, the `Cohort` and the metric classification counts were left alone on purpose:
+    each already prints its own denominator beside it.
+    `render.actor_combination` and the `render.ACTOR_GROUPS` table are THE TWO PLACES TO CHANGE if
+    the grouping is ever revised — the first decides what counts as one combination, the second which
+    action it falls under. The summary block and the grouped list both read them, so neither can be
+    revised into disagreeing with the other.
   - NO CROSS-REPOSITORY AVERAGING (decided 2026-08-15, when trend measurement was admitted). AN
     AVERAGE OF DELTAS IS A ROLL-UP. This is recorded beside the entry above because the trend report
     makes the forbidden thing subtler than a team label ever did: "the org improved 12%" reads as a

@@ -1,6 +1,7 @@
 """Test the plain-text rendering of evidence reports."""
 
 from datetime import UTC, datetime, timedelta
+from itertools import combinations
 
 import pytest
 
@@ -60,7 +61,15 @@ from metrics.domain import (
     WindowProvenance,
 )
 from metrics.render import (
+    ACTOR_COMBINATION_ORDER,
+    ACTOR_GROUPS,
+    ACTOR_ROW_INDENT,
+    ACTOR_UNGROUPED,
     RepositoryDrillDown,
+    actor_combination,
+    actor_combination_counts,
+    actor_group,
+    percentage_of,
     render_practice_report,
     render_report,
     render_trend_report,
@@ -982,6 +991,11 @@ def population_drill_downs() -> dict[str, RepositoryDrillDown]:
     return {name: drill_down() for name in population_teams()}
 
 
+def labelled(label: ReadinessLabel) -> ReadinessAssessment:
+    """Build an assessment carrying one label and no conditions, for counting a population by label."""
+    return ReadinessAssessment(label=label, blocking=(), caution=(), clear=())
+
+
 def population_report(
     repositories: tuple[RepositoryPracticeEvidence, ...],
     unavailable: tuple[EvidenceUnavailable, ...] = (),
@@ -1001,10 +1015,100 @@ def population_report(
 
 def test_the_report_opens_with_an_index_of_the_repositories_it_covers(report: str) -> None:
     """Answer which repositories are assessable, which are RED and which need reading, up front."""
-    assert report.startswith("Index\n-----\n")
+    assert report.startswith("Repository Summary\n------------------\n")
+    assert "\nIndex\n-----\n" in report
     assert index_lines(report) == [
         "  Team     Repository  Readiness  Gate observed",
         "  crime  cath-service      AMBER            yes",
+    ]
+
+
+def summary_lines(rendered: str) -> list[str]:
+    """Return the summary block's lines, its heading excluded."""
+    lines = rendered.splitlines()
+    body = lines[lines.index("Repository Summary") + 2 :]
+    return body[: body.index("")]
+
+
+def test_the_summary_counts_the_repositories_carrying_each_readiness_label() -> None:
+    """Give the population's shape before the index, which at hmcts scale is thousands of rows long."""
+    rendered = population_report(
+        (
+            practice_evidence(repository="cath-service", assessment=labelled(ReadinessLabel.RED)),
+            practice_evidence(repository="opal-common-lib", assessment=labelled(ReadinessLabel.RED)),
+            practice_evidence(repository="opal-logging-service", assessment=labelled(ReadinessLabel.GREEN)),
+        ),
+    )
+
+    assert summary_lines(rendered) == [
+        "  GREEN          1  33.3%",
+        "  AMBER          0     0%",
+        "  RED            2  66.7%",
+        "  CANNOT_ASSESS  0     0%",
+    ]
+
+
+def test_the_summary_prints_every_label_including_the_ones_nobody_carries() -> None:
+    """Keep the row set fixed, so two runs diff line for line and an empty label is an observation."""
+    rendered = population_report((practice_evidence(assessment=labelled(ReadinessLabel.AMBER)),))
+
+    assert [line.split()[0] for line in summary_lines(rendered)] == ["GREEN", "AMBER", "RED", "CANNOT_ASSESS"]
+
+
+def test_the_summary_counts_the_repositories_the_index_could_not_label() -> None:
+    """Reconcile with the index's own column: an unassessed and an unavailable row are counted too."""
+    rendered = population_report(
+        (
+            practice_evidence(repository="cath-service", assessment=None),
+            practice_evidence(repository="opal-common-lib", assessment=labelled(ReadinessLabel.CANNOT_ASSESS)),
+        ),
+        (EvidenceUnavailable(repository="refused-service", detail="GitHub rate limit exceeded"),),
+    )
+
+    assert summary_lines(rendered)[3:] == [
+        "  CANNOT_ASSESS  1  33.3%",
+        "  not assessed   1  33.3%",
+        "  unavailable    1  33.3%",
+    ]
+
+
+def test_the_summary_leaves_out_the_non_labels_nothing_carries() -> None:
+    """Print no `unavailable 0`: a repository is either assessed or not, and a zero there is nothing."""
+    rendered = population_report((practice_evidence(),))
+
+    assert [line.split()[0] for line in summary_lines(rendered)] == ["GREEN", "AMBER", "RED", "CANNOT_ASSESS"]
+
+
+def test_the_summary_counts_each_label_separately_and_combines_none_of_them() -> None:
+    """Hold one row per label: a total, a score or a per-team figure is still the forbidden roll-up.
+
+    The no-count ruling was reversed for this block on 2026-08-31 — see architecture.md, "Scope
+    boundaries" — and what the reversal admitted is a distribution and nothing else.
+    """
+    rendered = population_report(
+        (
+            practice_evidence(repository="cath-service", assessment=labelled(ReadinessLabel.RED)),
+            practice_evidence(repository="opal-common-lib", assessment=labelled(ReadinessLabel.GREEN)),
+        ),
+    )
+
+    assert [line.split() for line in summary_lines(rendered)] == [
+        ["GREEN", "1", "50%"],
+        ["AMBER", "0", "0%"],
+        ["RED", "1", "50%"],
+        ["CANNOT_ASSESS", "0", "0%"],
+    ]
+
+
+def test_the_summary_prints_a_dash_where_it_covers_no_repositories_at_all() -> None:
+    """Divide nothing by nothing: a report covering no population has no share to print, only a dash."""
+    rendered = population_report(())
+
+    assert [line.split() for line in summary_lines(rendered)] == [
+        ["GREEN", "0", "-"],
+        ["AMBER", "0", "-"],
+        ["RED", "0", "-"],
+        ["CANNOT_ASSESS", "0", "-"],
     ]
 
 
@@ -1134,6 +1238,9 @@ def actor(login: str, *repositories: ActorRepositoryReadiness) -> ActorReadiness
     return ActorReadiness(actor_login=login, repositories=repositories)
 
 
+ACTORS_HEADING = "Actors (cannot_assess repositories excluded)"
+
+
 def actor_lines(rendered: str) -> list[str]:
     """Return the actor block's lines, its heading excluded.
 
@@ -1141,7 +1248,7 @@ def actor_lines(rendered: str) -> list[str]:
     so a line escaping past it would otherwise go unread by every assertion here.
     """
     lines = rendered.splitlines()
-    return lines[lines.index("Actors") + 2 :]
+    return lines[lines.index(ACTORS_HEADING) + 2 :]
 
 
 def actors_report(*actors: ActorReadiness) -> str:
@@ -1155,7 +1262,7 @@ def test_an_actor_whose_repositories_share_one_label_is_not_told_which_they_are(
         actor("bob", *(actor_repository(f"opal-service-{index}", 10 - index) for index in range(6))),
     )
 
-    assert actor_lines(rendered) == ["  bob  RED x 6"]
+    assert actor_lines(rendered) == ["  Blocked", "    bob  RED x 6"]
 
 
 def test_one_label_is_tallied_once_however_the_repositories_carrying_it_are_spread() -> None:
@@ -1169,7 +1276,7 @@ def test_one_label_is_tallied_once_however_the_repositories_carrying_it_are_spre
         ),
     )
 
-    assert actor_lines(rendered) == ["  alice  RED x 2 (project-x, project-u), GREEN (project-z)"]
+    assert actor_lines(rendered) == ["  Review", "    alice  RED x 2 (project-x, project-u), GREEN (project-z)"]
 
 
 def test_groups_are_ordered_by_the_contributions_behind_them_not_by_first_appearance() -> None:
@@ -1183,7 +1290,7 @@ def test_groups_are_ordered_by_the_contributions_behind_them_not_by_first_appear
         ),
     )
 
-    assert actor_lines(rendered) == ["  alice  RED x 2 (project-b, project-c), GREEN (project-a)"]
+    assert actor_lines(rendered) == ["  Review", "    alice  RED x 2 (project-b, project-c), GREEN (project-a)"]
 
 
 def test_two_groups_of_equal_weight_are_ordered_worst_label_first() -> None:
@@ -1192,19 +1299,56 @@ def test_two_groups_of_equal_weight_are_ordered_worst_label_first() -> None:
         actor(
             "alice",
             actor_repository("project-a", 5, ReadinessLabel.GREEN),
-            actor_repository("project-b", 5, ReadinessLabel.CANNOT_ASSESS),
+            actor_repository("project-b", 5, ReadinessLabel.AMBER),
             actor_repository("project-c", 5),
         ),
     )
 
-    assert actor_lines(rendered) == ["  alice  RED (project-c), CANNOT_ASSESS (project-b), GREEN (project-a)"]
+    assert actor_lines(rendered) == ["  Review", "    alice  RED (project-c), AMBER (project-b), GREEN (project-a)"]
+
+
+def test_a_repository_that_could_not_be_assessed_is_left_out_of_a_persons_line() -> None:
+    """Drop a label that reports somebody else's missing permission, not the work of the person named."""
+    rendered = actors_report(
+        actor(
+            "alice",
+            actor_repository("project-a", 40, ReadinessLabel.CANNOT_ASSESS),
+            actor_repository("project-b", 5, ReadinessLabel.AMBER),
+        ),
+    )
+
+    assert actor_lines(rendered) == ["  Review", "    alice  AMBER"]
+
+
+def test_a_person_working_only_in_unassessable_repositories_gets_no_line() -> None:
+    """Leave out a name with no label beside it, which would read as a finding about that person."""
+    rendered = actors_report(
+        actor("alice", actor_repository("project-a", 40, ReadinessLabel.CANNOT_ASSESS)),
+        actor("bob", actor_repository("project-b", 5, ReadinessLabel.RED)),
+    )
+
+    assert actor_lines(rendered) == ["  Blocked", "    bob  RED"]
+
+
+def test_a_section_left_empty_by_the_exclusion_says_that_rather_than_that_nobody_merged() -> None:
+    """Separate a report nobody contributed to from one whose contributors were all excluded here."""
+    rendered = actors_report(actor("alice", actor_repository("project-a", 40, ReadinessLabel.CANNOT_ASSESS)))
+
+    assert actor_lines(rendered) == [
+        "  none: every repository the reported people contributed to could not be assessed",
+    ]
+
+
+def test_the_actor_heading_says_the_unassessable_repositories_are_left_out(report: str) -> None:
+    """Name the exclusion in the report, so a shortened list is not read as the whole of somebody's work."""
+    assert f"\n{ACTORS_HEADING}\n" in report
 
 
 def test_an_actor_in_one_repository_renders_the_bare_label() -> None:
     """Print neither a count of one nor a name that distinguishes nothing."""
     rendered = actors_report(actor("carol", actor_repository("cath-service", 4, ReadinessLabel.AMBER)))
 
-    assert actor_lines(rendered) == ["  carol  AMBER"]
+    assert actor_lines(rendered) == ["  Review", "    carol  AMBER"]
 
 
 def test_a_repository_that_was_never_assessed_is_named_rather_than_left_blank() -> None:
@@ -1217,7 +1361,7 @@ def test_a_repository_that_was_never_assessed_is_named_rather_than_left_blank() 
         ),
     )
 
-    assert actor_lines(rendered) == ["  carol  NOT ASSESSED (cath-service), AMBER (other-service)"]
+    assert actor_lines(rendered) == ["  Ungrouped", "    carol  NOT ASSESSED (cath-service), AMBER (other-service)"]
 
 
 def test_an_unassessed_group_sorts_behind_the_label_it_ties_with() -> None:
@@ -1230,17 +1374,61 @@ def test_an_unassessed_group_sorts_behind_the_label_it_ties_with() -> None:
         ),
     )
 
-    assert actor_lines(rendered) == ["  carol  GREEN (other-service), NOT ASSESSED (cath-service)"]
+    assert actor_lines(rendered) == ["  Ungrouped", "    carol  GREEN (other-service), NOT ASSESSED (cath-service)"]
 
 
 def test_actors_are_rendered_one_line_each_in_the_order_the_report_lists_them() -> None:
-    """Keep the section's order the JSON's order, so the two renderings cannot disagree."""
+    """Keep the order within a group the JSON's order, so the two renderings cannot disagree."""
+    # Listed against alphabetical order, so the assertion tells order preserved from order re-sorted.
     rendered = actors_report(
+        actor("bob", actor_repository("project-x", 6)),
         actor("alice", actor_repository("project-x", 41)),
-        actor("bob", actor_repository("project-x", 6, ReadinessLabel.AMBER)),
     )
 
-    assert actor_lines(rendered) == ["  alice  RED", "  bob    AMBER"]
+    assert actor_lines(rendered) == ["  Blocked", "    bob    RED", "    alice  RED"]
+
+
+def test_the_actor_list_is_grouped_by_the_action_its_labels_put_each_person_under() -> None:
+    """Group the printed people as the summary counts them, in the order the summary reports."""
+    rendered = actors_report(
+        actor("ann", actor_repository("project-a", 8, ReadinessLabel.GREEN)),
+        actor("bea", actor_repository("project-b", 7, ReadinessLabel.AMBER)),
+        actor("cam", actor_repository("project-c", 6)),
+        actor("dee", actor_repository("project-d", 5, None)),
+    )
+
+    assert actor_lines(rendered) == [
+        "  Enable",
+        "    ann  GREEN",
+        "  Review",
+        "    bea  AMBER",
+        "  Blocked",
+        "    cam  RED",
+        "  Ungrouped",
+        "    dee  NOT ASSESSED",
+    ]
+
+
+def test_a_group_nobody_is_in_is_left_out_rather_than_printed_empty() -> None:
+    """Leave the zero to the Actor Summary: an empty heading here reads as a list that failed to render."""
+    rendered = actors_report(actor("bob", actor_repository("project-b", 5)))
+
+    assert actor_lines(rendered) == ["  Blocked", "    bob  RED"]
+
+
+def test_the_login_column_is_one_width_across_the_whole_section_not_one_per_group() -> None:
+    """Start every person's labels in one column, so two groups can be read down as one list."""
+    rendered = actors_report(
+        actor("alexandra", actor_repository("project-a", 9)),
+        actor("bo", actor_repository("project-b", 8, ReadinessLabel.GREEN)),
+    )
+
+    assert actor_lines(rendered) == [
+        "  Enable",
+        f"    {'bo':<9}  GREEN",
+        "  Blocked",
+        f"    {'alexandra':<9}  RED",
+    ]
 
 
 def test_a_report_with_no_actors_says_so_rather_than_dropping_the_section() -> None:
@@ -1248,6 +1436,300 @@ def test_a_report_with_no_actors_says_so_rather_than_dropping_the_section() -> N
     rendered = actors_report()
 
     assert actor_lines(rendered) == ["  none: no person authored a merge in the reported repositories"]
+
+
+def test_the_same_label_several_times_over_is_one_combination() -> None:
+    """Ignore multiplicity: six red repositories say what one says, and counting them apart splits one population."""
+    combination = actor_combination(tuple(actor_repository(f"opal-service-{index}", 10 - index) for index in range(6)))
+
+    assert combination == ("RED",)
+
+
+def test_a_combination_is_ordered_best_label_first_however_the_contributions_fall() -> None:
+    """Order by the labels, not by the weight the printed line leads with, so one pair of labels is one key."""
+    heavy_red = actor_combination(
+        (
+            actor_repository("project-x", 41),
+            actor_repository("project-z", 30, ReadinessLabel.GREEN),
+            actor_repository("project-u", 20),
+        ),
+    )
+    heavy_green = actor_combination(
+        (
+            actor_repository("project-a", 40, ReadinessLabel.GREEN),
+            actor_repository("project-b", 5),
+        ),
+    )
+
+    assert heavy_red == heavy_green == ("GREEN", "RED")
+
+
+def test_an_unassessed_repository_comes_last_in_a_combination() -> None:
+    """Rank the absence of a label behind every label, rather than among them as a grade between them."""
+    combination = actor_combination(
+        (
+            actor_repository("cath-service", 9, None),
+            actor_repository("other-service", 2, ReadinessLabel.AMBER),
+        ),
+    )
+
+    assert combination == ("AMBER", "NOT ASSESSED")
+
+
+@pytest.mark.parametrize(
+    ("combination", "group"),
+    [
+        (("GREEN",), "Enable"),
+        (("GREEN", "AMBER"), "Enable"),
+        (("AMBER",), "Review"),
+        (("GREEN", "AMBER", "RED"), "Review"),
+        (("GREEN", "RED"), "Review"),
+        (("AMBER", "RED"), "Blocked"),
+        (("RED",), "Blocked"),
+    ],
+)
+def test_every_graded_combination_is_grouped_as_the_user_instructed(combination: tuple[str, ...], group: str) -> None:
+    """Assert each of the seven assignments separately, so a transcription slip names the row it is in."""
+    assert actor_group(combination) == group
+
+
+def test_the_group_table_covers_every_graded_combination_exactly_once() -> None:
+    """Guard the docstring's claim that only an unassessed line can fall through to the fallback."""
+    grades = ("GREEN", "AMBER", "RED")
+    every = {subset for size in (1, 2, 3) for subset in combinations(grades, size)}
+    grouped = [combination for rows in ACTOR_GROUPS.values() for combination in rows]
+
+    assert sorted(grouped) == sorted(every)
+
+
+def test_the_group_table_names_only_labels_the_section_can_print() -> None:
+    """Catch a renamed label leaving a transcribed row unreachable, since the rows spell the labels out."""
+    named = {name for rows in ACTOR_GROUPS.values() for combination in rows for name in combination}
+
+    assert named <= set(ACTOR_COMBINATION_ORDER)
+
+
+def test_a_combination_the_table_does_not_cover_is_reported_as_ungrouped() -> None:
+    """Say a line carrying no grade is not grouped, rather than guessing an action for it."""
+    assert actor_group(("GREEN", "NOT ASSESSED")) == ACTOR_UNGROUPED
+    assert actor_group(("NOT ASSESSED",)) == ACTOR_UNGROUPED
+
+
+def test_the_people_behind_each_combination_are_counted_once_each() -> None:
+    """Count people, not repositories, so a person with six red repositories counts as one person."""
+    counted = actor_combination_counts(
+        (
+            actor("alice", actor_repository("project-x", 41), actor_repository("project-y", 3)),
+            actor("bob", actor_repository("project-x", 6, ReadinessLabel.AMBER)),
+            actor("carol", actor_repository("project-z", 2), actor_repository("project-w", 1, ReadinessLabel.GREEN)),
+        ),
+    )
+
+    assert counted == {("RED",): 1, ("AMBER",): 1, ("GREEN", "RED"): 1}
+
+
+def test_a_person_the_actor_list_leaves_out_is_left_out_of_the_counts() -> None:
+    """Count over the same repositories the lines are built from, so the counts and the lines cannot disagree."""
+    counted = actor_combination_counts(
+        (
+            actor("alice", actor_repository("project-a", 40, ReadinessLabel.CANNOT_ASSESS)),
+            actor("bob", actor_repository("project-b", 5, ReadinessLabel.AMBER)),
+        ),
+    )
+
+    assert counted == {("AMBER",): 1}
+
+
+ACTOR_SUMMARY_HEADING = "Actor Summary"
+
+
+def actor_summary_lines(rendered: str) -> list[str]:
+    """Return the actor summary block's lines, its heading excluded."""
+    lines = rendered.splitlines()
+    body = lines[lines.index(ACTOR_SUMMARY_HEADING) + 2 :]
+    return body[: body.index("")]
+
+
+def test_the_actor_summary_sits_immediately_above_the_section_it_summarises() -> None:
+    """Put the counts where the list they describe starts, as the repository counts sit above the index."""
+    rendered = whole_report()
+    lines = rendered.splitlines()
+
+    # Read from the end of the summary's own rows rather than from its heading, so the assertion is
+    # that nothing sits between the two blocks — not merely that one falls somewhere below the other.
+    summary_end = lines.index(ACTOR_SUMMARY_HEADING) + 2 + len(actor_summary_lines(rendered))
+    assert lines[summary_end : summary_end + 2] == ["", ACTORS_HEADING]
+
+
+def test_the_actor_summary_counts_the_people_carrying_each_combination_of_labels() -> None:
+    """Say how the population divides, which a list of a thousand abridged lines cannot be read for."""
+    rendered = actors_report(
+        actor("alice", actor_repository("project-x", 41)),
+        actor("bob", actor_repository("project-y", 6, ReadinessLabel.AMBER)),
+        actor("carol", actor_repository("project-z", 2), actor_repository("project-w", 1, ReadinessLabel.GREEN)),
+        actor("dave", actor_repository("project-v", 3, ReadinessLabel.GREEN)),
+    )
+
+    assert actor_summary_lines(rendered) == [
+        "  Enable               1  25%",
+        "    GREEN              1  25%",
+        "    GREEN, AMBER       0   0%",
+        "  Review               2  50%",
+        "    AMBER              1  25%",
+        "    GREEN, AMBER, RED  0   0%",
+        "    GREEN, RED         1  25%",
+        "  Blocked              1  25%",
+        "    AMBER, RED         0   0%",
+        "    RED                1  25%",
+    ]
+
+
+def test_the_actor_summary_prints_every_combination_including_the_ones_nobody_carries() -> None:
+    """Keep the row set fixed, so two runs diff line for line and an empty combination is an observation."""
+    rendered = actors_report(actor("alice", actor_repository("project-x", 41)))
+
+    assert [line.rsplit(maxsplit=2)[0].strip() for line in actor_summary_lines(rendered)] == [
+        "Enable",
+        "GREEN",
+        "GREEN, AMBER",
+        "Review",
+        "AMBER",
+        "GREEN, AMBER, RED",
+        "GREEN, RED",
+        "Blocked",
+        "AMBER, RED",
+        "RED",
+    ]
+
+
+def test_each_group_subtotals_the_combinations_printed_under_it() -> None:
+    """Give each named action its own figure, per the user's instruction of 2026-09-01."""
+    rendered = actors_report(
+        actor("alice", actor_repository("project-x", 41), actor_repository("project-w", 2, ReadinessLabel.AMBER)),
+        actor("bob", actor_repository("project-y", 6, ReadinessLabel.AMBER)),
+        actor("carol", actor_repository("project-z", 2, ReadinessLabel.GREEN), actor_repository("project-u", 1)),
+        actor("dave", actor_repository("project-t", 3, ReadinessLabel.GREEN)),
+    )
+    counted = {line.rsplit(maxsplit=2)[0].strip(): line.split()[-2] for line in actor_summary_lines(rendered)}
+
+    assert counted["Enable"] == "1"
+    assert counted["Review"] == "2"
+    assert counted["Blocked"] == "1"
+    assert sum(int(counted[name]) for name in ("Enable", "Review", "Blocked")) == 4
+
+
+def test_a_combination_the_group_table_does_not_cover_is_printed_under_ungrouped() -> None:
+    """Report a line carrying no grade where it occurs, rather than dropping the people behind it."""
+    rendered = actors_report(
+        actor("alice", actor_repository("project-x", 41)),
+        actor("bob", actor_repository("project-y", 6, None)),
+        actor("carol", actor_repository("project-z", 2, None), actor_repository("project-w", 1, ReadinessLabel.GREEN)),
+    )
+
+    assert actor_summary_lines(rendered)[-3:] == [
+        "  Ungrouped              2  66.7%",
+        "    GREEN, NOT ASSESSED  1  33.3%",
+        "    NOT ASSESSED         1  33.3%",
+    ]
+
+
+def test_the_ungrouped_group_is_left_out_where_nobody_reaches_it() -> None:
+    """Print no fourth action where the user named three: an empty heading would offer one."""
+    rendered = actors_report(actor("alice", actor_repository("project-x", 41)))
+
+    assert ACTOR_UNGROUPED not in rendered
+
+
+def test_the_actor_summary_prints_a_dash_where_the_section_reports_nobody() -> None:
+    """Divide nothing by nothing: a report nobody contributed to has no population to take a share of."""
+    rendered = actors_report()
+
+    assert actor_summary_lines(rendered) == [
+        "  Enable               0  -",
+        "    GREEN              0  -",
+        "    GREEN, AMBER       0  -",
+        "  Review               0  -",
+        "    AMBER              0  -",
+        "    GREEN, AMBER, RED  0  -",
+        "    GREEN, RED         0  -",
+        "  Blocked              0  -",
+        "    AMBER, RED         0  -",
+        "    RED                0  -",
+    ]
+
+
+def test_the_actor_summary_counts_nobody_where_every_person_is_excluded_from_the_section() -> None:
+    """Count over the people the section reports, so a report whose contributors were all excluded is empty."""
+    rendered = actors_report(actor("alice", actor_repository("project-a", 40, ReadinessLabel.CANNOT_ASSESS)))
+
+    assert {line.split()[-1] for line in actor_summary_lines(rendered)} == {"-"}
+    assert {line.split()[-2] for line in actor_summary_lines(rendered)} == {"0"}
+
+
+def test_each_group_subtotal_counts_the_people_printed_under_that_group_in_the_list() -> None:
+    """Read both blocks out of one rendering, so the count and the list it counts cannot disagree."""
+    rendered = actors_report(
+        actor("ann", actor_repository("project-a", 8, ReadinessLabel.GREEN)),
+        actor("bea", actor_repository("project-b", 7, ReadinessLabel.AMBER)),
+        actor("cam", actor_repository("project-c", 6)),
+        actor("dee", actor_repository("project-d", 5, ReadinessLabel.AMBER)),
+        actor("eve", actor_repository("project-e", 4, None)),
+    )
+    subtotals = {
+        line.rsplit(maxsplit=2)[0].strip(): int(line.rsplit(maxsplit=2)[1])
+        for line in actor_summary_lines(rendered)
+        if not line.startswith(f"  {ACTOR_ROW_INDENT}")
+    }
+    listed: dict[str, int] = {}
+    group = ""
+    for line in actor_lines(rendered):
+        if line.startswith(f"  {ACTOR_ROW_INDENT}"):
+            listed[group] += 1
+        else:
+            group = line.strip()
+            listed[group] = 0
+
+    assert listed == {"Enable": 1, "Review": 2, "Blocked": 1, "Ungrouped": 1}
+    assert {name: count for name, count in subtotals.items() if count} == listed
+
+
+def test_a_count_too_small_to_round_to_a_tenth_is_not_printed_as_a_measured_zero() -> None:
+    """Separate a row somebody is in from the zero rows beside it, as `percent` separates absent from zero."""
+    assert percentage_of(1, 3000) == "<0.1%"
+    assert percentage_of(0, 3000) == "0%"
+
+
+def whole_report() -> str:
+    """Render a practice report carrying every block, so the blocks can be read in the order they fall."""
+    return render_practice_report(
+        practice_report(
+            unavailable=(EvidenceUnavailable(repository="other-service", detail="GitHub rate limit exceeded"),),
+            actors=(actor("alice", actor_repository("project-x", 41)),),
+        ),
+        {"cath-service": drill_down()},
+        teams(),
+    )
+
+
+def test_the_report_renders_its_blocks_in_the_order_a_reader_works_down_them() -> None:
+    """Put each set of counts above the list it describes, and the repositories between the two."""
+    lines = whole_report().splitlines()
+    positions = [
+        lines.index(title)
+        for title in ("Repository Summary", "Index", "Unavailable", ACTOR_SUMMARY_HEADING, ACTORS_HEADING)
+    ]
+
+    assert positions == sorted(positions)
+    assert lines.index("Index") < lines.index("hmcts/cath-service") < lines.index("Unavailable")
+
+
+def test_every_count_in_the_two_summary_blocks_is_given_a_share_of_its_population() -> None:
+    """Report each figure against what it was counted over, so no row is read as a share of the report."""
+    rendered = whole_report()
+    counted = [line.rsplit(maxsplit=2) for line in (*summary_lines(rendered), *actor_summary_lines(rendered))]
+
+    assert counted
+    assert all(count.isdigit() and share.endswith("%") for _, count, share in counted)
 
 
 REVIEW_COVERAGE = "independent-review-coverage"

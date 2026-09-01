@@ -1412,8 +1412,15 @@ def test_evidence_renders_the_same_evidence_as_a_readable_report(
 
     report = capsys.readouterr().out
     assert "\n====================\nhmcts/nfdiv-case-api" in report
-    # The index reads every cell from the same models the block beneath it renders.
+    # The summary counts the labels the index below it lists, over the same models.
     assert report.startswith(
+        "Repository Summary\n"
+        "------------------\n"
+        "  GREEN          0    0%\n"
+        "  AMBER          0    0%\n"
+        "  RED            0    0%\n"
+        "  CANNOT_ASSESS  1  100%\n"
+        "\n"
         "Index\n"
         "-----\n"
         "  Team         Repository      Readiness  Gate observed\n"

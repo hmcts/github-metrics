@@ -842,17 +842,45 @@ tickets — for reading aloud in a meeting, which is the one thing the JSON is b
 the `evidence` report; [Trend](#trend-measuring-periods-after-enablement) describes the tables a series adds, and every
 one of them obeys the same discipline — presentation only, every figure read from the JSON.
 
-The report opens with an **index**: one line per configured repository giving the owning team, the repository, its
+The report opens with a **repository summary**: how many repositories carry each readiness label, and each label's share
+of the whole population the run covers. At fourteen repositories the index below it can be read as a shape; across hmcts
+it is 1,863 rows and cannot, so the counts come first. All four labels are printed, zero included, so two runs diff line
+for line and a label nobody carries reads as an observation rather than an omission. A repository the policy left
+unjudged adds a `not assessed` row and one whose collection failed an `unavailable` row, matching the two non-labels the
+index's own column prints; neither is shown where nothing carries it. Add the index's rows up and you arrive at these
+figures. Each percentage is over every repository the report covers — the ones that reported and the ones that could
+not — so the counts account for the whole population. Each share is rounded to a tenth on its own, so the printed column
+can read 99.9 or 100.1 rather than exactly a hundred; the counts are what reconcile against the index. A run covering no
+repositories prints dashes rather than a `0%` it never divided, and a count too small to round to a tenth prints
+`<0.1%`, so a row somebody is in never reads like the zero rows beside it.
+
+```
+Repository Summary
+------------------
+  GREEN           18   1.2%
+  AMBER          506  34.1%
+  RED            612  41.2%
+  CANNOT_ASSESS  349  23.5%
+```
+
+Below it comes the **index**: one line per configured repository giving the owning team, the repository, its
 readiness label, and whether the merge gate's rules could be read at all. It is a table of contents for a report that at
 fourteen repositories is roughly fourteen times longer than it was at one, and it answers the three questions a reader
 opens such a report with — which repositories are assessable, which are RED, and which need reading in full — before any
 scrolling. A repository whose collection failed gets a row too, reading `unavailable`, so the index covers the
 population rather than the part of it that answered. Every cell comes from the same models the block below it renders.
 
-**The index is not a roll-up.** There is no combined label, no per-team verdict, and deliberately no count or total of
-any kind. `teams` in the configuration says who owns a repository, not how several repositories reduce to one label;
-listing fourteen labels is presentation, and combining them is out of scope by decision — see
-`docs/architecture.md` under "Scope boundaries". The index exists only in `--format report`; the JSON is unchanged.
+**Neither block is a roll-up.** There is no combined label, no per-team verdict and no score anywhere: the summary counts
+each label separately and combines none of them, and no index row carries a figure. `teams` in the configuration says who
+owns a repository, not how several repositories reduce to one label; listing and counting labels is presentation, and
+combining them is out of scope by decision — see `docs/architecture.md` under "Scope boundaries", which records the
+counts as a reversal, dated 2026-08-31, of the ruling that kept them out of the index. Both blocks exist only in
+`--format report`; the JSON is unchanged.
+
+Above the actor list, mirroring where the repository summary sits above the index, comes the **actor summary**: how many
+people carry each combination of readiness labels, and each count's share of the people that section reports. See
+[Actors](#actors-the-same-evidence-read-person-by-person) for the combinations, the three named groups and what their
+subtotals do and do not claim.
 
 The report prints, per repository: a header with the resolved window and its provenance; the readiness label above
 **every** condition behind it, blocking, caution and clear alike; the cohort, the direct commits, the total merges
@@ -876,6 +904,13 @@ question `independent-review-coverage` already answers. Those same events are li
 `--metric independent-review-coverage --include-identities`.
 
 ```
+Repository Summary
+------------------
+  GREEN          1  33.3%
+  AMBER          1  33.3%
+  RED            0     0%
+  CANNOT_ASSESS  1  33.3%
+
 Index
 -----
   Team        Repository      Readiness  Gate observed
@@ -954,11 +989,26 @@ Behaviour
   description-quality          72.5%  66 of 91      -        -        -        -
   traceability-reference       58.2%  53 of 91      -        -        -        -
 
-Actors
-------
-  alice  AMBER (cath-service), CANNOT_ASSESS (unreadable-svc)
-  bob    AMBER
-  carol  GREEN
+Actor Summary
+-------------
+  Enable               1  33.3%
+    GREEN              1  33.3%
+    GREEN, AMBER       0     0%
+  Review               2  66.7%
+    AMBER              2  66.7%
+    GREEN, AMBER, RED  0     0%
+    GREEN, RED         0     0%
+  Blocked              0     0%
+    AMBER, RED         0     0%
+    RED                0     0%
+
+Actors (cannot_assess repositories excluded)
+--------------------------------------------
+  Enable
+    carol  GREEN
+  Review
+    alice  AMBER
+    bob    AMBER
 ```
 
 ### Actors: the same evidence read person by person
@@ -983,10 +1033,21 @@ exclusions. `blocking` sums the `occurrences` behind their practice findings in 
 merges count as twelve rather than as one finding; it reports what a rule already found, gathered per repository.
 `readiness` is the repository's assessed label, and is **absent** when the readiness policy is disabled — there is then
 no label to carry, and inventing one would grade a repository the report deliberately left ungraded. Actors are
-alphabetical by case-folded login, and each actor's repositories are ordered by contributions, largest first, ties
+alphabetical by case-folded login — in the JSON, and within each group of the rendered list — and each actor's
+repositories are ordered by contributions, largest first, ties
 broken by repository name. Logins are matched case-insensitively, because a GitHub login is unique
 case-insensitively — `Alice` and `alice` are one person — and are spelled as the repository they contributed most to
 spells them.
+
+**The rendered section leaves out `cannot_assess` repositories**, by instruction on 2026-08-31; the heading says so. The
+label is not a grade — it means a half of the question could not be read, most often a merge gate a non-administrator
+cannot see — so beside a person's name it reports somebody else's missing permission, and at hmcts scale it reports that
+about most repositories most people work in, crowding out the labels the section exists to show. A person left with no
+other repository gets no line, because a name with no label beside it reads as a finding about them. The exclusion is
+rendering only: those repositories are unchanged in the JSON's `actors`, in the index, and in the body of the report.
+Where it empties the whole section, the section says so in its own words — `none: every repository the reported people
+contributed to could not be assessed` — which is deliberately not the wording used when nobody authored a merge at all
+(`none: no person authored a merge in the reported repositories`), so the two causes are never read as one.
 
 The rendered line abridges that list. **Each label is tallied once**, wherever the repositories carrying it sit in the
 list, so no line reports the same label twice. Groups are ordered by the contributions behind them, largest first, ties
@@ -997,16 +1058,41 @@ within a group keep the contribution order. `x N` is dropped when N is 1, a repo
 because the names would draw no distinction. Where the labels do differ the names are the point, since which of them is
 the red one is the next thing asked.
 
+**The rendered lines are grouped**, since 2026-09-01, under the action the combination of labels a person carries puts
+them under. `Enable` covers `GREEN` and `GREEN, AMBER`; `Review` covers `AMBER`, `GREEN, AMBER, RED` and `GREEN, RED`;
+`Blocked` covers `AMBER, RED` and `RED`. The table is a ruling about what to do next, not a property of the labels —
+`GREEN, AMBER` enables while `AMBER` alone is reviewed, which no severity ordering yields — so it is written out rather
+than derived. Groups print in that order with `Ungrouped` last, alphabetical login order is kept within each group, and a
+group nobody is in is left out rather than printed as a heading with nothing under it. Only a combination carrying
+`NOT ASSESSED` can reach `Ungrouped`: all seven combinations of the three graded labels are covered above, and
+`cannot_assess` is already excluded.
+
+Multiplicity is not part of a combination, which is what makes the set of them finite: `RED x 6` and `RED` say the same
+thing about a person — everything they work in is red — so they group together, and `RED x 2, GREEN` counts as
+`GREEN, RED`.
+
+The **actor summary** above the list counts the people behind each of those combinations, with a subtotal per group. It
+prints the seven listed rows at every run, zero included, so two runs diff line for line, and prints `Ungrouped` only
+where something reaches it. Every percentage is over the people this section reports — not everyone the report covers,
+since somebody left with no repository by the `cannot_assess` exclusion gets no line and is counted in nothing here. Each
+share is rounded to a tenth on its own, so a group's share can differ by a tenth or two from its rows' shares added up;
+the counts are what reconcile, and a subtotal is always the sum of the counts printed under it. Those
+are the only two blocks carrying percentages: the review breakdown, the cohort and the metric classification counts each
+print their own denominator already.
+
 **Bot accounts get no line**, both those GitHub types as `Bot` and those following the `[bot]` login convention while
 typed as ordinary users — the same test `active-contributors` applies, which drops more accounts than
 `cohort.excluded_authors` does. Their merges **stay in the cohort** and in every rate measured over it, because
 agent-authored work is work this report covers; an agent is simply not a person to review. A repository where an agent
 raised every change therefore reports its merges with nobody named against them.
 
-**Like the index, this is not a roll-up.** It lists labels and combines them nowhere: a person contributing to a red
-repository and a green one has no single readiness, and averaging or reducing the two would invent a per-person verdict
-this tool does not make. There is no worst-label summary and no count of people — see `docs/architecture.md` under
-"Scope boundaries".
+**There is still no per-person verdict.** A person contributing to a red repository and a green one has no single
+readiness: the line lists both labels, and averaging or reducing them would invent a verdict this tool does not make.
+The group name above a line names what to do next about a pair of labels, not the person carrying them, and there is no
+worst-label summary, no score, no per-team figure and no ordering of people by what they carry. The count of people and
+the group subtotals were once excluded here as roll-ups; both were admitted on 2026-09-01 at the user's instruction, and
+`docs/architecture.md` under "Scope boundaries" records them as dated reversals along with what stays out. If the
+grouping is ever revised, `render.actor_combination` and the `render.ACTOR_GROUPS` table are the two places to change.
 
 ### Trend: measuring periods after enablement
 

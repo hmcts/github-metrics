@@ -89,6 +89,23 @@ def percent(value: float | None) -> str:
     return "-" if value is None else f"{value:g}%"
 
 
+def percentage_of(count: int, total: int) -> str:
+    """Format one count as a percentage of the population it was counted over.
+
+    A total of zero is a dash rather than `0%`, through the same `percent` an unmeasured value goes
+    through: a report covering nothing has no population to take a share of, and printing `0%` would
+    claim a division it never did.
+
+    A count too small to round to a tenth of a percent prints `<0.1%` for the same reason: across a
+    population of thousands one person is 0.05%, and rounding that to `0%` would make a row somebody
+    is in read exactly like the deliberately-printed zero rows beside it.
+    """
+    if total == 0:
+        return percent(None)
+    share = round(count / total * 100, 1)
+    return "<0.1%" if count and not share else percent(share)
+
+
 def quantity(value: int | None) -> str:
     """Format one optional count, leaving an uncounted value visibly absent.
 
@@ -557,13 +574,80 @@ def gate_observed(report: MergeGateReport) -> str:
     return yes_or_no(value=report.gate is not None and report.gate.rules_observed)
 
 
+INDEX_NOT_ASSESSED = "not assessed"
+"""How the index's readiness column names a repository the readiness policy left unjudged."""
+
+INDEX_UNAVAILABLE = "unavailable"
+"""How the index's readiness column names a repository the window could not be reported for."""
+
+
 def index_readiness(assessment: ReadinessAssessment | None) -> str:
     """Render one repository's readiness label for the index, or say it was not judged.
 
     A label is upper-cased exactly as the section heading below renders it; anything that is not a
     label stays lower case, so a reader scanning the column cannot mistake one for the other.
     """
-    return "not assessed" if assessment is None else assessment.label.value.upper()
+    return INDEX_NOT_ASSESSED if assessment is None else assessment.label.value.upper()
+
+
+READINESS_LABEL_NAMES = tuple(label.value.upper() for label in ReadinessLabel)
+"""Every readiness label as the index and the summary spell it, in declaration order, best first."""
+
+SUMMARY_ROWS = (*READINESS_LABEL_NAMES, INDEX_NOT_ASSESSED, INDEX_UNAVAILABLE)
+"""Every value the index's readiness column can hold, in the order the summary counts them.
+
+The labels are read off `ReadinessLabel` rather than written out again, so a label added there is
+counted here without a second list to keep in step. The two non-labels follow, because neither is a
+grade and reading them among the labels would make them one."""
+
+
+def counted_row(name: str, count: int, total: int) -> tuple[str, str, str]:
+    """Render one summary row: what was counted, how many there are, and their share of the total."""
+    return name, str(count), percentage_of(count, total)
+
+
+def readiness_counts(report: PracticeEvidenceReport) -> Mapping[str, int]:
+    """Count the repositories behind each value the index's readiness column shows.
+
+    Keyed by the strings the column itself prints, through `index_readiness`, so a reader can add the
+    index's rows up and arrive at these figures rather than at a second set of names for them.
+    """
+    counted = dict.fromkeys(SUMMARY_ROWS, 0)
+    for item in report.repositories:
+        counted[index_readiness(item.assessment)] += 1
+    counted[INDEX_UNAVAILABLE] += len(report.unavailable)
+    return counted
+
+
+def render_summary(report: PracticeEvidenceReport) -> tuple[str, ...]:
+    """Render how many repositories carry each readiness label, and each label's share of them.
+
+    Each percentage is over every repository the report covers — the ones that reported and the ones
+    that could not — which is the same population every row here is counted over, so the counts
+    account for all of it. Each share is rounded to a tenth on its own, so the printed column can
+    read 99.9 or 100.1 rather than exactly a hundred; the counts are what reconcile, not the shares.
+
+    A DISTRIBUTION, NOT A VERDICT — the distinction the roll-up boundary turns on. Across the hmcts
+    organisation the index runs to more than a thousand rows and cannot be read as a shape, so the
+    user asked on 2026-08-31 for the counts to open the report; architecture.md "Scope boundaries"
+    records the reversal of the no-count ruling that governed the index until then. What stays excluded is
+    unchanged: no combined label, no per-team figure, no score, and no ordering of teams or people by
+    what they carry. Every count is over the whole population the report covers.
+
+    The four labels are always printed, zero included, so two runs diff line for line and a label
+    nobody carries reads as an observation rather than an omission. The two non-labels are printed
+    only where they occur, because a repository is either assessed or it is not, and a zero there is
+    the absence of a state rather than a count of one.
+    """
+    counted = readiness_counts(report)
+    total = sum(counted.values())
+    rows = tuple(
+        counted_row(name, counted[name], total)
+        for name in SUMMARY_ROWS
+        if name in READINESS_LABEL_NAMES or counted[name]
+    )
+    widths = tuple(max(len(row[column]) for row in rows) for column in range(3))
+    return *heading("Repository Summary"), *(row_text(row, widths) for row in rows)
 
 
 def render_index(report: PracticeEvidenceReport, teams: Mapping[str, str]) -> tuple[str, ...]:
@@ -574,9 +658,11 @@ def render_index(report: PracticeEvidenceReport, teams: Mapping[str, str]) -> tu
     the three questions a reader opens it with — which repositories are assessable at all, which are
     RED, and which need reading in full — should be answerable before scrolling.
 
-    NOT A ROLL-UP. There is no combined label, no per-team verdict, and deliberately no count or
-    total of any kind: listing fourteen labels is presentation, and reducing them to one is what
-    architecture.md "Scope boundaries" forbids. `teams` says who owns a repository, nothing more.
+    NOT A ROLL-UP. There is no combined label and no per-team verdict: listing fourteen labels is
+    presentation, and reducing them to one is what architecture.md "Scope boundaries" forbids. The
+    counts the report now opens with are `render_summary`, which counts each label separately and
+    combines none of them; no row here carries a figure. `teams` says who owns a repository, nothing
+    more.
 
     Every cell is read from the same models `render_repository` consumes, so the index and the block
     it points at cannot disagree.
@@ -586,7 +672,7 @@ def render_index(report: PracticeEvidenceReport, teams: Mapping[str, str]) -> tu
             (teams[item.repository], item.repository, index_readiness(item.assessment), gate_observed(item.merge_gate))
             for item in report.repositories
         ),
-        *((teams[item.repository], item.repository, "unavailable", "-") for item in report.unavailable),
+        *((teams[item.repository], item.repository, INDEX_UNAVAILABLE, "-") for item in report.unavailable),
     )
     return *heading("Index"), *table(("Team", "Repository", "Readiness", "Gate observed"), rows)
 
@@ -662,28 +748,207 @@ def render_readiness_group(group: ReadinessGroup, *, named: bool) -> str:
     return f"{tally} ({', '.join(group.repositories)})" if named else tally
 
 
-def actor_line(actor: ActorReadiness) -> str:
+def actor_line(repositories: Sequence[ActorRepositoryReadiness]) -> str:
     """Render one person's labels, weightiest first, naming repositories only where they differ.
 
     An actor whose repositories all carry one label renders `RED x 6` alone: the names would be that
     person's whole list of repositories printed for no distinction. Where the labels differ the names
     are the point, because which of them is the red one is the next thing asked.
     """
-    groups = readiness_tally(actor.repositories)
+    groups = readiness_tally(repositories)
     return ", ".join(render_readiness_group(group, named=len(groups) > 1) for group in groups)
 
 
-def render_actors(actors: Sequence[ActorReadiness]) -> tuple[str, ...]:
-    """Render one abridged line per person, saying so where the report covers nobody.
+def actor_repositories(actor: ActorReadiness) -> tuple[ActorRepositoryReadiness, ...]:
+    """Return the repositories of one person that the actor section reports on.
 
-    NOT A ROLL-UP, exactly as `render_index` is not: a person contributing to a red repository and a
-    green one has no single readiness, so the line lists both labels and combines them nowhere. There
-    is no per-person verdict, no worst-label summary and no count of people — see architecture.md,
-    "Scope boundaries".
+    A `cannot_assess` repository is DROPPED here, by the user's instruction of 2026-08-31. The label
+    is not a grade — it means a half of the question could not be read, most often a merge gate a
+    non-administrator cannot see — so on a line about a person it says only that somebody else lacks
+    a permission, and at hmcts scale it says that about most repositories most people work in,
+    crowding out the labels the line exists to show. The repositories are unchanged in the JSON, in
+    the index and in the body: this is a rendering of one section, not a re-judging of anything.
+
+    An actor left with nothing gets no line, because a line naming a person and no label reads as a
+    finding about them.
     """
-    if not actors:
-        return *heading("Actors"), "  none: no person authored a merge in the reported repositories"
-    return *heading("Actors"), *pairs(tuple((actor.actor_login, actor_line(actor)) for actor in actors))
+    return tuple(row for row in actor.repositories if row.readiness is not ReadinessLabel.CANNOT_ASSESS)
+
+
+ACTOR_COMBINATION_ORDER = (*READINESS_LABEL_NAMES, actor_readiness_label(None))
+"""Every label one person's line can carry, best first, with the absence of a label last.
+
+Read off `READINESS_LABEL_NAMES` and `actor_readiness_label` rather than written out again, so a label
+added to `ReadinessLabel` orders itself here. `NOT ASSESSED` is appended rather than sorted among the
+labels, for the reason `readiness_severity` ranks it last: it is the absence of a grade, not the
+mildest one."""
+
+
+def actor_combination(repositories: Sequence[ActorRepositoryReadiness]) -> tuple[str, ...]:
+    """Return the DISTINCT labels one person's line carries, best first.
+
+    Distinct because multiplicity is not part of the combination: `RED x 6` and `RED` say the same
+    thing about a person — everything they work in is red — and telling them apart would split one
+    population by how many repositories somebody happens to author in. `RED x 2, GREEN` is therefore
+    `GREEN, RED`.
+
+    Ordered by `ACTOR_COMBINATION_ORDER` rather than by the weight `readiness_tally` orders the
+    printed line by, so one pair of labels is one key however the contributions behind them fall.
+    """
+    carried = {actor_readiness_label(row.readiness) for row in repositories}
+    return tuple(name for name in ACTOR_COMBINATION_ORDER if name in carried)
+
+
+ACTOR_GROUPS: Mapping[str, tuple[tuple[str, ...], ...]] = {
+    "Enable": (("GREEN",), ("GREEN", "AMBER")),
+    "Review": (("AMBER",), ("GREEN", "AMBER", "RED"), ("GREEN", "RED")),
+    "Blocked": (("AMBER", "RED"), ("RED",)),
+}
+"""Which combination of labels puts a person under which of the three named actions.
+
+Transcribed from the user's instruction of 2026-09-01, groups and rows in the order given. WRITTEN
+OUT rather than derived from a rule, because it is a ruling about what to do next and not a property
+of the labels: `GREEN, AMBER` enables while `AMBER` alone is reviewed, which no ordering or severity
+of the labels yields. A label added to `ReadinessLabel` is consequently not grouped by default — it
+reaches `Ungrouped` until somebody rules on it, which is the outcome a defaulted guess would hide.
+
+The labels are spelled here, where the rest of the module reads them off `READINESS_LABEL_NAMES`,
+because these rows are the ruling's own text; a test asserts every name in the table is one this
+section can print, so a renamed label cannot leave the table quietly unreachable."""
+
+ACTOR_UNGROUPED = "Ungrouped"
+"""What a combination the group table does not cover is reported under."""
+
+
+def actor_group(combination: tuple[str, ...]) -> str:
+    """Name the action a combination of labels puts a person under, or say it is not grouped.
+
+    Only a combination carrying `NOT ASSESSED` can reach the fallback: all seven non-empty subsets of
+    GREEN, AMBER and RED are mapped, and `actor_repositories` has already dropped `cannot_assess`, so
+    there is nothing else a graded line can be.
+    """
+    for name, combinations in ACTOR_GROUPS.items():
+        if combination in combinations:
+            return name
+    return ACTOR_UNGROUPED
+
+
+def actor_combination_counts(actors: Sequence[ActorReadiness]) -> Mapping[tuple[str, ...], int]:
+    """Count the people behind each combination of labels the actor section reports.
+
+    Counted over the same `actor_repositories` the rendered lines are built from, so the counts and
+    the lines cannot disagree. Anyone that leaves with no repository is skipped for the reason they
+    get no line: a person with no label beside them is not a finding to count.
+    """
+    counted: dict[tuple[str, ...], int] = {}
+    for item in actors:
+        repositories = actor_repositories(item)
+        if repositories:
+            combination = actor_combination(repositories)
+            counted[combination] = counted.get(combination, 0) + 1
+    return counted
+
+
+ACTOR_ROW_INDENT = "  "
+"""How far a row is set in from the group name above it, in the summary block and in the list."""
+
+
+def ungrouped_combinations(counted: Mapping[tuple[str, ...], int]) -> tuple[tuple[str, ...], ...]:
+    """Return the combinations the group table does not cover, ordered as their labels are.
+
+    Ordered through `ACTOR_COMBINATION_ORDER` rather than alphabetically, so these rows read in the
+    same best-first order as the labels within each of them, and two runs over the same population
+    print them the same way round.
+    """
+    position = {name: index for index, name in enumerate(ACTOR_COMBINATION_ORDER)}
+    ungrouped = (combination for combination in counted if actor_group(combination) == ACTOR_UNGROUPED)
+    return tuple(sorted(ungrouped, key=lambda combination: [position[name] for name in combination]))
+
+
+def actor_summary_groups(counted: Mapping[tuple[str, ...], int]) -> tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]:
+    """Return the groups this block prints, in order, with the combination rows under each.
+
+    The three named groups and their seven rows are printed at every run, zero included, for the
+    reason `render_summary` prints every label: a combination nobody carries is an observation about
+    the population and reads as one only where the row is there to be read. `Ungrouped` is printed
+    only where something reaches it, because it is not one of the actions the user named — a heading
+    with nothing under it would offer a fourth.
+    """
+    ungrouped = ungrouped_combinations(counted)
+    return (*ACTOR_GROUPS.items(), *(((ACTOR_UNGROUPED, ungrouped),) if ungrouped else ()))
+
+
+def render_actor_summary(actors: Sequence[ActorReadiness]) -> tuple[str, ...]:
+    """Render how many people carry each combination of labels, under the action it puts them under.
+
+    Each percentage is over the people the actor section reports — the same population every row is
+    counted over, and not everyone the report covers, because somebody left with no repository by the
+    `cannot_assess` exclusion gets no line and is counted in nothing here. Every share is rounded to a
+    tenth on its own, so a group's printed share can differ from its rows' shares added up by a tenth
+    or two; the counts are what reconcile, and a subtotal is always the sum of the counts under it.
+
+    THE SUBTOTALS ARE A ROLL-UP, and a deliberate one: the user instructed on 2026-09-01 that each of
+    Enable, Review and Blocked carries its own figure, which is a further dated reversal of the
+    no-roll-up ruling — architecture.md "Scope boundaries" records it. What the reversal admits is a
+    count of people per named action and nothing more: no per-team figure, no score, no verdict on
+    any individual, and no ordering of people by what they carry.
+    """
+    counted = actor_combination_counts(actors)
+    total = sum(counted.values())
+    rows = tuple(
+        row
+        for name, combinations in actor_summary_groups(counted)
+        for row in (
+            counted_row(name, sum(counted.get(combination, 0) for combination in combinations), total),
+            *(
+                counted_row(f"{ACTOR_ROW_INDENT}{', '.join(combination)}", counted.get(combination, 0), total)
+                for combination in combinations
+            ),
+        )
+    )
+    widths = tuple(max(len(row[column]) for row in rows) for column in range(3))
+    return *heading("Actor Summary"), *(row_text(row, widths) for row in rows)
+
+
+def render_actors(actors: Sequence[ActorReadiness]) -> tuple[str, ...]:
+    """Render one abridged line per person, under the action their labels put them under.
+
+    STILL NOT A PER-PERSON VERDICT: a person contributing to a red repository and a green one has no
+    single readiness, so the line lists both labels and combines them nowhere. The group name above
+    them is the action `ACTOR_GROUPS` puts that combination under, by the user's instruction of
+    2026-09-01 — it names what to do next about a pair of labels, not a judgement of the person
+    carrying them — and there is no score, no per-team figure and no ordering of people by what they
+    carry. architecture.md "Scope boundaries" records the instruction.
+
+    A group nobody is in is left out rather than printed empty: `render_actor_summary` reports that
+    zero above, and a heading with nothing under it here would read as a list that failed to render.
+
+    The heading says the `cannot_assess` repositories are left out, so a reader comparing a person's
+    labels with the index cannot read the shorter list as the whole of what they work in.
+    """
+    title = "Actors (cannot_assess repositories excluded)"
+    reported = tuple(
+        (actor.actor_login, repositories) for actor in actors if (repositories := actor_repositories(actor))
+    )
+    if not reported:
+        detail = (
+            "no person authored a merge in the reported repositories"
+            if not actors
+            else "every repository the reported people contributed to could not be assessed"
+        )
+        return *heading(title), f"  none: {detail}"
+    # One width over the whole section rather than one per group, so a person's labels start in the
+    # same column throughout and two groups can be read down as one list.
+    width = max(len(login) for login, _ in reported)
+    grouped: dict[str, list[str]] = {}
+    for login, repositories in reported:
+        line = f"{ACTOR_ROW_INDENT}  {login:<{width}}  {actor_line(repositories)}"
+        grouped.setdefault(actor_group(actor_combination(repositories)), []).append(line)
+    order = (*ACTOR_GROUPS, ACTOR_UNGROUPED)
+    return (
+        *heading(title),
+        *(line for name in order if name in grouped for line in (f"  {name}", *grouped[name])),
+    )
 
 
 def render_repository(
@@ -725,9 +990,10 @@ def render_practice_report(
     drill_downs: Mapping[str, RepositoryDrillDown],
     teams: Mapping[str, str],
 ) -> str:
-    """Render the default practice report for every reported repository, under its index."""
+    """Render the default practice report for every reported repository, under its counts and index."""
     return rendered(
         (
+            *render_summary(report),
             *render_index(report, teams),
             *(
                 line
@@ -735,6 +1001,7 @@ def render_practice_report(
                 for line in render_repository(report.organization, evidence, drill_downs[evidence.repository])
             ),
             *render_unavailable(report.unavailable),
+            *render_actor_summary(report.actors),
             *render_actors(report.actors),
         ),
     )
