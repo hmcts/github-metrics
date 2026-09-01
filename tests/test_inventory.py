@@ -13,6 +13,7 @@ from requests import Response, Session
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
 from metrics.config import Configuration, TeamConfiguration
+from metrics.credentials import PersonalAccessToken
 from metrics.domain import (
     AlertSeverity,
     AvailabilityReason,
@@ -134,7 +135,7 @@ def standards_response(data: dict[str, object] | None = None) -> MagicMock:
 
 def test_collect_repository_preserves_unavailable_reason() -> None:
     """Keep transport failure classifications in inventory evidence."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     with patch.object(client, "get_repository", side_effect=error):
         result = collect_repository(client, "hmcts", "divorce", "nfdiv-case-api")
@@ -147,7 +148,7 @@ def test_collect_repository_preserves_unavailable_reason() -> None:
 
 def test_collect_repository_returns_typed_metadata() -> None:
     """Parse repository inventory fields from GitHub JSON."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     response.json.return_value = {
         "name": "nfdiv-case-api",
@@ -177,7 +178,7 @@ def test_collect_repository_returns_typed_metadata() -> None:
 )
 def test_collect_repository_rejects_invalid_payload(side_effect: object, detail: str) -> None:
     """Classify malformed repository payloads as collection failures."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     if isinstance(side_effect, Exception):
         response.json.side_effect = side_effect
@@ -193,7 +194,7 @@ def test_collect_repository_rejects_invalid_payload(side_effect: object, detail:
 
 def test_collect_merge_gate_preserves_unavailable_reason() -> None:
     """Keep branch-rule failure classifications separate from repository evidence."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     metadata = repository_metadata()
     error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     with patch.object(client, "get_paginated", side_effect=error):
@@ -207,7 +208,7 @@ def test_collect_merge_gate_preserves_unavailable_reason() -> None:
 
 def test_collect_merge_gate_returns_effective_branch_rules() -> None:
     """Parse active merge rules applied to the selected branch."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {
             "type": "pull_request",
@@ -258,7 +259,7 @@ def test_collect_merge_gate_attributes_all_six_rule_types() -> None:
     `opal-common-lib` and `opal-logging-service` each run six rules, and the two beyond the
     originally modelled four were reported as absent until they were collected.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {
             "type": "pull_request",
@@ -295,7 +296,7 @@ def test_collect_merge_gate_attributes_all_six_rule_types() -> None:
 
 def test_collect_merge_gate_names_rule_types_it_cannot_interpret() -> None:
     """Name an uninterpreted rule type rather than dropping it, sorted and deduplicated."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {"type": "tag_name_pattern"},
         {"type": "deletion"},
@@ -315,7 +316,7 @@ def test_collect_merge_gate_names_rule_types_it_cannot_interpret() -> None:
 
 def test_collect_merge_gate_falls_back_to_branch_protection() -> None:
     """Preserve classic protection when its administrative details are inaccessible."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     response = MagicMock()
     response.json.return_value = {"name": "master", "protected": True}
@@ -368,7 +369,7 @@ def test_collect_inventory_reports_permission_limited_branch_protection(
             ),
         ),
     )
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     repository_response = MagicMock()
     repository_response.json.return_value = repository_metadata().model_dump(mode="json")
     permission_error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
@@ -393,7 +394,7 @@ def test_collect_inventory_reports_permission_limited_branch_protection(
 
 def test_collect_merge_gate_maps_classic_branch_protection() -> None:
     """Normalise readable classic protection into effective merge rules."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     response.json.return_value = {
         "required_pull_request_reviews": {
@@ -459,7 +460,7 @@ def test_collect_merge_gate_reads_classic_linear_history(protection: dict[str, o
     rule GitHub discloses and this collector never looked at would put an unfalsifiable claim into an
     auditable report.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     response.json.return_value = {
         "required_conversation_resolution": {"enabled": True},
@@ -480,7 +481,7 @@ def test_collect_merge_gate_reads_classic_linear_history(protection: dict[str, o
 
 def test_collect_merge_gate_maps_classic_contexts_without_pull_request_reviews() -> None:
     """Preserve legacy status contexts when classic checks and reviews are absent."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     response.json.return_value = {
         "required_pull_request_reviews": None,
@@ -510,7 +511,7 @@ def test_collect_merge_gate_maps_classic_contexts_without_pull_request_reviews()
 
 def test_collect_merge_gate_treats_missing_classic_protection_as_unprotected() -> None:
     """Represent a classic protection 404 as an unprotected branch."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub repository not found or inaccessible", AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE)
     with (
         patch.object(client, "get_paginated", return_value=()),
@@ -536,7 +537,7 @@ def test_collect_merge_gate_reads_a_plan_limited_repository_as_unprotected(endpo
     The rules endpoint answering it does not settle the question on its own — a repository can carry
     classic protection instead — so it falls through and classic protection answers the same 403.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
 
     def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
@@ -566,7 +567,7 @@ def test_collect_merge_gate_reads_classic_protection_when_rules_report_disabled(
     about it. Reading "unprotected" straight off that message would publish a fact nobody observed —
     and readiness vetoes on it, so the repository would be graded red for a gate it does have.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
     protection = MagicMock()
     protection.json.return_value = {
@@ -604,7 +605,7 @@ def test_collect_merge_gate_preserves_classic_protection_failure(rules: str) -> 
     own `except` clauses no longer apply, and the exception would leave `collect_inventory` — killing
     a 1850-repository run over one repository, with every repository already collected discarded.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub rate limit exceeded", AvailabilityReason.RATE_LIMITED)
     disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
     with (
@@ -627,7 +628,7 @@ def test_collect_merge_gate_preserves_classic_protection_failure(rules: str) -> 
 )
 def test_collect_merge_gate_rejects_invalid_classic_protection(side_effect: object, detail: str) -> None:
     """Classify malformed classic protection payloads as collection failures."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock()
     if isinstance(side_effect, Exception):
         response.json.side_effect = side_effect
@@ -647,7 +648,7 @@ def test_collect_merge_gate_rejects_invalid_classic_protection(side_effect: obje
 
 def test_collect_merge_gate_rejects_invalid_branch_fallback() -> None:
     """Classify malformed permission-limited branch metadata as a collection failure."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     response = MagicMock()
     response.json.return_value = {}
@@ -665,7 +666,7 @@ def test_collect_merge_gate_rejects_invalid_branch_fallback() -> None:
 
 def test_collect_merge_gate_rejects_invalid_rules() -> None:
     """Classify malformed effective branch rules as collection failures."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     with patch.object(client, "get_paginated", return_value=({"type": "pull_request", "parameters": {}},)):
         result = collect_merge_gate(client, "hmcts", "divorce", repository_metadata())
 
@@ -704,7 +705,7 @@ def test_collect_inventory_derives_incomplete_status(status: CollectionStatus) -
             ),
         ),
     )
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     metadata = repository_metadata()
     response = MagicMock()
@@ -995,7 +996,7 @@ def test_collect_inventory_stays_complete_when_a_feature_is_disabled() -> None:
         database=Path("metrics.sqlite3"),
         teams=(TeamConfiguration(identifier="divorce", display_name="Divorce", repositories=("nfdiv-case-api",)),),
     )
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     repository_response = MagicMock()
     repository_response.json.return_value = repository_metadata().model_dump(mode="json")
     disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
@@ -1105,7 +1106,7 @@ def unprotected_repository_responses(name: str) -> list[object]:
 def test_collect_inventory_reports_what_each_repository_cost() -> None:
     """Count the calls and the seconds each repository needed, slowest first."""
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     responses = unprotected_repository_responses("nfdiv-case-api") + unprotected_repository_responses("nfdiv-frontend")
     with (
         patch.object(session, "get", side_effect=responses),
@@ -1133,7 +1134,7 @@ def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_a
     would split one repository's cost across two rows of the same report, each understating it.
     """
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     configuration = two_repository_configuration().model_copy(
         update={
             "teams": (
@@ -1158,7 +1159,7 @@ def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_a
 def test_collect_inventory_reports_the_cost_of_a_repository_that_failed() -> None:
     """Report what an attempt spent even when it produced no repository at all."""
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     refused = Response()
     refused.status_code = 404
     responses = [*unprotected_repository_responses("nfdiv-case-api"), refused]
@@ -1240,7 +1241,7 @@ def test_binds_administrators_reports_unknown_rather_than_a_partial_verdict(
 
 def test_fetch_ruleset_reads_a_repository_ruleset() -> None:
     """Read a repository-owned ruleset from the repository endpoint."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     rule = InventoryRule(type="pull_request", ruleset_id=20375680, ruleset_source_type="Repository")
     with patch.object(client, "get", return_value=ruleset_response(administrator_ruleset(20375680))) as get:
         ruleset = fetch_ruleset(client, "agilezebra", "jwt-middleware", rule)
@@ -1252,7 +1253,7 @@ def test_fetch_ruleset_reads_a_repository_ruleset() -> None:
 
 def test_fetch_ruleset_reads_an_organization_ruleset_from_the_organization() -> None:
     """Read an inherited ruleset where it is configured rather than from the repository."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     rule = InventoryRule(type="pull_request", ruleset_id=99, ruleset_source_type="Organization")
     with patch.object(client, "get", return_value=ruleset_response({"id": 99, "enforcement": "active"})) as get:
         assert fetch_ruleset(client, "hmcts", "nfdiv-case-api", rule) is not None
@@ -1262,7 +1263,7 @@ def test_fetch_ruleset_reads_an_organization_ruleset_from_the_organization() -> 
 
 def test_fetch_ruleset_returns_nothing_for_a_rule_naming_no_ruleset() -> None:
     """Ask for nothing where a rule carries no attribution to follow."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     with patch.object(client, "get") as get:
         assert fetch_ruleset(client, "hmcts", "nfdiv-case-api", InventoryRule(type="deletion")) is None
 
@@ -1282,7 +1283,7 @@ def test_fetch_ruleset_degrades_one_field_rather_than_the_repository(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Lose the bypass list to a refusal without losing the rules GitHub already disclosed."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     rule = InventoryRule(type="pull_request", ruleset_id=20375680, ruleset_source_type="Repository")
     with caplog.at_level("WARNING"), patch.object(client, "get", side_effect=failure):
         assert fetch_ruleset(client, "agilezebra", "jwt-middleware", rule) is None
@@ -1292,7 +1293,7 @@ def test_fetch_ruleset_degrades_one_field_rather_than_the_repository(
 
 def test_collect_rulesets_reads_each_ruleset_once_however_many_rules_it_supplies() -> None:
     """Cost one call per ruleset, not one per rule, for the ordinary many-rules-one-ruleset shape."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     rules = (
         InventoryRule(type="deletion", ruleset_id=20375680, ruleset_source_type="Repository"),
         InventoryRule(type="non_fast_forward", ruleset_id=20375680, ruleset_source_type="Repository"),
@@ -1335,7 +1336,7 @@ def test_collect_merge_gate_reports_an_administrator_bypass_it_once_left_undiscl
     exempting the repository admin role always. Every ruleset-governed repository reported
     `applies_to_administrators: null` before this, which read as a blind spot rather than a bypass.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {
             "type": "pull_request",
@@ -1370,7 +1371,7 @@ def test_collect_merge_gate_reports_an_administrator_bypass_it_once_left_undiscl
 
 def test_collect_merge_gate_reports_a_gate_that_binds_administrators() -> None:
     """Report True where the only exemptions are limited to pull requests or belong to nobody's admin."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {
             "type": "pull_request",
@@ -1409,7 +1410,7 @@ def test_collect_merge_gate_falls_back_to_classic_when_every_ruleset_only_evalua
     A repository can carry rulesets and classic protection at once, as jwt-middleware does, and an
     evaluating ruleset must not hide the protection that is actually gating the branch.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     records = (
         {
             "type": "pull_request",
@@ -1928,7 +1929,7 @@ def test_collect_inventory_is_partial_when_only_the_standards_query_failed() -> 
             ),
         },
     )
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     repository_response = MagicMock()
     repository_response.json.return_value = repository_metadata().model_dump(mode="json")
     with (
@@ -1965,7 +1966,7 @@ def test_collect_inventory_carries_standards_evidence_onto_the_item() -> None:
         },
     )
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     payload = standards_data(
         files={"rootCodeowners": {"byteSize": 42}},
         nodes=[
@@ -2112,7 +2113,7 @@ def test_collect_inventory_stores_the_measures_of_a_resolved_project() -> None:
         nodes=[commit_node("2026-08-01T00:00:00Z", login="alice")],
     )
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     sonar, sonar_get = sonar_reading(
         sonar_answer(analyses_payload()),
         sonar_answer(measures_payload("hmcts.cath")),
@@ -2159,7 +2160,7 @@ def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_pro
     signal it carries.
     """
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     sonar, sonar_get = sonar_reading()
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
@@ -2184,7 +2185,7 @@ def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_pro
 def test_collect_inventory_collects_no_sonar_state_without_a_source() -> None:
     """Leave both SonarCloud fields unset for a run collecting none, so a stored row says nothing."""
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
         patch.object(session, "post", side_effect=[standards_response()]),
@@ -2206,7 +2207,7 @@ def test_collect_inventory_reads_an_override_under_the_configured_repository_nam
     names the repository GitHub reported.
     """
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     configuration = single_repository_configuration(
         "nfdiv-case-api-old-name",
         sonar_projects={"nfdiv-case-api-old-name": "hmcts.cath"},
@@ -2408,7 +2409,7 @@ def test_collect_inventory_logs_one_progress_line_per_repository(caplog: pytest.
     One line per repository and no more: a phase that visits 1850 of them is the reason the line
     exists, and a phase that logged two lines for each would be twice as long as the report.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     with (
         patch.object(client, "get_repository", side_effect=metadata_answer(client, 3)),
         patch.object(client, "get_paginated", return_value=()),
@@ -2440,7 +2441,7 @@ def test_collect_inventory_progress_names_each_alert_family_that_is_not_enabled(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Explain a blank in the report without grading it: a family nobody turned on is not a fault."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
 
     def paginated(url: str, parameters: dict[str, str | int] | None = None) -> tuple[dict[str, object], ...]:
@@ -2481,7 +2482,7 @@ def test_collect_inventory_progress_keeps_a_refused_family_out_of_the_not_enable
     family a token may not read is a fault. Naming the refused one as "not enabled" would tell an
     operator to go and enable a feature that is already on.
     """
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     refused = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
     disabled = GitHubError("GitHub reports the feature is not enabled", AvailabilityReason.FEATURE_DISABLED)
 
@@ -2519,7 +2520,7 @@ def test_collect_inventory_progress_names_the_evidence_a_repository_could_not_su
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Name the kind and the reason of each unavailable piece, which is the part a reader acts on."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     with (
         patch.object(
             client,

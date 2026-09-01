@@ -7,6 +7,7 @@ import pytest
 from requests import Session
 
 from metrics.cost import CostMeter, combined
+from metrics.credentials import PersonalAccessToken
 from metrics.domain import RepositoryCollectionCost
 from metrics.github import GitHubClient
 
@@ -24,7 +25,7 @@ def fake_clock(*readings: float) -> AbstractContextManager[object]:
 
 def counting_client(calls: int) -> GitHubClient:
     """Build a client that has already issued the given number of calls."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     client.issued = calls
     return client
 

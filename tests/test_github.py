@@ -9,23 +9,31 @@ from requests import ConnectionError as RequestsConnectionError
 from requests import HTTPError, Response, Session
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
+from metrics.credentials import PersonalAccessToken
 from metrics.domain import AvailabilityReason
 from metrics.github import CallOutcome, GitHubClient, GitHubError, RateLimitBudget, endpoint_template
 
 
 def test_get_repository_sends_authenticated_request() -> None:
-    """Send authenticated repository requests with stable API headers."""
+    """Send the bearer on the REQUEST, and only the unchanging headers on the session.
+
+    A token left on the session outlives the request it was fetched for, which an installation token
+    minted for the next hour must not do: anything else handed the same session would go on sending
+    it after it expired, and after it was replaced. The session keeps the two headers that are
+    identical on every call this client will ever make, and nothing that expires.
+    """
     session = Session()
 
     with patch.object(session, "get") as get:
         get.return_value.status_code = 200
-        GitHubClient("secret", session).get_repository("hmcts", "nfdiv-case-api")
+        GitHubClient(PersonalAccessToken("secret"), session).get_repository("hmcts", "nfdiv-case-api")
 
     assert session.headers["Accept"] == "application/vnd.github+json"
-    assert session.headers["Authorization"] == "Bearer secret"
     assert session.headers["X-GitHub-Api-Version"] == "2022-11-28"
+    assert "Authorization" not in session.headers
     get.assert_called_once_with(
         "https://api.github.com/repos/hmcts/nfdiv-case-api",
+        headers={"Authorization": "Bearer secret"},
         timeout=30,
     )
     get.return_value.raise_for_status.assert_called_once_with()
@@ -47,7 +55,7 @@ def test_get_reports_http_failure(status_code: int, message: str) -> None:
     response = Response()
     response.status_code = status_code
     response.url = "https://api.github.com/repos/hmcts/nfdiv-case-api"
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", return_value=response),
         pytest.raises(GitHubError, match=message),
@@ -68,7 +76,7 @@ def test_get_leaves_a_422_unclassified_for_every_reader_but_the_one_that_knows_i
     response = Response()
     response.status_code = 422
     response.url = "https://api.github.com/repos/hmcts/nfdiv-case-api/dependabot/alerts"
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with patch.object(session, "get", return_value=response), pytest.raises(GitHubError) as captured:
         client.get("https://api.github.com/repos/hmcts/nfdiv-case-api/dependabot/alerts")
 
@@ -85,7 +93,7 @@ def test_get_reports_network_failure(caplog: pytest.LogCaptureFixture) -> None:
     """
     session = Session()
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with (
         patch.object(session, "get", side_effect=RequestsConnectionError("offline")) as get,
         pytest.raises(GitHubError, match="GitHub request failed after 3 attempts: offline"),
@@ -107,7 +115,7 @@ def test_repository_failure_has_structured_reason() -> None:
     session = Session()
     response = Response()
     response.status_code = 403
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "get", return_value=response),
         pytest.raises(GitHubError) as captured,
@@ -115,6 +123,97 @@ def test_repository_failure_has_structured_reason() -> None:
         client.get("https://api.github.com/repos/hmcts/nfdiv-case-api")
 
     assert captured.value.reason is AvailabilityReason.PERMISSION_DENIED
+
+
+class RenewableCredentials:
+    """Stand in for a credential that CAN produce a different token, as an App installation does.
+
+    A stub rather than a real `AppInstallation` because these tests are about what the CLIENT does
+    with a 401, and a real one would drag an RSA key and a stubbed token exchange into every
+    assertion about retry counts. What minting actually involves is pinned in `test_credentials`.
+    """
+
+    def __init__(self) -> None:
+        self.minted = 0
+
+    def token(self) -> str:
+        """Return a token that says how many times this credential has been renewed."""
+        return f"token-{self.minted}"
+
+    def refresh(self) -> bool:
+        """Mint a replacement, as an installation credential does when its token is refused."""
+        self.minted += 1
+        return True
+
+
+def test_a_refused_token_is_replaced_and_the_call_retried_once() -> None:
+    """Survive an installation token that expires mid-collection, without spending a retry on it.
+
+    An installation token lives an hour and a collection of 1850 repositories does not fit in one, so
+    a 401 partway through is an expected event with an obvious remedy. The retried call carries the
+    NEW token, and the transient budget is untouched — the three attempts exist to outlast a bad
+    minute at GitHub, which an expired token is not.
+    """
+    session = Session()
+    refused = Response()
+    refused.status_code = 401
+    success = Response()
+    success.status_code = 200
+    credentials = RenewableCredentials()
+    pause = MagicMock()
+    client = GitHubClient(credentials, session, pause=pause)
+    with patch.object(session, "get", side_effect=[refused, success]) as get:
+        assert client.get("https://api.github.com/example") is success
+
+    assert credentials.minted == 1
+    assert [call.kwargs["headers"] for call in get.call_args_list] == [
+        {"Authorization": "Bearer token-0"},
+        {"Authorization": "Bearer token-1"},
+    ]
+    pause.assert_not_called()
+    # One call, counted once, under the response it ended on. The superseded 401 is not evidence of
+    # anything that happened to the repository.
+    assert client.call_outcomes == {(200, "ok", "GET", "https://api.github.com/example"): 1}
+    assert client.requests_issued == 1
+
+
+def test_a_second_refusal_of_a_freshly_minted_token_is_not_retried_again() -> None:
+    """Stop after one replacement, because a token minted seconds ago is not the problem."""
+    session = Session()
+    refused = Response()
+    refused.status_code = 401
+    credentials = RenewableCredentials()
+    client = GitHubClient(credentials, session, pause=MagicMock())
+    with (
+        patch.object(session, "get", return_value=refused) as get,
+        pytest.raises(GitHubError, match="GitHub authentication failed") as captured,
+    ):
+        client.get("https://api.github.com/example")
+
+    assert get.call_count == 2
+    assert credentials.minted == 1
+    assert captured.value.reason is AvailabilityReason.AUTHENTICATION_FAILED
+
+
+def test_a_personal_access_token_is_never_sent_twice_at_a_401() -> None:
+    """Classify a refused PAT where it was refused, rather than resending the same string.
+
+    `refresh()` answering False is what makes this the untouched path: there is no other token to
+    try, so a retry would ask GitHub the identical question and get the identical answer a second
+    later.
+    """
+    session = Session()
+    refused = Response()
+    refused.status_code = 401
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
+    with (
+        patch.object(session, "get", return_value=refused) as get,
+        pytest.raises(GitHubError, match="GitHub authentication failed") as captured,
+    ):
+        client.get("https://api.github.com/example")
+
+    get.assert_called_once()
+    assert captured.value.reason is AvailabilityReason.AUTHENTICATION_FAILED
 
 
 def test_get_retries_transient_server_failure() -> None:
@@ -125,7 +224,7 @@ def test_get_retries_transient_server_failure() -> None:
     success = Response()
     success.status_code = 200
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with patch.object(session, "get", side_effect=[unavailable, success]) as get:
         assert client.get("https://api.github.com/example") is success
 
@@ -142,7 +241,7 @@ def test_get_honors_retry_after() -> None:
     success = Response()
     success.status_code = 200
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with patch.object(session, "get", side_effect=[limited, success]):
         assert client.get("https://api.github.com/example") is success
 
@@ -158,7 +257,7 @@ def test_get_honors_primary_rate_limit_reset() -> None:
     success = Response()
     success.status_code = 200
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: 100)
     with patch.object(session, "get", side_effect=[limited, success]):
         assert client.get("https://api.github.com/example") is success
 
@@ -172,7 +271,7 @@ def test_get_uses_secondary_rate_limit_default() -> None:
     success = Response()
     success.status_code = 200
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with patch.object(session, "get", side_effect=[limited, success]):
         assert client.get("https://api.github.com/example") is success
 
@@ -196,7 +295,7 @@ def test_get_never_retries_a_403_that_is_a_refusal_rather_than_a_rate_limit() ->
     refused.raise_for_status.side_effect = HTTPError(response=refused)
     refused.json.return_value = {"message": "Resource not accessible by personal access token"}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with (
         patch.object(session, "get", return_value=refused) as get,
         pytest.raises(GitHubError, match="GitHub permission denied") as captured,
@@ -222,7 +321,7 @@ def test_get_logs_githubs_own_message_for_a_refusal_without_carrying_it_into_the
     refused = MagicMock(status_code=403, headers={}, text="", url="https://api.github.com/search/commits")
     refused.raise_for_status.side_effect = HTTPError(response=refused)
     refused.json.return_value = {"message": "Although you appear to have the correct authorization credentials"}
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         caplog.at_level(logging.WARNING),
         patch.object(session, "get", return_value=refused),
@@ -252,7 +351,7 @@ def test_get_survives_rate_limit_headers_it_cannot_read_as_numbers(headers: dict
     refused = MagicMock(status_code=403, headers=headers, text="")
     refused.raise_for_status.side_effect = HTTPError(response=refused)
     refused.json.return_value = {"message": "Resource not accessible"}
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", return_value=refused),
         pytest.raises(GitHubError) as captured,
@@ -280,7 +379,7 @@ def test_the_client_reports_the_budget_github_named_so_a_scarce_quota_can_be_pac
             "x-ratelimit-reset": "160",
         },
     )
-    client = GitHubClient("secret", session, pause=MagicMock(), clock=lambda: 100)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock(), clock=lambda: 100)
     with patch.object(session, "get", return_value=response):
         client.get("https://api.github.com/search/commits", resource="commit-search")
 
@@ -299,7 +398,7 @@ def test_get_stops_retrying_rate_limit(caplog: pytest.LogCaptureFixture) -> None
     limited.status_code = 429
     limited.headers["retry-after"] = "1"
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with (
         caplog.at_level(logging.DEBUG),
         patch.object(session, "get", return_value=limited),
@@ -326,13 +425,18 @@ def test_get_paginated_follows_link_headers() -> None:
     second = MagicMock(status_code=200)
     second.json.return_value = [{"id": 2}]
     second.links = {}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with patch.object(session, "get", side_effect=[first, second]) as get:
         records = client.get_paginated("https://api.github.com/example", {"state": "open", "per_page": 50})
 
     assert records == ({"id": 1}, {"id": 2})
-    assert get.call_args_list[0].kwargs == {"timeout": 30, "params": {"state": "open", "per_page": 50}}
-    assert get.call_args_list[1].kwargs == {"timeout": 30}
+    bearer = {"Authorization": "Bearer secret"}
+    assert get.call_args_list[0].kwargs == {
+        "timeout": 30,
+        "params": {"state": "open", "per_page": 50},
+        "headers": bearer,
+    }
+    assert get.call_args_list[1].kwargs == {"timeout": 30, "headers": bearer}
 
 
 @pytest.mark.parametrize("page", [{"id": 1}, [1]])
@@ -342,7 +446,7 @@ def test_get_paginated_rejects_invalid_records(page: object) -> None:
     response = MagicMock(status_code=200)
     response.json.return_value = page
     response.links = {}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "get", return_value=response),
         pytest.raises(GitHubError, match="invalid paginated records"),
@@ -355,7 +459,7 @@ def test_get_paginated_rejects_invalid_json() -> None:
     session = Session()
     response = MagicMock(status_code=200)
     response.json.side_effect = RequestsJSONDecodeError("invalid", "{", 1)
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "get", return_value=response),
         pytest.raises(GitHubError, match="invalid paginated JSON at line 1, column 2"),
@@ -369,7 +473,7 @@ def test_get_paginated_rejects_unsafe_next_url() -> None:
     response = MagicMock(status_code=200)
     response.json.return_value = []
     response.links = {"next": {"url": "https://example.com/next"}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "get", return_value=response) as get,
         pytest.raises(GitHubError, match="unsafe pagination URL"),
@@ -384,7 +488,7 @@ def test_graphql_sends_query_and_returns_data() -> None:
     session = Session()
     response = MagicMock(status_code=200)
     response.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     query = 'query Repository($organization: String!) { repository(owner: $organization, name: "cath-service") }'
     with patch.object(session, "post", return_value=response) as post:
         data = client.graphql(query, {"organization": "hmcts"})
@@ -393,6 +497,7 @@ def test_graphql_sends_query_and_returns_data() -> None:
     post.assert_called_once_with(
         "https://api.github.com/graphql",
         json={"query": query, "variables": {"organization": "hmcts"}},
+        headers={"Authorization": "Bearer secret"},
         timeout=30,
     )
     response.raise_for_status.assert_called_once_with()
@@ -406,7 +511,7 @@ def test_graphql_retries_rate_limit_returned_with_http_success() -> None:
     success = MagicMock(status_code=200)
     success.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with patch.object(session, "post", side_effect=[limited, success]) as post:
         data = client.graphql("query { viewer { login } }")
 
@@ -428,7 +533,7 @@ def test_graphql_rejects_invalid_response_shapes(payload: object, message: str) 
     session = Session()
     response = MagicMock(status_code=200)
     response.json.return_value = payload
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "post", return_value=response),
         pytest.raises(GitHubError, match=message) as captured,
@@ -443,7 +548,7 @@ def test_graphql_rejects_invalid_json() -> None:
     session = Session()
     response = MagicMock(status_code=200)
     response.json.side_effect = RequestsJSONDecodeError("invalid", "{", 1)
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "post", return_value=response),
         pytest.raises(GitHubError, match="invalid GraphQL JSON at line 1, column 2"),
@@ -465,7 +570,7 @@ def test_graphql_classifies_errors_without_exposing_details(errors: object, reas
     session = Session()
     response = MagicMock(status_code=200)
     response.json.return_value = {"errors": errors}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         patch.object(session, "post", return_value=response),
         pytest.raises(GitHubError, match="GitHub GraphQL returned errors") as captured,
@@ -488,7 +593,7 @@ def test_graphql_logs_the_error_detail_it_keeps_out_of_the_report(caplog: pytest
     response.json.return_value = {
         "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a Repository with the name 'hmcts/gone'."}],
     }
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with (
         caplog.at_level(logging.WARNING),
         patch.object(session, "post", return_value=response),
@@ -519,7 +624,7 @@ def test_a_graphql_failure_is_counted_rather_than_hidden_inside_the_successes() 
     refused.json.return_value = {"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]}
     answered = MagicMock(status_code=200, headers={}, content=b"{}")
     answered.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with patch.object(session, "post", side_effect=[answered, refused]):
         client.graphql("query { repository { name } }", {"repository": "cath-service"})
@@ -546,7 +651,7 @@ def test_a_graphql_failure_logs_one_warning_carrying_the_variables_it_failed_for
     session = Session()
     refused = MagicMock(status_code=200, headers={}, content=b"{}")
     refused.json.return_value = {"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with (
         caplog.at_level(logging.DEBUG),
@@ -583,7 +688,7 @@ def test_repeated_graphql_errors_are_counted_rather_than_written_out_one_by_one(
             *({"type": "FORBIDDEN", "message": "Resource not accessible"} for _ in range(76)),
         ],
     }
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with (
         caplog.at_level(logging.WARNING),
@@ -604,7 +709,7 @@ def test_a_graphql_body_that_is_not_a_json_object_carries_no_counted_errors() ->
     outcome does not claim to have read errors it never saw.
     """
     session = Session()
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     unreadable = MagicMock(status_code=200, headers={}, content=b"[]")
     unreadable.json.return_value = []
     invalid = MagicMock(status_code=200, headers={}, content=b"{")
@@ -626,7 +731,7 @@ def test_a_bad_gateway_is_a_failed_call_rather_than_a_refused_one(caplog: pytest
     unavailable.raise_for_status.side_effect = HTTPError(response=unavailable)
     unavailable.json.return_value = {}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
 
     with (
         caplog.at_level(logging.DEBUG),
@@ -657,7 +762,7 @@ def test_graphql_honors_rate_limit_headers(headers: dict[str, str], clock: int, 
     success = MagicMock(status_code=200)
     success.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: clock)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: clock)
     with patch.object(session, "post", side_effect=[limited, success]):
         client.graphql("query { viewer { login } }")
 
@@ -686,7 +791,7 @@ def test_graphql_survives_rate_limit_headers_it_cannot_read_as_numbers(headers: 
     success = MagicMock(status_code=200)
     success.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: 100)
     with patch.object(session, "post", side_effect=[limited, success]):
         client.graphql("query { viewer { login } }")
 
@@ -699,7 +804,7 @@ def test_graphql_stops_retrying_rate_limit() -> None:
     limited = MagicMock(status_code=200, headers={})
     limited.json.return_value = {"errors": [{"type": "RATE_LIMITED"}]}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause)
     with (
         patch.object(session, "post", return_value=limited) as post,
         pytest.raises(GitHubError, match="rate limit exceeded after 3 attempts") as captured,
@@ -729,7 +834,13 @@ def test_client_preserves_resource_specific_rate_limit_reserve() -> None:
     graphql = MagicMock(status_code=200, headers={})
     graphql.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100, rate_limit_reserve=100)
+    client = GitHubClient(
+        PersonalAccessToken("secret"),
+        session,
+        pause=pause,
+        clock=lambda: 100,
+        rate_limit_reserve=100,
+    )
     with (
         patch.object(session, "get", return_value=rest),
         patch.object(session, "post", return_value=graphql),
@@ -762,7 +873,7 @@ def test_the_client_spends_a_budget_to_its_last_call_rather_than_stopping_at_a_r
         "x-ratelimit-reset": "585",
     }
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: 100)
     with patch.object(session, "get", return_value=low):
         client.get("https://api.github.com/example")
         client.get("https://api.github.com/example")
@@ -782,12 +893,39 @@ def test_the_client_waits_only_once_the_window_has_genuinely_nothing_left() -> N
         "x-ratelimit-reset": "585",
     }
     pause = MagicMock()
-    client = GitHubClient("secret", session, pause=pause, clock=lambda: 100)
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: 100)
     with patch.object(session, "get", return_value=spent):
         client.get("https://api.github.com/example")
         client.get("https://api.github.com/example")
 
     pause.assert_called_once_with(485)
+
+
+def test_the_client_paces_on_the_budget_github_reports_rather_than_an_assumed_one() -> None:
+    """Read the limit off the headers, because App auth does not get a user's 5,000 an hour.
+
+    A GitHub App installation is granted 12,500 REST calls an hour rather than the 5,000 a user token
+    gets, and the figure moves with the size of the installation. Nothing here may assume either: the
+    budget is whatever `x-ratelimit-limit` says, and the wait is until the reset instant that came
+    with it. A client that hard-coded 5,000 would park a run with 7,500 calls still in hand.
+    """
+    session = Session()
+    spent = MagicMock(status_code=200)
+    spent.headers = {
+        "x-ratelimit-resource": "core",
+        "x-ratelimit-limit": "12500",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-used": "12500",
+        "x-ratelimit-reset": "3700",
+    }
+    pause = MagicMock()
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=pause, clock=lambda: 100)
+    with patch.object(session, "get", return_value=spent):
+        client.get("https://api.github.com/example")
+        client.get("https://api.github.com/example")
+
+    assert client.budget("core") == RateLimitBudget(limit=12500, remaining=0, used=12500, resets_at=3700)
+    pause.assert_called_once_with(3600)
 
 
 @pytest.mark.parametrize(
@@ -806,7 +944,7 @@ def test_the_client_waits_only_once_the_window_has_genuinely_nothing_left() -> N
 )
 def test_client_ignores_incomplete_rate_limit_headers(headers: dict[str, str]) -> None:
     """Do not replace known budget state with incomplete response metadata."""
-    client = GitHubClient("secret", Session())
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
     response = MagicMock(headers=headers)
 
     client.record_rate_limit(response)
@@ -825,7 +963,7 @@ def test_the_client_counts_every_call_it_issues() -> None:
     second.links = {}
     graphql = MagicMock(status_code=200)
     graphql.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     assert client.requests_issued == 0
 
@@ -853,7 +991,7 @@ def test_debug_logging_never_writes_a_response_body(caplog: pytest.LogCaptureFix
     response.status_code = 200
     response.url = "https://api.github.com/repos/hmcts/nfdiv-case-api/secret-scanning/alerts"
     response._content = b'[{"number": 1, "secret": "ghp_averyrealtokenindeed"}]'  # noqa: SLF001
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with caplog.at_level(logging.DEBUG), patch.object(session, "get", return_value=response):
         client.get(response.url)
@@ -862,13 +1000,55 @@ def test_debug_logging_never_writes_a_response_body(caplog: pytest.LogCaptureFix
     assert f"{len(response.content)} bytes" in caplog.text
 
 
+def test_debug_logging_never_writes_the_bearer_token(caplog: pytest.LogCaptureFixture) -> None:
+    """Keep the credential itself out of the log at the level that records every call that worked.
+
+    DEBUG is the level a stuck collection is re-run at, and its output is pasted into tickets and
+    kept in CI artefacts for as long as the retention policy says. A token in that output outlives
+    the run by weeks.
+    """
+    session = Session()
+    response = Response()
+    response.status_code = 200
+    response._content = b'{"full_name": "hmcts/nfdiv-case-api"}'  # noqa: SLF001
+    client = GitHubClient(PersonalAccessToken("ghp_averyrealtokenindeed"), session)
+
+    with caplog.at_level(logging.DEBUG), patch.object(session, "get", return_value=response):
+        client.get("https://api.github.com/repos/hmcts/nfdiv-case-api")
+
+    assert "ghp_averyrealtokenindeed" not in caplog.text
+    assert "GitHub ok 200 GET https://api.github.com/repos/hmcts/nfdiv-case-api" in caplog.text
+
+
+def test_the_401_retry_names_the_call_and_neither_token(caplog: pytest.LogCaptureFixture) -> None:
+    """Report that a token was replaced without writing either the refused one or its replacement.
+
+    The 401 line is the one place the client says anything about a credential at all, so it is the
+    one most likely to grow a token if somebody makes it more helpful. The call it names is what a
+    reader needs; which string was refused is not.
+    """
+    session = Session()
+    refused = Response()
+    refused.status_code = 401
+    success = Response()
+    success.status_code = 200
+    client = GitHubClient(RenewableCredentials(), session, pause=MagicMock())
+
+    with caplog.at_level(logging.DEBUG), patch.object(session, "get", side_effect=[refused, success]):
+        client.get("https://api.github.com/example")
+
+    assert "token-0" not in caplog.text
+    assert "token-1" not in caplog.text
+    assert "GitHub returned HTTP 401 for GET https://api.github.com/example" in caplog.text
+
+
 def test_the_client_counts_a_call_that_failed() -> None:
     """Count a call GitHub refused, which cost the same as one it answered."""
     session = Session()
     response = Response()
     response.status_code = 403
     response.url = "https://api.github.com/repos/hmcts/nfdiv-case-api"
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with patch.object(session, "get", return_value=response), pytest.raises(GitHubError):
         client.get("https://api.github.com/repos/hmcts/nfdiv-case-api")
 
@@ -902,7 +1082,7 @@ def test_a_403_that_says_the_feature_is_off_is_not_a_refusal(message: str) -> No
     not one.
     """
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", return_value=refused_response(message)),
         pytest.raises(GitHubError) as captured,
@@ -932,7 +1112,7 @@ def test_a_403_this_client_does_not_recognise_stays_a_refusal(message: str) -> N
     the log and adds. The reverse direction would hide a real refusal behind a phrase we guessed at.
     """
     session = Session()
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", return_value=refused_response(message)),
         pytest.raises(GitHubError, match="GitHub permission denied") as captured,
@@ -946,7 +1126,7 @@ def test_a_successful_call_logs_one_debug_line(caplog: pytest.LogCaptureFixture)
     """Emit one line per call, naming what was asked for and how much came back."""
     session = Session()
     response = MagicMock(status_code=200, headers={}, content=b'[{"number": 1}]')
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with caplog.at_level(logging.DEBUG), patch.object(session, "get", return_value=response):
         client.get("https://api.github.com/repos/hmcts/cath-service/rulesets/17187159")
 
@@ -964,7 +1144,7 @@ def test_a_disabled_feature_logs_one_debug_line_beside_the_calls_that_worked(
     """Keep a disabled feature out of the warnings, so a 403 at INFO is always a real access problem."""
     session = Session()
     disabled = refused_response("Code Security must be enabled for this repository to use code scanning.")
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         caplog.at_level(logging.DEBUG),
         patch.object(session, "get", return_value=disabled),
@@ -991,7 +1171,7 @@ def test_a_refused_call_logs_one_warning_line_and_no_other(caplog: pytest.LogCap
     """
     session = Session()
     refused = refused_response("Resource not accessible by personal access token")
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         caplog.at_level(logging.DEBUG),
         patch.object(session, "get", return_value=refused),
@@ -1015,7 +1195,7 @@ def test_a_graphql_call_names_the_repository_its_variables_carry(caplog: pytest.
     session = Session()
     response = MagicMock(status_code=200, headers={}, content=b"{}")
     response.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
     with caplog.at_level(logging.DEBUG), patch.object(session, "post", return_value=response):
         client.graphql("query { viewer { login } }", {"organization": "hmcts", "repository": "cath-service"})
 
@@ -1037,7 +1217,7 @@ def test_a_retried_call_logs_its_retry_warning_rather_than_an_outcome_line(
     session = Session()
     unavailable = MagicMock(status_code=503, headers={}, text="", content=b"")
     success = MagicMock(status_code=200, headers={}, content=b"{}")
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with caplog.at_level(logging.DEBUG), patch.object(session, "get", side_effect=[unavailable, success]):
         client.get("https://api.github.com/example")
 
@@ -1053,7 +1233,7 @@ def test_the_client_counts_a_retried_call_once() -> None:
     failed = MagicMock(status_code=502, headers={}, text="")
     success = MagicMock(status_code=200, headers={})
     success.json.return_value = {"data": {"viewer": {"login": "octocat"}}}
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with patch.object(session, "post", side_effect=[failed, success]) as post:
         client.graphql("query { viewer { login } }")
 
@@ -1115,7 +1295,7 @@ def test_two_repositories_reading_one_endpoint_are_counted_as_one() -> None:
     repository = MagicMock(status_code=200, headers={}, content=b"{}")
     disabled = refused_response("Dependabot alerts are disabled for this repository.")
     refused = refused_response("Resource not accessible by personal access token")
-    client = GitHubClient("secret", session, pause=MagicMock())
+    client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
 
     with patch.object(session, "get", side_effect=[repository, repository, disabled, refused]):
         client.get_repository("hmcts", "cath-service")
@@ -1137,7 +1317,7 @@ def test_a_graphql_call_is_counted_without_the_variables_that_name_its_repositor
     session = Session()
     response = MagicMock(status_code=200, headers={}, content=b"{}")
     response.json.return_value = {"data": {"repository": {"name": "cath-service"}}}
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with patch.object(session, "post", return_value=response):
         client.graphql("query { repository { name } }", {"organization": "hmcts", "repository": "cath-service"})
@@ -1155,7 +1335,7 @@ def test_the_counted_outcomes_cannot_be_rewritten_by_a_reader() -> None:
     """
     session = Session()
     response = MagicMock(status_code=200, headers={}, content=b"{}")
-    client = GitHubClient("secret", session)
+    client = GitHubClient(PersonalAccessToken("secret"), session)
 
     with patch.object(session, "get", return_value=response):
         client.get_repository("hmcts", "cath-service")

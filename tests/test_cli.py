@@ -10,11 +10,14 @@ from sqlite3 import connect
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from requests import ConnectionError as RequestsConnectionError
 from requests import Response
 
 from metrics.cli import INCOMPLETE_RUN, log_call_summary, main
 from metrics.config import load_configuration
+from metrics.credentials import CredentialsError
 from metrics.domain import (
     AlertSeverity,
     CodeownersEvidence,
@@ -81,9 +84,9 @@ def graphql_responses(
 ) -> Callable[..., MagicMock]:
     """Answer each GraphQL request with the payload belonging to the document it sent."""
 
-    def respond(url: str, *, json: dict[str, object], timeout: int) -> MagicMock:
+    def respond(url: str, *, json: dict[str, object], headers: dict[str, str], timeout: int) -> MagicMock:
         """Return the response for one posted GraphQL document."""
-        _ = url, timeout
+        _ = url, headers, timeout
         query = str(json["query"])
         if "githubCodeowners" in query:
             # The bundled repository-standards query: an empty branch and no CODEOWNERS by default.
@@ -101,8 +104,51 @@ def graphql_responses(
     return respond
 
 
-def test_doctor_succeeds(configuration_path: Path) -> None:
+@pytest.fixture(scope="session")
+def app_private_key(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Write a throwaway RSA private key where `GH_APP_PRIVATE_KEY_PATH` expects to find one.
+
+    A real key, so the assertion the exchange carries is really signed: a stub would pass every test
+    here and leave the one failure that matters — a process that cannot sign at all — undetected.
+    Generated once for the session, because an RSA keygen per test is the slowest thing in the suite.
+    """
+    generated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    path = tmp_path_factory.mktemp("app") / "app.pem"
+    path.write_bytes(
+        generated.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+    )
+    return path
+
+
+def app_environment(key: Path) -> dict[str, str]:
+    """Configure App auth and nothing else, so no assertion can be satisfied by a fallback token."""
+    return {"GH_APP_ID": "1234", "GH_APP_INSTALLATION_ID": "5678", "GH_APP_PRIVATE_KEY_PATH": str(key)}
+
+
+def installation_token(payload: object, status_code: int = 201) -> MagicMock:
+    """Build one stubbed answer to the installation token exchange."""
+    response = MagicMock(status_code=status_code, ok=status_code < 400, text="")
+    response.json.return_value = payload
+    return response
+
+
+MINTED = {"token": "ghs_minted", "expires_at": "2126-01-01T00:00:00Z"}
+"""One minted installation token, expiring long after any machine that runs these tests will.
+
+The expiry is a century out rather than an hour, because the credential reads the real clock here:
+an instant in the past would put every read inside the renewal margin and mint a second token.
+"""
+
+EXCHANGE_URL = "https://api.github.com/app/installations/5678/access_tokens"
+
+
+def test_doctor_succeeds(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Validate configuration and accessible repositories."""
+    caplog.set_level(logging.INFO)
     with (
         patch("sys.argv", ["metrics", "doctor", "--config", str(configuration_path)]),
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
@@ -114,12 +160,48 @@ def test_doctor_succeeds(configuration_path: Path) -> None:
     session = session_class.return_value.__enter__.return_value
     session.get.assert_called_once_with(
         "https://api.github.com/repos/hmcts/nfdiv-case-api",
+        headers={"Authorization": "Bearer secret"},
         timeout=30,
     )
+    # The mode, on every run that contacts GitHub: what a token may read is not what an installation
+    # may read, so a report of refusals is one line away from its explanation.
+    assert "Authenticating to GitHub as a personal access token" in caplog.text
+    # No call minted anything: a PAT is already the token, so proving it costs nothing.
+    session.post.assert_not_called()
 
 
-def test_doctor_requires_token(configuration_path: Path) -> None:
-    """Fail before making requests when the token is absent."""
+def test_doctor_authenticates_as_a_github_app(
+    configuration_path: Path,
+    app_private_key: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mint an installation token before asking about a repository, and send the token that arrives."""
+    caplog.set_level(logging.INFO)
+    with (
+        patch("sys.argv", ["metrics", "doctor", "--config", str(configuration_path)]),
+        patch.dict("os.environ", app_environment(app_private_key), clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.post.return_value = installation_token(MINTED)
+        session.get.return_value.status_code = 200
+
+        assert main() == 0
+
+    assert "Authenticating to GitHub as GitHub App 1234, installation 5678" in caplog.text
+    assert session.post.call_args.args == (EXCHANGE_URL,)
+    session.get.assert_called_once_with(
+        "https://api.github.com/repos/hmcts/nfdiv-case-api",
+        headers={"Authorization": "Bearer ghs_minted"},
+        timeout=30,
+    )
+    # No part of the credential reaches the log: neither the token GitHub issued, nor the assertion
+    # that bought it, nor the key that signed it.
+    assert "ghs_minted" not in caplog.text
+
+
+def test_doctor_requires_credentials(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Name both ways of authenticating, and ask about no repository, when neither is configured."""
     with (
         patch("sys.argv", ["metrics", "doctor", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
@@ -127,7 +209,60 @@ def test_doctor_requires_token(configuration_path: Path) -> None:
     ):
         assert main() == 1
 
-    session_class.assert_not_called()
+    session = session_class.return_value.__enter__.return_value
+    session.get.assert_not_called()
+    session.post.assert_not_called()
+    assert "GH_APP_ID" in caplog.text
+    assert "GH_TOKEN" in caplog.text
+
+
+def test_doctor_reports_a_refused_installation_token(
+    configuration_path: Path,
+    app_private_key: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stop the run at the exchange, carrying GitHub's own account of why the App cannot be used."""
+    with (
+        patch("sys.argv", ["metrics", "doctor", "--config", str(configuration_path)]),
+        patch.dict("os.environ", app_environment(app_private_key), clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.post.return_value = installation_token({"message": "Integration not found"}, status_code=404)
+
+        assert main() == 1
+
+    assert "Cannot authenticate to GitHub" in caplog.text
+    assert "Integration not found" in caplog.text
+    # Nothing was asked about a repository: an inaccessible repository and an unusable credential are
+    # different problems, and reporting fourteen of the first for one of the second wastes a morning.
+    session.get.assert_not_called()
+
+
+def test_a_credential_that_fails_after_the_run_started_ends_it_with_one_line(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Answer a renewal that fails mid-run exactly as a failure to mint at startup is answered.
+
+    Startup is not the only place this happens. An installation token is replaced inside the
+    five-minute margin partway through any run long enough to outlive one, and again if a 401 gets
+    past that — both deep inside a request, where every handler between there and here grades ONE
+    repository's evidence and is looking for a `GitHubError`. Without a handler of its own the
+    renewal a bad minute at GitHub defeats ends the run in a traceback instead of in the line that
+    says what to fix.
+    """
+    credentials = MagicMock()
+    credentials.token.side_effect = ["ghs_minted", CredentialsError("the token exchange failed")]
+    with (
+        patch("sys.argv", ["metrics", "doctor", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.cli.Session"),
+        patch("metrics.cli.resolve_credentials", return_value=credentials),
+    ):
+        assert main() == 1
+
+    assert "Cannot authenticate to GitHub: the token exchange failed" in caplog.text
 
 
 def test_doctor_fails_for_inaccessible_repository(configuration_path: Path) -> None:
@@ -154,6 +289,24 @@ def alert_responses() -> list[MagicMock]:
         response.json.return_value = []
         responses.append(response)
     return responses
+
+
+def test_collect_requires_credentials(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Refuse a collection that cannot authenticate, before it asks GitHub about anything."""
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        assert main() == 1
+
+    session = session_class.return_value.__enter__.return_value
+    session.get.assert_not_called()
+    session.post.assert_not_called()
+    assert "Cannot authenticate to GitHub" in caplog.text
+    # No offline advice here: `collect` has nothing to do without GitHub, and offering a flag that
+    # does not exist on this command is worse than offering nothing.
+    assert "--offline" not in caplog.text
 
 
 def test_collect_reports_current_state_and_what_the_window_fetched(
@@ -283,6 +436,7 @@ teams:
     session = session_class.return_value.__enter__.return_value
     session.get.assert_called_once_with(
         "https://api.github.com/repos/hmcts/opal-common-lib",
+        headers={"Authorization": "Bearer secret"},
         timeout=30,
     )
 
@@ -753,9 +907,15 @@ def sonar_answers(
     analysed = analyses or {}
     found = commits or {}
 
-    def respond(url: str, *, params: dict[str, object] | None = None, timeout: int = 30) -> MagicMock:
+    def respond(
+        url: str,
+        *,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 30,
+    ) -> MagicMock:
         """Return the response belonging to one requested URL."""
-        _ = timeout
+        _ = headers, timeout
         parameters = params or {}
         if url.endswith("/api/components/search_projects"):
             payload: object = {"paging": {"total": len(projects)}, "components": projects}
@@ -1236,8 +1396,12 @@ def test_map_sonar_reports_a_storage_failure(
     assert "Storage failed: database is locked" in caplog.text
 
 
-def test_map_sonar_requires_a_token(configuration_path: Path) -> None:
-    """Fail before opening a session: the commit search is the one call that cannot be anonymous here."""
+def test_map_sonar_requires_credentials(configuration_path: Path) -> None:
+    """Call neither API: the commit search that resolves a project cannot be made anonymously.
+
+    A session IS opened, unlike every version of this before App auth: proving an installation means
+    exchanging a JWT for a token, and that exchange is itself an HTTP call.
+    """
     with (
         patch("sys.argv", ["metrics", "map-sonar", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
@@ -1245,7 +1409,9 @@ def test_map_sonar_requires_a_token(configuration_path: Path) -> None:
     ):
         assert main() == 1
 
-    session_class.assert_not_called()
+    session = session_class.return_value.__enter__.return_value
+    session.get.assert_not_called()
+    session.post.assert_not_called()
 
 
 def test_map_sonar_runs_without_a_configured_team(configuration_path: Path) -> None:
@@ -1366,6 +1532,23 @@ def test_evidence_runs_offline_without_token_or_session(
     assert not output["identities_included"]
     assert "pull_requests" not in output
     session_class.assert_not_called()
+
+
+def test_evidence_resolves_no_credentials_offline(configuration_path: Path) -> None:
+    """Never look for a credential in an offline run, rather than resolving one and not using it.
+
+    Stronger than asserting no session was opened: an App would be resolved from a key on disk, which
+    a run that promised to contact nothing has no business reading either.
+    """
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.cli.resolve_credentials") as resolve,
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    resolve.assert_not_called()
 
 
 def test_evidence_defaults_to_all_observed_behaviour(
@@ -2389,7 +2572,7 @@ teams:
     assert "nfdiv-case-orchestration" in caplog.text
 
 
-def test_evidence_requires_a_token_before_collecting(
+def test_evidence_requires_credentials_before_collecting(
     configuration_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2401,6 +2584,10 @@ def test_evidence_requires_a_token_before_collecting(
         assert main() == 1
 
     assert "use --offline to report cached evidence only" in caplog.text
+    # And what was missing, in the same record: the remedy alone leaves a human who wanted to collect
+    # guessing which variables to set.
+    assert "GH_APP_ID" in caplog.text
+    assert "GH_TOKEN" in caplog.text
 
 
 def test_evidence_collects_the_requested_window(
@@ -2947,7 +3134,7 @@ def test_trend_collects_the_periods_the_cache_lacks(
     assert len(json.loads(capsys.readouterr().out)["repositories"][0]["periods"]) == 2
 
 
-def test_trend_requires_a_token_before_collecting(
+def test_trend_requires_credentials_before_collecting(
     trend_configuration_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2959,6 +3146,22 @@ def test_trend_requires_a_token_before_collecting(
         assert main() == 1
 
     assert "use --offline to report cached evidence only" in caplog.text
+
+
+def test_trend_resolves_no_credentials_offline(trend_configuration_path: Path) -> None:
+    """Read a cached series with no credential of any kind, as `evidence --offline` does."""
+    with (
+        patch(
+            "sys.argv",
+            ["metrics", "trend", "--config", str(trend_configuration_path), "--offline", "--periods", "3"],
+        ),
+        patch.dict("os.environ", {}, clear=True),
+        patch("metrics.cli.resolve_credentials") as resolve,
+        cached_periods(),
+    ):
+        assert main() == 0
+
+    resolve.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from requests import HTTPError, RequestException, Response, Session
 from requests.exceptions import JSONDecodeError
 
+from metrics.credentials import GitHubCredentials
 from metrics.domain import AvailabilityReason
 
 
@@ -187,19 +188,24 @@ class GitHubClient:
 
     def __init__(
         self,
-        token: str,
+        credentials: GitHubCredentials,
         session: Session,
         pause: Callable[[float], None] = sleep,
         clock: Callable[[], float] = time,
         rate_limit_reserve: int = 0,
     ) -> None:
+        # ONLY the two headers that are the same on every call this client will ever make. The
+        # Authorization header is deliberately NOT among them: an installation token expires within
+        # the hour, and a session holding one hands a stale credential to anything else given the
+        # same session. It is asked for per request instead, from the credentials object, so no call
+        # site holds a token beyond the request it is sent on.
         session.headers.update(
             {
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+        self.credentials = credentials
         self.session = session
         self.pause = pause
         self.clock = clock
@@ -346,9 +352,17 @@ class GitHubClient:
         so, and only GraphQL passes one. It is read where the call is logged and counted, never on an
         attempt that is about to be retried, so a response the client superseded is not graded on a
         body nobody acted on.
+
+        A 401 is retried ONCE, and only when the credentials can actually produce a different token.
+        A collection of 1850 repositories outlives the hour an installation token lives for, so a
+        token expiring mid-flight is an expected event with an obvious remedy, not a repository whose
+        evidence is unavailable. A personal access token answers `refresh()` with False and takes the
+        untouched path straight to `AUTHENTICATION_FAILED`, because sending a just-refused token a
+        second time buys nothing.
         """
         self.wait_for_rate_limit(resource)
         attempt = 0
+        refreshed = False
         while True:
             attempt += 1
             try:
@@ -370,6 +384,17 @@ class GitHubClient:
                 continue
 
             self.record_rate_limit(response)
+            if response.status_code == HTTPStatus.UNAUTHORIZED and not refreshed and self.credentials.refresh():
+                refreshed = True
+                # The transient budget is NOT charged for this. Those three attempts exist to outlast
+                # a bad minute at GitHub, and an expired token has spent none of it — a call that
+                # then hits a 502 should still get its full complement of retries.
+                attempt -= 1
+                logging.warning(
+                    "GitHub returned HTTP 401 for %s, retrying once with a freshly minted token",
+                    description,
+                )
+                continue
             try:
                 delay = retry_delay(response, attempt)
             except GitHubError:
@@ -470,16 +495,33 @@ class GitHubClient:
         """
         return self.rate_limits.get(resource)
 
+    def authorization(self) -> dict[str, str]:
+        """Return the Authorization header for ONE request, asking credentials for the token now.
+
+        Asked for per request rather than once, because in App mode the token is minted on demand
+        and replaced before it expires: a header built at construction would be an hour stale by the
+        end of a collection that takes longer than that. In PAT mode this returns the same string
+        every time and costs a dictionary.
+
+        The dictionary goes to `requests` and nowhere else. NO PATH IN THIS CLIENT LOGS A HEADER
+        MAPPING: `log_outcome` writes a status, the description the caller built, and GitHub's own
+        `message`; the retry warnings read individual `x-ratelimit-*` values by name; and the 401
+        line names the call rather than the token it was refused for. That is why there is no
+        redaction step here to remember to apply — the token has nowhere to leak to. Anything added
+        that logs headers wholesale has to redact them, and `credentials.redacted` is how.
+        """
+        return {"Authorization": f"Bearer {self.credentials.token()}"}
+
     def send(self, url: str, parameters: dict[str, str | int] | None) -> Response:
         """Send one HTTP request."""
         if parameters:
-            return self.session.get(url, params=parameters, timeout=30)
-        return self.session.get(url, timeout=30)
+            return self.session.get(url, params=parameters, headers=self.authorization(), timeout=30)
+        return self.session.get(url, headers=self.authorization(), timeout=30)
 
     def send_graphql(self, query: str, variables: Mapping[str, object] | None) -> Response:
         """Send one GraphQL HTTP request."""
         payload = {"query": query, "variables": dict(variables or {})}
-        return self.session.post(self.graphql_url, json=payload, timeout=30)
+        return self.session.post(self.graphql_url, json=payload, headers=self.authorization(), timeout=30)
 
     def graphql_retry_delay(self, response: Response, attempt: int) -> float | None:
         """Return the delay required for HTTP or GraphQL rate-limit failures.

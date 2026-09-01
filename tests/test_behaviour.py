@@ -37,6 +37,7 @@ from metrics.behaviour import (
     window_progress,
 )
 from metrics.config import Configuration, TeamConfiguration
+from metrics.credentials import PersonalAccessToken
 from metrics.domain import (
     AvailabilityReason,
     BehaviourProvenance,
@@ -937,7 +938,7 @@ def test_collect_window_adds_what_the_window_cost_to_what_current_state_cost(tmp
     with patch("metrics.cost.monotonic", measured_clock(10.0, 12.5)):
         result = collect_window(
             configuration(tmp_path / "metrics.sqlite3"),
-            CountingClient("secret", Session()),
+            CountingClient(PersonalAccessToken("secret"), Session()),
             inventory,
             ReportingWindow(starts_at=datetime(2026, 7, 1, tzinfo=UTC), ends_at=datetime(2026, 8, 1, tzinfo=UTC)),
             datetime(2026, 8, 1, tzinfo=UTC),

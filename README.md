@@ -122,10 +122,41 @@ uv sync
 uv run poe check
 ```
 
+## Authenticate
+
+A run authenticates **either as a GitHub App installation or with a personal access token**. App auth is used when
+`GH_APP_ID`, `GH_APP_INSTALLATION_ID` and a private key are all set; anything less falls back to `GH_TOKEN`, so a
+half-set left over from an experiment reverts to the token rather than failing the run with a partial configuration
+nobody meant to use. **What counts is whether a key was named, not whether it read back**: a key variable pointing at a
+file that is missing or empty is a broken App configuration and stops the run saying so, rather than falling back to a
+token whose smaller permissions would report branch protection and all three alert families as unavailable with nothing
+explaining why. With neither the App set nor `GH_TOKEN`, every command that contacts GitHub stops before collecting
+anything and names both options.
+
+The key is read from **`GH_APP_PRIVATE_KEY_PATH` in preference to `GH_APP_PRIVATE_KEY`**. A path wins because it is the
+safer of the two: a PEM in an environment variable is visible to every child process and to anything that dumps the
+environment. The variable is accepted anyway, because CI secret stores commonly cannot hold newlines, and escaped `\n`
+sequences in it are converted back to real ones.
+
+**The two modes do not read the same things.** An App installation is granted its permissions by the organisation rather
+than intersected with a user's, which is what makes branch protection, the three alert families and the GraphQL
+pull-request searches readable at all — a user-intersected fine-grained token is refused on every one of them, and each
+refusal is reported as availability rather than as a number. A personal access token stays supported because it is what
+a developer already has in their shell, and a run that reads less is better than a run nobody can start. Every run that
+contacts GitHub logs which mode it is in — the App and installation ids, which are identifiers rather than secrets, or
+`a personal access token` — so a report full of refusals is one line away from its explanation.
+
+The installation token is minted **once at startup**, so a wrong key, App id, or installation stops the run while
+someone is still watching it rather than 1850 repositories in, and it is replaced five minutes before GitHub's stated
+expiry, so a collection lasting longer than one token's hour never sends an expired one. Nothing about the key, the JWT,
+or the token reaches the log at any level.
+
 ## Run
 
 ```bash
-export GH_TOKEN=your-fine-grained-personal-access-token
+export GH_APP_ID=123456
+export GH_APP_INSTALLATION_ID=78901234
+export GH_APP_PRIVATE_KEY_PATH=~/.config/metrics/github-app.pem
 uv run metrics doctor --config metrics.example.yaml
 uv run metrics map-sonar --config metrics.example.yaml
 uv run metrics collect --config metrics.example.yaml --from 2026-05-01 --to 2026-08-01
@@ -143,8 +174,12 @@ The two collecting commands have disjoint jobs. **`collect` fills the cache and 
 series of windows anchored to each repository's enablement date, through the same code — see
 [Trend](#trend-measuring-periods-after-enablement) below.
 
-`doctor` validates the configuration and verifies that the token can read every configured repository. It does not query
-GitHub's repository-team endpoint, which is unavailable to fine-grained personal access tokens.
+`doctor` validates the configuration and verifies that the credential the run holds can read every configured
+repository. It does not query GitHub's repository-team endpoint. That began as a permission limit — a fine-grained
+personal access token is refused it — but it is not one under App auth, where an installation granted
+`Administration: read` can read it. It stays unqueried because nothing needs the answer: repository ownership comes from
+the configuration and is authoritative there, so asking GitHub would check a credential against data this tool does not
+use.
 
 `map-sonar` resolves which GitHub repository each SonarCloud project analyses and stores the answer, so that `collect`
 can read a repository's quality state without having to work out whose it is. It is **run by hand, periodically — not on

@@ -13,6 +13,7 @@ from requests import ConnectionError as RequestsConnectionError
 from requests import HTTPError, Session
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
+from metrics.credentials import PersonalAccessToken
 from metrics.domain import (
     AvailabilityReason,
     SonarGateLevel,
@@ -481,7 +482,7 @@ def github_reading(*responses: MagicMock) -> tuple[GitHubClient, MagicMock]:
     session = MagicMock()
     session.headers = {}
     session.get.side_effect = responses
-    return GitHubClient("secret", session, pause=MagicMock()), session.get
+    return GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock()), session.get
 
 
 def analyses_payload(*entries: tuple[str, str | None]) -> dict[str, object]:
@@ -842,7 +843,7 @@ def test_sonar_to_github_pauses_a_rate_limited_search_before_giving_up() -> None
     session.headers = {}
     session.get.side_effect = [limited, limited, github_answer(commit_search_payload("hmcts/cath-service"))]
     retry = MagicMock()
-    github = GitHubClient("secret", session, pause=retry)
+    github = GitHubClient(PersonalAccessToken("secret"), session, pause=retry)
     pacer, _ = resolving()
 
     attempt = sonar_to_github(sonar, github, "hmcts", "hmcts.cath", pacer=pacer)
@@ -858,7 +859,7 @@ def test_sonar_to_github_reraises_a_rate_limit_that_never_cleared() -> None:
     session = MagicMock()
     session.headers = {}
     session.get.side_effect = [limited, limited, limited]
-    github = GitHubClient("secret", session, pause=MagicMock())
+    github = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     pacer, _ = resolving()
 
     with pytest.raises(GitHubError, match="rate limit exceeded") as captured:

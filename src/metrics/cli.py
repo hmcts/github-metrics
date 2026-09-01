@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from os import environ
 from pathlib import Path
 
 from requests import Session
@@ -24,6 +23,7 @@ from metrics.config import (
     load_configuration,
     repository_owners,
 )
+from metrics.credentials import AppInstallation, CredentialsError, GitHubCredentials, resolve_credentials
 from metrics.doctor import run_doctor
 from metrics.domain import (
     BehaviourEvidenceCollection,
@@ -103,6 +103,58 @@ def run_status(status: CollectionStatus) -> int:
     if status is CollectionStatus.COMPLETE:
         return 0
     return 1 if status is CollectionStatus.FAILED else INCOMPLETE_RUN
+
+
+OFFLINE_ADVICE = "use --offline to report cached evidence only"
+"""What to tell a human whose reporting command cannot authenticate.
+
+Only the two reporting commands carry it: `evidence` and `trend` have a cached answer to fall back
+on, and `collect`, `doctor` and `map-sonar` have nothing to do without GitHub.
+"""
+
+
+def authentication_mode(credentials: GitHubCredentials) -> str:
+    """Describe what the run is authenticating as, without naming any part of the credential itself.
+
+    Logged at the start of every run that contacts GitHub, because the two modes read DIFFERENT
+    THINGS: branch protection, the three alert families and the GraphQL pull-request searches answer
+    for an App installation and are refused for a user-intersected fine-grained token. A report full
+    of `refused` findings is then one line away from its explanation, rather than an afternoon of
+    checking permissions on the wrong credential.
+
+    The App and installation ids are identifiers, not secrets — they are visible to anyone who can
+    read the App's public page — so they are named. Nothing about the key or the token is.
+    """
+    if isinstance(credentials, AppInstallation):
+        return f"GitHub App {credentials.app_identifier}, installation {credentials.installation_identifier}"
+    return "a personal access token"
+
+
+def github_credentials(session: Session, advice: str = "") -> GitHubCredentials | None:
+    """Resolve the run's credential and prove it, or report why the run cannot authenticate.
+
+    MINTS ONCE HERE, before any collection: in App mode this forces the exchange the first request
+    would have made anyway, so a wrong key, a wrong App id or an installation that no longer exists
+    stops the run while a human is still watching it rather than 1850 repositories in. In PAT mode it
+    returns the configured string and costs no call.
+
+    None rather than a raised exception, following `resolve_configuration`: every caller answers a
+    credentials failure the same way — say what is wrong, and exit non-zero.
+    """
+    try:
+        credentials = resolve_credentials(session)
+        logging.info("Authenticating to GitHub as %s", authentication_mode(credentials))
+        credentials.token()
+    except CredentialsError as exception:
+        logging.error("Cannot authenticate to GitHub: %s%s", exception, f"; {advice}" if advice else "")
+        return None
+    return credentials
+
+
+def github_client(session: Session, advice: str = "") -> GitHubClient | None:
+    """Build the one client a run makes every GitHub call through, on proven credentials."""
+    credentials = github_credentials(session, advice)
+    return None if credentials is None else GitHubClient(credentials, session)
 
 
 def add_window_arguments(parser: ArgumentParser) -> None:
@@ -368,9 +420,6 @@ def emit_evidence(configuration: Configuration, options: Namespace) -> int:
     if unusable is not None:
         logging.error(unusable)
         return 1
-    if not options.offline and environ.get("GH_TOKEN") is None:
-        logging.error("GH_TOKEN is not set; use --offline to report cached evidence only")
-        return 1
     reference = datetime.now(UTC)
     try:
         window = requested_window(configuration, options, reference)
@@ -380,10 +429,14 @@ def emit_evidence(configuration: Configuration, options: Namespace) -> int:
 
     # One session and one client for both phases of the run, so the second does not discard the
     # rate-limit budget the first learned. Neither phase contacts GitHub when the run is offline.
-    # ExitStack rather than `with Session()`: an offline run must construct no session at all, which
-    # `test_evidence_runs_offline_without_token_or_session` pins.
+    # ExitStack rather than `with Session()`: an offline run must construct no session at all and
+    # resolve no credentials, which `test_evidence_runs_offline_without_token_or_session` pins.
     with ExitStack() as stack:
-        client = None if options.offline else GitHubClient(environ["GH_TOKEN"], stack.enter_context(Session()))
+        client = None
+        if not options.offline:
+            client = github_client(stack.enter_context(Session()), OFFLINE_ADVICE)
+            if client is None:
+                return 1
         loaded = gather_evidence(configuration, options, client, window, reference)
         evidence = tuple(item for item in loaded if isinstance(item, RepositoryEvidence))
         unavailable = tuple(item for item in loaded if isinstance(item, EvidenceUnavailable))
@@ -441,14 +494,15 @@ def emit_trend(configuration: Configuration, options: Namespace) -> int:
     uncovered period and a warm one costs nothing; `--offline` refuses any period the cache does not
     fully cover rather than reporting a short one.
     """
-    if not options.offline and environ.get("GH_TOKEN") is None:
-        logging.error("GH_TOKEN is not set; use --offline to report cached evidence only")
-        return 1
     reference = datetime.now(UTC)
     # ExitStack rather than `with Session()`, as `emit_evidence` does: an offline run must construct
     # no session at all, so the trend of a cached series never needs credentials.
     with ExitStack() as stack:
-        client = None if options.offline else GitHubClient(environ["GH_TOKEN"], stack.enter_context(Session()))
+        client = None
+        if not options.offline:
+            client = github_client(stack.enter_context(Session()), OFFLINE_ADVICE)
+            if client is None:
+                return 1
         try:
             request = SeriesRequest(
                 period_days=options.period_days,
@@ -534,7 +588,7 @@ def log_call_summary(outcomes: Mapping[CallOutcome, int], repositories: int) -> 
     )
 
 
-def collect_evidence(configuration: Configuration, options: Namespace, token: str) -> int:
+def collect_evidence(configuration: Configuration, options: Namespace) -> int:
     """Fill the cache for one collection window and report what was fetched or reused.
 
     The collection report is written whatever the run's completeness, including when nothing could
@@ -552,10 +606,13 @@ def collect_evidence(configuration: Configuration, options: Namespace, token: st
     except ValueError as exception:
         logging.error("Unusable collection window: %s", exception)
         return 1
-    # Two sessions, as `map-sonar` uses: the GitHub client puts its bearer token on the session it is
-    # given, and sharing one would send a GitHub token to SonarCloud on every request.
+    # Two sessions, as `map-sonar` uses: the GitHub client stamps GitHub's own Accept and API-version
+    # headers onto the session it is given, and SonarCloud is not GitHub. The bearer no longer travels
+    # on the session — it is sent per request — but the two APIs still do not share one.
     with Session() as session, Session() as sonar_session:
-        client = GitHubClient(token, session)
+        client = github_client(session)
+        if client is None:
+            return 1
         try:
             inventory = collect_window(
                 configuration,
@@ -772,11 +829,11 @@ def log_mapping_summary(organization: str, progress: MappingProgress) -> None:
         logging.warning("%s is claimed by %s projects: %s", repository, len(projects), ", ".join(projects))
 
 
-def map_sonar_projects(configuration: Configuration, token: str) -> int:
+def map_sonar_projects(configuration: Configuration) -> int:
     """Resolve every project the configured SonarCloud organisation lists, and store the map.
 
-    Two sessions, not one: the GitHub client puts its bearer token on the session it is given, and
-    sharing that session would send a GitHub token to SonarCloud on every request.
+    Two sessions, not one: the GitHub client stamps GitHub's own Accept and API-version headers onto
+    the session it is given, and sharing that session would send them to SonarCloud on every request.
 
     An organisation that lists nothing is a refusal rather than an empty success — the configured
     `sonar_organization` names nothing readable, and reporting `0` would let a later evidence run
@@ -789,7 +846,9 @@ def map_sonar_projects(configuration: Configuration, token: str) -> int:
     sonar_organization = configuration.sonar_organization_name
     database = observation_database(configuration.database)
     with Session() as github_session, Session() as sonar_session:
-        github = GitHubClient(token, github_session)
+        github = github_client(github_session)
+        if github is None:
+            return 1
         sonar = SonarClient(sonar_session)
         try:
             projects = sonar.list_projects(sonar_organization)
@@ -839,6 +898,27 @@ def resolve_configuration(options: Namespace) -> Configuration | None:
     return configuration
 
 
+def run_command(configuration: Configuration, options: Namespace) -> int:
+    """Run the one command the arguments named, on a configuration already known to be valid."""
+    # The commands this resolves no credentials for: `prune` never contacts GitHub, and the two
+    # reporting commands resolve their own only when they were not asked to stay offline.
+    reporting = {"evidence": emit_evidence, "trend": emit_trend, "prune": prune_evidence_cache}
+    if options.command in reporting:
+        return reporting[options.command](configuration, options)
+
+    if options.command == "doctor":
+        # A session before the credential, unlike every earlier version of this: App auth is proven
+        # by exchanging a JWT for an installation token, and that exchange is an HTTP call. No
+        # request about a repository is made until the credential is proven.
+        with Session() as session:
+            logging.info("OK     Configuration valid")
+            credentials = github_credentials(session)
+            return 0 if credentials is not None and run_doctor(configuration, credentials, session) else 1
+    if options.command == "map-sonar":
+        return map_sonar_projects(configuration)
+    return collect_evidence(configuration, options)
+
+
 def main() -> int:
     """Entry point for the command-line interface."""
     options = parse_arguments()
@@ -846,23 +926,19 @@ def main() -> int:
     configuration = resolve_configuration(options)
     if configuration is None:
         return 1
-    # The commands main() need not hold a token for: `prune` never contacts GitHub, and the two
-    # reporting commands acquire one themselves only when they were not asked to stay offline.
-    reporting = {"evidence": emit_evidence, "trend": emit_trend, "prune": prune_evidence_cache}
-    if options.command in reporting:
-        return reporting[options.command](configuration, options)
-
-    token = environ.get("GH_TOKEN")
-    if token is None:
-        logging.error("GH_TOKEN is not set")
+    try:
+        return run_command(configuration, options)
+    except CredentialsError as exception:
+        # THE SAME ANSWER AFTER COLLECTION STARTS AS BEFORE IT. `github_credentials` catches the
+        # failure to mint at startup, but that is not the only place one happens: an installation
+        # token is renewed inside the five-minute margin partway through any collection long enough
+        # to outlive it, and replaced again if a 401 gets past that. Both go through `token()` deep
+        # inside a request, where nothing between here and there catches this — every handler on the
+        # way up grades ONE repository's evidence and expects a `GitHubError`. Without this the
+        # renewal a bad minute at GitHub defeats ends the run in a traceback rather than in the one
+        # line that says what to fix.
+        logging.error("Cannot authenticate to GitHub: %s", exception)
         return 1
-    if options.command == "doctor":
-        with Session() as session:
-            logging.info("OK     Configuration valid")
-            return 0 if run_doctor(configuration, token, session) else 1
-    if options.command == "map-sonar":
-        return map_sonar_projects(configuration, token)
-    return collect_evidence(configuration, options, token)
 
 
 if __name__ == "__main__":
