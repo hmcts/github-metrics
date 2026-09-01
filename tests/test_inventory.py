@@ -1,7 +1,7 @@
 """Test configured repository inventory collection."""
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +24,8 @@ from metrics.domain import (
     MaintenanceEvidence,
     MergeGateEvidence,
     OpenAlertCount,
+    OpenPullRequestSnapshot,
+    OpenPullRequestSummary,
     ReportingWindow,
     RepositoryInventoryIssue,
     RepositoryMetadata,
@@ -39,6 +41,7 @@ from metrics.inventory import (
     MAINTENANCE_HISTORY_PAGE_SIZE,
     BypassActor,
     HistoryPage,
+    OpenPullRequestScope,
     RepositoryStandardsResult,
     Ruleset,
     SonarSource,
@@ -47,6 +50,7 @@ from metrics.inventory import (
     bypasses_as_administrator,
     collect_inventory,
     collect_merge_gate,
+    collect_open_pull_requests,
     collect_repository,
     collect_repository_standards,
     collect_rulesets,
@@ -131,6 +135,72 @@ def standards_response(data: dict[str, object] | None = None) -> MagicMock:
     response = MagicMock(status_code=200, headers={})
     response.json.return_value = {"data": data if data is not None else standards_data()}
     return response
+
+
+def collection_reference() -> datetime:
+    """Return the instant an inventory run resolved its window and its stale cutoff against."""
+    return datetime(2026, 8, 1, tzinfo=UTC)
+
+
+def open_pull_request_data(
+    opened_in_window: int = 0,
+    closed_without_merge: int = 0,
+    currently_open: int = 0,
+    stale_open: int = 0,
+) -> dict[str, object]:
+    """Build one bundled open-pull-request GraphQL data object."""
+    return {
+        "openedInWindow": {"issueCount": opened_in_window},
+        "closedWithoutMerge": {"issueCount": closed_without_merge},
+        "currentlyOpen": {"issueCount": currently_open},
+        "staleOpen": {"issueCount": stale_open},
+    }
+
+
+def state_payloads(
+    standards: dict[str, object] | None = None,
+    open_pull_requests: dict[str, object] | None = None,
+) -> Callable[..., dict[str, object]]:
+    """Answer each current-state GraphQL document with the payload belonging to it.
+
+    The current-state phase posts two documents per repository, so a single return value would
+    answer one of them with the other's shape.
+    """
+
+    def respond(query: str, variables: Mapping[str, object] | None = None) -> dict[str, object]:
+        """Return the payload for one posted document."""
+        _ = variables
+        if "openedInWindow" in query:
+            return open_pull_request_data() if open_pull_requests is None else open_pull_requests
+        return standards_data() if standards is None else standards
+
+    return respond
+
+
+def posted_state_responses(standards: dict[str, object] | None = None) -> Callable[..., MagicMock]:
+    """Answer each posted current-state document with the response belonging to it.
+
+    The phase posts two documents per repository — the bundled standards query and the bundled
+    open-pull-request one — so a fixed list of responses would answer whichever came second with
+    the other one's shape.
+    """
+
+    def respond(url: str, *, json: dict[str, object], headers: dict[str, str], timeout: int) -> MagicMock:
+        """Return the response for one posted document."""
+        _ = url, headers, timeout
+        query = str(json["query"])
+        return standards_response(open_pull_request_data() if "openedInWindow" in query else standards)
+
+    return respond
+
+
+def open_pull_request_scope(window: ReportingWindow | None = None) -> OpenPullRequestScope:
+    """Build the open-pull-request scope an inventory run resolves before collecting."""
+    return OpenPullRequestScope(
+        window=window if window is not None else collection_window(),
+        stale_open_days=14,
+        reference=collection_reference(),
+    )
 
 
 def test_collect_repository_preserves_unavailable_reason() -> None:
@@ -379,9 +449,9 @@ def test_collect_inventory_reports_permission_limited_branch_protection(
         patch.object(client, "get_repository", return_value=repository_response),
         patch.object(client, "get_paginated", return_value=()),
         patch.object(client, "get", side_effect=[permission_error, branch_response]),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert inventory.status is status
     assert inventory.repositories[0].merge_gate is not None
@@ -714,7 +784,7 @@ def test_collect_inventory_derives_incomplete_status(status: CollectionStatus) -
     with (
         patch.object(client, "get_repository", side_effect=side_effects),
         patch.object(client, "get_paginated", return_value=()),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
         patch.object(
             client,
             "get",
@@ -724,7 +794,7 @@ def test_collect_inventory_derives_incomplete_status(status: CollectionStatus) -
             ),
         ),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert inventory.status is status
 
@@ -1011,7 +1081,7 @@ def test_collect_inventory_stays_complete_when_a_feature_is_disabled() -> None:
     with (
         patch.object(client, "get_repository", return_value=repository_response),
         patch.object(client, "get_paginated", side_effect=paginated),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
         patch.object(
             client,
             "get",
@@ -1021,7 +1091,7 @@ def test_collect_inventory_stays_complete_when_a_feature_is_disabled() -> None:
             ),
         ),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert inventory.status is CollectionStatus.COMPLETE
     assert inventory.failures == ()
@@ -1110,20 +1180,22 @@ def test_collect_inventory_reports_what_each_repository_cost() -> None:
     responses = unprotected_repository_responses("nfdiv-case-api") + unprotected_repository_responses("nfdiv-frontend")
     with (
         patch.object(session, "get", side_effect=responses),
-        patch.object(session, "post", side_effect=[standards_response(), standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(100.0, 101.5, 200.0, 209.0)),
     ):
-        inventory = collect_inventory(two_repository_configuration(), client, collection_window())
+        inventory = collect_inventory(
+            two_repository_configuration(), client, collection_window(), collection_reference()
+        )
 
     assert inventory.status is CollectionStatus.COMPLETE
     # Slowest first, which is not the configured order: the point of the figure is to name the
     # repository that dominates a run.
     assert tuple(cost.repository for cost in inventory.costs) == ("nfdiv-frontend", "nfdiv-case-api")
     assert tuple(cost.elapsed_seconds for cost in inventory.costs) == (9.0, 1.5)
-    # One repository read, one standards query, one rules page, one protection read and one page
-    # per alert family.
-    assert tuple(cost.requests for cost in inventory.costs) == (7, 7)
-    assert client.requests_issued == 14
+    # One repository read, one standards query, one rules page, one protection read, one page per
+    # alert family and one bundled open-pull-request query.
+    assert tuple(cost.requests for cost in inventory.costs) == (8, 8)
+    assert client.requests_issued == 16
 
 
 def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_answered_with() -> None:
@@ -1148,10 +1220,10 @@ def test_collect_inventory_keys_a_renamed_repository_s_cost_on_the_name_github_a
     )
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(0.0, 2.0)),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert tuple(cost.repository for cost in inventory.costs) == ("nfdiv-case-api",)
 
@@ -1165,10 +1237,12 @@ def test_collect_inventory_reports_the_cost_of_a_repository_that_failed() -> Non
     responses = [*unprotected_repository_responses("nfdiv-case-api"), refused]
     with (
         patch.object(session, "get", side_effect=responses),
-        patch.object(session, "post", side_effect=[standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(0.0, 4.0, 10.0, 11.0)),
     ):
-        inventory = collect_inventory(two_repository_configuration(), client, collection_window())
+        inventory = collect_inventory(
+            two_repository_configuration(), client, collection_window(), collection_reference()
+        )
 
     assert inventory.status is CollectionStatus.PARTIAL
     assert tuple(item.repository.name for item in inventory.repositories) == ("nfdiv-case-api",)
@@ -1932,11 +2006,19 @@ def test_collect_inventory_is_partial_when_only_the_standards_query_failed() -> 
     client = GitHubClient(PersonalAccessToken("secret"), Session())
     repository_response = MagicMock()
     repository_response.json.return_value = repository_metadata().model_dump(mode="json")
+
+    rate_limited = GitHubError("GitHub rate limited", AvailabilityReason.RATE_LIMITED)
+
+    def refuse_standards(query: str, variables: Mapping[str, object] | None = None) -> dict[str, object]:
+        """Rate limit the standards query alone, so the failures name the block that went missing."""
+        _ = variables
+        if "openedInWindow" in query:
+            return open_pull_request_data()
+        raise rate_limited
+
     with (
         patch.object(client, "get_repository", return_value=repository_response),
-        patch.object(
-            client, "graphql", side_effect=GitHubError("GitHub rate limited", AvailabilityReason.RATE_LIMITED)
-        ),
+        patch.object(client, "graphql", side_effect=refuse_standards),
         patch.object(client, "get_paginated", return_value=()),
         patch.object(
             client,
@@ -1947,7 +2029,7 @@ def test_collect_inventory_is_partial_when_only_the_standards_query_failed() -> 
             ),
         ),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert inventory.status is CollectionStatus.PARTIAL
     assert [failure.evidence for failure in inventory.failures] == [EvidenceKind.CODEOWNERS, EvidenceKind.MAINTENANCE]
@@ -1976,9 +2058,9 @@ def test_collect_inventory_carries_standards_evidence_onto_the_item() -> None:
     )
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response(payload)]),
+        patch.object(session, "post", side_effect=posted_state_responses(payload)),
     ):
-        inventory = collect_inventory(configuration, client, collection_window())
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
 
     assert inventory.status is CollectionStatus.COMPLETE
     item = inventory.repositories[0]
@@ -1990,6 +2072,124 @@ def test_collect_inventory_carries_standards_evidence_onto_the_item() -> None:
         last_commit_at=datetime(2026, 8, 1, tzinfo=UTC),
         last_human_commit_at=datetime(2026, 7, 1, tzinfo=UTC),
         searched_back_to=None,
+    )
+
+
+def test_collect_open_pull_requests_stores_the_counts_with_the_window_they_cover() -> None:
+    """Observe all four counts and remember the window the two windowed ones were measured over."""
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
+    with patch.object(
+        client,
+        "graphql",
+        return_value=open_pull_request_data(
+            opened_in_window=12,
+            closed_without_merge=3,
+            currently_open=7,
+            stale_open=2,
+        ),
+    ) as graphql:
+        result = collect_open_pull_requests(client, "hmcts", "divorce", "nfdiv-case-api", open_pull_request_scope())
+
+    assert isinstance(result, OpenPullRequestSnapshot)
+    assert (result.starts_at, result.ends_at) == (collection_window().starts_at, collection_window().ends_at)
+    assert result.summary.opened_in_window == 12
+    assert result.summary.closed_without_merge == 3
+    assert result.summary.currently_open == 7
+    assert result.summary.stale_open == 2
+    # One bundled call for the four counts, and the stale cutoff measured back from the run's own
+    # instant rather than from the end of the window.
+    assert graphql.call_count == 1
+    assert graphql.call_args.args[1]["staleOpenQuery"] == (
+        "repo:hmcts/nfdiv-case-api is:pr is:open updated:<2026-07-18T00:00:00Z"
+    )
+
+
+def test_collect_open_pull_requests_reports_a_refusal_as_its_own_unavailable_evidence() -> None:
+    """Record a failure rather than a zeroed count: "none open" is not "nobody would say"."""
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
+    error = GitHubError("GitHub permission denied", AvailabilityReason.PERMISSION_DENIED)
+    with patch.object(client, "graphql", side_effect=error):
+        result = collect_open_pull_requests(client, "hmcts", "divorce", "nfdiv-case-api", open_pull_request_scope())
+
+    assert isinstance(result, RepositoryInventoryIssue)
+    assert result.evidence is EvidenceKind.OPEN_PULL_REQUESTS
+    assert result.reason is AvailabilityReason.PERMISSION_DENIED
+    assert result.detail == "GitHub permission denied"
+    assert result.repository == "nfdiv-case-api"
+    assert result.team_identifier == "divorce"
+
+
+def test_collect_inventory_still_stores_a_repository_whose_open_pull_requests_were_refused() -> None:
+    """Keep every other block of a repository whose open pull-request state would not answer."""
+    configuration = single_repository_configuration()
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
+    repository_response = MagicMock()
+    repository_response.json.return_value = repository_metadata().model_dump(mode="json")
+    refused = GitHubError(
+        "GitHub repository not found or inaccessible",
+        AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+    )
+
+    rate_limited = GitHubError("GitHub rate limited", AvailabilityReason.RATE_LIMITED)
+
+    def refuse_open_pull_requests(query: str, variables: Mapping[str, object] | None = None) -> dict[str, object]:
+        """Rate limit the open-pull-request query alone, so the standards still report."""
+        _ = variables
+        if "openedInWindow" in query:
+            raise rate_limited
+        return standards_data(files={"rootCodeowners": {"byteSize": 42}})
+
+    with (
+        patch.object(client, "get_repository", return_value=repository_response),
+        patch.object(client, "get_paginated", return_value=()),
+        patch.object(client, "get", side_effect=refused),
+        patch.object(client, "graphql", side_effect=refuse_open_pull_requests),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
+
+    assert inventory.status is CollectionStatus.PARTIAL
+    item = inventory.repositories[0]
+    assert item.open_pull_requests is None
+    assert item.codeowners is not None
+    assert [failure.evidence for failure in inventory.failures] == [EvidenceKind.OPEN_PULL_REQUESTS]
+    assert inventory.failures[0].reason is AvailabilityReason.RATE_LIMITED
+
+
+def test_collect_inventory_carries_the_open_pull_request_snapshot_onto_the_item() -> None:
+    """Store the observation beside the merge gate, measured against the run's own window."""
+    configuration = single_repository_configuration()
+    client = GitHubClient(PersonalAccessToken("secret"), Session())
+    repository_response = MagicMock()
+    repository_response.json.return_value = repository_metadata().model_dump(mode="json")
+    with (
+        patch.object(client, "get_repository", return_value=repository_response),
+        patch.object(client, "get_paginated", return_value=()),
+        patch.object(
+            client,
+            "get",
+            side_effect=GitHubError(
+                "GitHub repository not found or inaccessible",
+                AvailabilityReason.NOT_FOUND_OR_INACCESSIBLE,
+            ),
+        ),
+        patch.object(
+            client,
+            "graphql",
+            side_effect=state_payloads(open_pull_requests=open_pull_request_data(currently_open=5, stale_open=1)),
+        ),
+    ):
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference())
+
+    assert inventory.failures == ()
+    assert inventory.repositories[0].open_pull_requests == OpenPullRequestSnapshot(
+        starts_at=collection_window().starts_at,
+        ends_at=collection_window().ends_at,
+        summary=OpenPullRequestSummary(
+            opened_in_window=0,
+            closed_without_merge=0,
+            currently_open=5,
+            stale_open=1,
+        ),
     )
 
 
@@ -2121,10 +2321,12 @@ def test_collect_inventory_stores_the_measures_of_a_resolved_project() -> None:
     )
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response(payload)]),
+        patch.object(session, "post", side_effect=posted_state_responses(payload)),
         patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
     ):
-        inventory = collect_inventory(single_repository_configuration(), client, collection_window(), sonar)
+        inventory = collect_inventory(
+            single_repository_configuration(), client, collection_window(), collection_reference(), sonar
+        )
 
     assert inventory.status is CollectionStatus.COMPLETE
     assert inventory.failures == ()
@@ -2148,8 +2350,8 @@ def test_collect_inventory_stores_the_measures_of_a_resolved_project() -> None:
         "https://sonarcloud.io/api/project_analyses/search",
         "https://sonarcloud.io/api/measures/component",
     ]
-    # Seven GitHub calls and two SonarCloud ones in ONE figure: the unit metered is the repository.
-    assert inventory.costs[0].requests == 9
+    # Eight GitHub calls and two SonarCloud ones in ONE figure: the unit metered is the repository.
+    assert inventory.costs[0].requests == 10
 
 
 def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_project() -> None:
@@ -2164,10 +2366,12 @@ def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_pro
     sonar, sonar_get = sonar_reading()
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
     ):
-        inventory = collect_inventory(single_repository_configuration(), client, collection_window(), sonar)
+        inventory = collect_inventory(
+            single_repository_configuration(), client, collection_window(), collection_reference(), sonar
+        )
 
     assert inventory.status is CollectionStatus.COMPLETE
     assert inventory.failures == ()
@@ -2179,7 +2383,7 @@ def test_collect_inventory_records_no_failure_for_a_repository_with_no_sonar_pro
     assert item.sonar_project.detail == "no SonarCloud project in hmcts is mapped to this repository"
     # A repository with no project costs nothing to answer for: the map is local.
     sonar_get.assert_not_called()
-    assert inventory.costs[0].requests == 7
+    assert inventory.costs[0].requests == 8
 
 
 def test_collect_inventory_collects_no_sonar_state_without_a_source() -> None:
@@ -2188,10 +2392,12 @@ def test_collect_inventory_collects_no_sonar_state_without_a_source() -> None:
     client = GitHubClient(PersonalAccessToken("secret"), session, pause=MagicMock())
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
     ):
-        inventory = collect_inventory(single_repository_configuration(), client, collection_window())
+        inventory = collect_inventory(
+            single_repository_configuration(), client, collection_window(), collection_reference()
+        )
 
     item = inventory.repositories[0]
     assert item.sonar is None
@@ -2219,10 +2425,10 @@ def test_collect_inventory_reads_an_override_under_the_configured_repository_nam
     )
     with (
         patch.object(session, "get", side_effect=unprotected_repository_responses("nfdiv-case-api")),
-        patch.object(session, "post", side_effect=[standards_response()]),
+        patch.object(session, "post", side_effect=posted_state_responses()),
         patch("metrics.cost.monotonic", measured_clock(0.0, 1.0)),
     ):
-        inventory = collect_inventory(configuration, client, collection_window(), sonar)
+        inventory = collect_inventory(configuration, client, collection_window(), collection_reference(), sonar)
 
     item = inventory.repositories[0]
     assert item.sonar_project is not None
@@ -2413,7 +2619,7 @@ def test_collect_inventory_logs_one_progress_line_per_repository(caplog: pytest.
     with (
         patch.object(client, "get_repository", side_effect=metadata_answer(client, 3)),
         patch.object(client, "get_paginated", return_value=()),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
         patch.object(
             client,
             "get",
@@ -2428,6 +2634,7 @@ def test_collect_inventory_logs_one_progress_line_per_repository(caplog: pytest.
             progress_configuration("nfdiv-case-api", "nfdiv-frontend"),
             client,
             collection_window(),
+            collection_reference(),
         )
 
     assert inventory.status is CollectionStatus.COMPLETE
@@ -2454,7 +2661,7 @@ def test_collect_inventory_progress_names_each_alert_family_that_is_not_enabled(
     with (
         patch.object(client, "get_repository", side_effect=metadata_answer(client, 0)),
         patch.object(client, "get_paginated", side_effect=paginated),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
         patch.object(
             client,
             "get",
@@ -2465,7 +2672,9 @@ def test_collect_inventory_progress_names_each_alert_family_that_is_not_enabled(
         ),
         caplog.at_level("INFO"),
     ):
-        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+        inventory = collect_inventory(
+            progress_configuration("nfdiv-case-api"), client, collection_window(), collection_reference()
+        )
 
     assert inventory.status is CollectionStatus.COMPLETE
     assert progress_lines(caplog) == [
@@ -2498,7 +2707,7 @@ def test_collect_inventory_progress_keeps_a_refused_family_out_of_the_not_enable
     with (
         patch.object(client, "get_repository", side_effect=metadata_answer(client, 0)),
         patch.object(client, "get_paginated", side_effect=paginated),
-        patch.object(client, "graphql", return_value=standards_data()),
+        patch.object(client, "graphql", side_effect=state_payloads()),
         patch.object(
             client,
             "get",
@@ -2509,7 +2718,9 @@ def test_collect_inventory_progress_keeps_a_refused_family_out_of_the_not_enable
         ),
         caplog.at_level("INFO"),
     ):
-        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+        inventory = collect_inventory(
+            progress_configuration("nfdiv-case-api"), client, collection_window(), collection_reference()
+        )
 
     assert inventory.status is CollectionStatus.PARTIAL
     expected = "[1/1] nfdiv-case-api  state 1 unavailable: security permission denied, code scanning not enabled"
@@ -2529,7 +2740,9 @@ def test_collect_inventory_progress_names_the_evidence_a_repository_could_not_su
         ),
         caplog.at_level("INFO"),
     ):
-        inventory = collect_inventory(progress_configuration("nfdiv-case-api"), client, collection_window())
+        inventory = collect_inventory(
+            progress_configuration("nfdiv-case-api"), client, collection_window(), collection_reference()
+        )
 
     assert inventory.status is CollectionStatus.FAILED
     assert progress_lines(caplog) == [

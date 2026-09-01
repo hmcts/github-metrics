@@ -1,0 +1,28 @@
+.DS_Store
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+dist/
+htmlcov/
+.metrics
+ai-in-sdlc-github-analysis/
+*.egg-info/
+*.py[cod]
+
+# Scratch at the repository ROOT only, every pattern anchored with a leading slash. Unanchored, these
+# match at every depth: `*.yml` swallowed `.github/workflows/`, `*.json` swallowed the UI's own
+# configuration — which is why ui/.gitignore had to negate it back — and `completed/` swallowed
+# docs/plans/completed/, where every finished plan lives.
+/*.yml
+/*.json
+/*.log
+/*.out
+/*.gz
+/completed/
+/data/
+/output/
+.claude/settings.local.json

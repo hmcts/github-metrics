@@ -24,6 +24,7 @@ from metrics.domain import (
     ObservationStatus,
     OpenAlertCount,
     OpenPullRequestReport,
+    OpenPullRequestSnapshot,
     OpenPullRequestSummary,
     RateObservation,
     RepositoryInventoryIssue,
@@ -471,6 +472,43 @@ def test_a_repository_state_row_stored_before_the_minimum_standards_blocks_still
     assert item.codeowners is None
     assert item.maintenance is None
     assert item.sonar is None
+    # A row stored before open pull requests were collected says nothing about them, which is not
+    # the same answer as a repository with nothing open.
+    assert item.open_pull_requests is None
+
+
+def test_an_open_pull_request_snapshot_carries_the_window_its_windowed_counts_cover() -> None:
+    """Keep the two windowed counts interpretable by storing the window they were measured over."""
+    snapshot = OpenPullRequestSnapshot.model_validate(
+        {
+            "starts_at": "2026-05-01T00:00:00Z",
+            "ends_at": "2026-08-01T00:00:00Z",
+            "summary": {
+                "opened_in_window": 12,
+                "closed_without_merge": 3,
+                "currently_open": 7,
+                "stale_open": 2,
+            },
+        },
+    )
+
+    assert snapshot.starts_at == datetime(2026, 5, 1, tzinfo=UTC)
+    assert snapshot.ends_at == datetime(2026, 8, 1, tzinfo=UTC)
+    assert snapshot.summary.opened_in_window == 12
+    assert snapshot.summary.stale_open == 2
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"ends_at": "2026-08-01T00:00:00Z", "summary": {}},
+        {"starts_at": "2026-05-01T00:00:00Z", "ends_at": "2026-08-01T00:00:00Z"},
+    ],
+)
+def test_an_open_pull_request_snapshot_refuses_counts_without_their_window(fields: dict[str, object]) -> None:
+    """Refuse a snapshot missing either bound or the counts themselves: neither half stands alone."""
+    with pytest.raises(ValidationError, match="Field required"):
+        OpenPullRequestSnapshot.model_validate(fields)
 
 
 SONAR_ANALYSIS_INSTANT = datetime(2026, 8, 26, 9, 30, tzinfo=UTC)

@@ -13,6 +13,7 @@ from metrics.domain import (
     AlertSeverity,
     BehaviourEvidenceCollection,
     BehaviourEvidenceReport,
+    BehaviourMetricSummary,
     CodeownersEvidence,
     CodeownersFile,
     CodeownersReport,
@@ -142,9 +143,11 @@ def gate_report() -> MergeGateReport:
 
 
 def open_pull_requests_report() -> OpenPullRequestReport:
-    """Build a freshly fetched open pull-request state."""
+    """Build the stored open pull-request state, observed over a window of its own."""
     return OpenPullRequestReport(
         fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        starts_at=datetime(2026, 7, 26, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 2, tzinfo=UTC),
         summary=OpenPullRequestSummary(
             opened_in_window=5,
             closed_without_merge=1,
@@ -166,6 +169,19 @@ def finding() -> PracticeFinding:
         message="author: 2 of 4 merges had no independent human review (50%) — 1 substantial, 1 trivial",
         occurrences_by_size={"substantial": 1, "trivial": 1},
         pull_requests=(),
+    )
+
+
+def metric_summary(
+    metric: str,
+    summary: RateObservation | DistributionObservation,
+    classifications: dict[str, int] | None = None,
+) -> BehaviourMetricSummary:
+    """Summarise one metric over the shared window, as a repository block carries it."""
+    return BehaviourMetricSummary(
+        metric=metric,
+        summary=summary,
+        classifications={} if classifications is None else classifications,
     )
 
 
@@ -215,9 +231,9 @@ def drill_down() -> RepositoryDrillDown:
     """Build the metric aggregates and review counts shown beside the practice evidence."""
     return RepositoryDrillDown(
         behaviour=(
-            behaviour_report("approval-coverage", rate(1, 2)),
-            behaviour_report("merge-cycle-time", hours()),
-            behaviour_report("checks-passing-at-merge", unobserved()),
+            metric_summary("approval-coverage", rate(1, 2)),
+            metric_summary("merge-cycle-time", hours()),
+            metric_summary("checks-passing-at-merge", unobserved()),
         ),
         review_states={"APPROVED": 3, "COMMENTED": 1},
     )
@@ -337,6 +353,7 @@ def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
     """Build one repository's practice evidence, overriding selected fields."""
     evidence = RepositoryPracticeEvidence(
         repository="cath-service",
+        team="crime",
         starts_at=starts_at(),
         ends_at=ends_at(),
         provenance=provenance(),
@@ -348,6 +365,7 @@ def practice_evidence(**overrides: object) -> RepositoryPracticeEvidence:
         codeowners=codeowners_report(),
         maintenance=maintenance_report(),
         sonar=sonar_report(),
+        metrics=drill_down().behaviour,
         behaviour=(finding(),),
     )
     return evidence.model_copy(update=overrides)
@@ -522,16 +540,30 @@ def test_a_gate_that_was_never_collected_reports_the_reason() -> None:
 
 
 def test_open_pull_requests_reports_the_four_counts(report: str) -> None:
-    """Show every counted state beside the instant they were freshly fetched."""
-    assert "  Opened in window      5" in report
-    assert "  Closed without merge  1" in report
-    assert "  Currently open        3" in report
-    assert "  Stale open            2" in report
+    """Show every counted state beside the instant the state was observed."""
+    assert "  Opened in window        5" in report
+    assert "  Closed without merge    1" in report
+    assert "  Currently open          3" in report
+    assert "  Stale open              2" in report
 
 
-def test_open_pull_requests_unavailable_under_offline_states_the_reason() -> None:
-    """State why open pull-request state is missing rather than omitting the block."""
-    detail = "open pull-request state is never cached; omit --offline to observe it"
+def test_open_pull_requests_names_the_window_the_two_windowed_counts_cover(report: str) -> None:
+    """Print the window the stored counts were measured over, not the window of the report.
+
+    The block is current state read back from the last collection, so its window is that
+    collection's — a reader taking the report's own window instead would read seven days of opened
+    pull requests as ninety.
+    """
+    assert "  Opened and closed over  2026-07-26T00:00Z to 2026-08-02T00:00Z" in report
+    assert "Window      2026-05-01T00:00Z to 2026-08-01T00:00Z (92 days)" in report
+
+
+def test_open_pull_requests_never_collected_states_the_reason() -> None:
+    """State why open pull-request state is missing rather than omitting the block.
+
+    No window is printed here, because a report with nothing to report was measured over nothing.
+    """
+    detail = "open pull-request state was not collected when repository state was stored; run metrics collect"
     rendered = render_practice_report(
         practice_report(practice_evidence(open_pull_requests=OpenPullRequestReport(detail=detail))),
         {"cath-service": drill_down()},
@@ -539,6 +571,7 @@ def test_open_pull_requests_unavailable_under_offline_states_the_reason() -> Non
     )
 
     assert f"  not available: {detail}" in rendered
+    assert "Opened and closed over" not in rendered
 
 
 def test_rates_and_distributions_fill_the_columns_each_of_them_has(report: str) -> None:
@@ -1230,6 +1263,7 @@ def actor_repository(
         repository=repository,
         contributions=contributions,
         blocking=0,
+        metrics=(),
     )
 
 

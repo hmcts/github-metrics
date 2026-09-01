@@ -6,14 +6,13 @@ from argparse import ArgumentParser, Namespace
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from requests import Session
 
 from metrics.analysis import review_state_counts
-from metrics.assessment import readiness_policy
 from metrics.behaviour import collect_window
 from metrics.behaviour_metrics import behaviour_metric, behaviour_metric_identifiers, behaviour_metrics
 from metrics.config import (
@@ -39,18 +38,18 @@ from metrics.domain import (
 )
 from metrics.evidence import (
     RepositoryEvidence,
-    actor_readiness,
+    StoredReports,
     cached_repository_evidence,
     collected_repository_evidence,
-    offline_open_pull_request_report,
+    metric_summaries,
     open_pull_request_report,
+    practice_report,
     stored_reports,
     stored_repository_state,
 )
 from metrics.github import CallOutcome, GitHubClient, GitHubError
 from metrics.inventory import SonarSource, collect_inventory
 from metrics.render import RepositoryDrillDown, render_report, render_trend_report
-from metrics.rules import configured_rules
 from metrics.sonar import (
     SonarClient,
     SonarError,
@@ -106,10 +105,17 @@ def run_status(status: CollectionStatus) -> int:
 
 
 OFFLINE_ADVICE = "use --offline to report cached evidence only"
-"""What to tell a human whose reporting command cannot authenticate.
+"""What to tell a human whose `trend` run cannot authenticate.
 
-Only the two reporting commands carry it: `evidence` and `trend` have a cached answer to fall back
-on, and `collect`, `doctor` and `map-sonar` have nothing to do without GitHub.
+`trend` collects unless it is asked not to, so the remedy is the flag that asks. `collect`, `doctor`
+and `map-sonar` carry no advice: they have nothing to do without GitHub.
+"""
+
+REFRESH_ADVICE = "omit --refresh to report cached evidence only"
+"""What to tell a human whose `evidence --refresh` run cannot authenticate.
+
+The mirror image of `OFFLINE_ADVICE`, because `evidence` reports from the caches by default since
+2026-09-01: the remedy is dropping the flag that asked for GitHub, not adding one.
 """
 
 
@@ -206,9 +212,9 @@ def parse_arguments() -> Namespace:
     evidence.add_argument("--repository", help="limit results to one configured repository")
     add_window_arguments(evidence)
     evidence.add_argument(
-        "--offline",
+        "--refresh",
         action="store_true",
-        help="never contact GitHub, and report a repository the cache does not cover as unavailable",
+        help="contact GitHub to collect missing history and observe open pull-request state fresh",
     )
     evidence.add_argument("--metric", choices=behaviour_metric_identifiers(), help="show one raw metric")
     evidence.add_argument(
@@ -270,6 +276,33 @@ def unusable_request(configured: tuple[str, ...], options: Namespace) -> str | N
     return None
 
 
+def current_state(
+    configuration: Configuration,
+    repository: str,
+    refreshed: Mapping[str, OpenPullRequestReport],
+) -> StoredReports:
+    """Project one repository's stored row into its blocks, refreshed open-PR state winning.
+
+    One load per repository, projected into every block that reads it: the merge gate, the open
+    pull-request counts, the security alerts, CODEOWNERS presence, maintenance and the SonarCloud
+    measures are six views of the same stored row.
+
+    A `--refresh` run replaces one of those six with what GitHub just answered, and it is replaced
+    here rather than downstream so that `practices` receives one set of blocks and is never handed a
+    stored figure and a fresh one for the same repository to choose between.
+
+    Only a refresh that ANSWERED wins. A rate limit or a 403 on one repository returns a report
+    carrying a reason instead of counts, and substituting that would answer `--refresh` with strictly
+    less than the same command without it: the stored block is readable, dated, and still true as at
+    the instant it records.
+    """
+    blocks = stored_reports(stored_repository_state(configuration, repository))
+    fresh = refreshed.get(repository)
+    if fresh is None or fresh.summary is None:
+        return blocks
+    return replace(blocks, open_pull_requests=fresh)
+
+
 def evidence_report(
     configuration: Configuration,
     options: Namespace,
@@ -279,33 +312,13 @@ def evidence_report(
 ) -> BehaviourEvidenceReport | BehaviourEvidenceCollection | PracticeEvidenceReport:
     """Build the report for the requested evidence mode."""
     if options.metric is None:
-        rules = configured_rules(configuration)
-        policy = readiness_policy(configuration)
-        # One load per repository, projected into every block that reads it: the merge gate, the
-        # security alerts, CODEOWNERS presence, maintenance and the SonarCloud measures are five
-        # views of the same stored row.
-        stored = {item.repository: stored_repository_state(configuration, item.repository) for item in evidence}
-        # Kept paired rather than zipped back together later: the actor section reads each
-        # repository's authors from the cached facts and its label and findings from the practice
-        # report built out of them, and pairing at the point of construction is what stops one
-        # repository's merges from ever being read against another's assessment.
-        reported = tuple(
-            (
-                item,
-                item.practices(
-                    rules,
-                    policy,
-                    open_pull_requests[item.repository],
-                    stored_reports(stored[item.repository]),
-                ),
-            )
-            for item in evidence
-        )
-        return PracticeEvidenceReport(
-            organization=configuration.organization,
-            repositories=tuple(practice for _, practice in reported),
-            unavailable=unavailable,
-            actors=actor_readiness(reported),
+        # Assembled by `evidence.practice_report`, which the offline service assembles through too:
+        # this path's only difference is the blocks it pairs each repository with, because a
+        # `--refresh` run has a fresh open pull-request count to substitute for the stored one.
+        return practice_report(
+            configuration,
+            tuple((item, current_state(configuration, item.repository, open_pull_requests)) for item in evidence),
+            unavailable,
         )
     metric = behaviour_metric(options.metric, configuration.traceability)
     reports = tuple(item.metric(metric, include_identities=options.include_identities) for item in evidence)
@@ -322,14 +335,12 @@ def evidence_report(
 def repository_drill_down(configuration: Configuration, evidence: RepositoryEvidence) -> RepositoryDrillDown:
     """Build the metric aggregates and review counts the readable report shows beside the findings.
 
-    Computed for the report format alone. Nothing here reaches the JSON, and every figure is one a
-    `--metric` drill-down over the same window already emits, so the two renderings cannot diverge.
+    Computed through `metric_summaries`, which is what the JSON's own repository block is built from,
+    so the readable report and the contract show one computation rather than two that agree today.
+    The review counts are the report's alone.
     """
     return RepositoryDrillDown(
-        behaviour=tuple(
-            evidence.metric(metric, include_identities=False)
-            for metric in behaviour_metrics(configuration.traceability)
-        ),
+        behaviour=metric_summaries(evidence, behaviour_metrics(configuration.traceability)),
         review_states=review_state_counts(evidence.pull_requests),
     )
 
@@ -360,7 +371,8 @@ def gather_evidence(
 ) -> tuple[RepositoryEvidence | EvidenceUnavailable, ...]:
     """Report every selected repository, collecting missing history unless there is no client.
 
-    `client` is None exactly when the run is offline, which is what makes the cache the only source.
+    `client` is None exactly when the run was not asked to refresh, which is what makes the cache
+    the only source.
 
     Selection follows `configured_repositories` — team identifier, then repository name — so both
     renderings order repositories the same way and neither is reordered by an edit to the
@@ -376,21 +388,19 @@ def gather_evidence(
 
 def gather_open_pull_requests(
     configuration: Configuration,
-    client: GitHubClient | None,
+    client: GitHubClient,
     repositories: tuple[str, ...],
     window: ReportingWindow,
     reference: datetime,
 ) -> dict[str, OpenPullRequestReport]:
-    """Fetch each selected repository's open pull-request state fresh; refuse it under --offline.
+    """Observe each selected repository's open pull-request state fresh, under `--refresh` only.
 
-    This state is never cached (see architecture.md), so it is fetched independently of the
-    windowed merge evidence `gather_evidence` collects or reads back from the cache. It shares the
-    client with that phase rather than building a second one: the rate-limit budget is recorded on
-    the client, so a fresh one would start believing there was none and could spend past the
-    configured reserve before its first response taught it otherwise.
+    Reached only when a client exists, because the stored block a collection wrote is what every
+    other run reports. It shares that client with the collection phase rather than building a second
+    one: the rate-limit budget is recorded on the client, so a fresh one would start believing there
+    was none and could spend past the configured reserve before its first response taught it
+    otherwise.
     """
-    if client is None:
-        return {repository: offline_open_pull_request_report() for repository in repositories}
     return {
         repository: open_pull_request_report(client, configuration, repository, window, reference)
         for repository in repositories
@@ -411,9 +421,14 @@ def prune_evidence_cache(configuration: Configuration, options: Namespace) -> in
 def emit_evidence(configuration: Configuration, options: Namespace) -> int:
     """Emit configured practice findings or an optional raw metric drill-down.
 
+    REPORTS FROM THE CACHES AND CONTACTS NOTHING UNLESS `--refresh` IS GIVEN (2026-09-01, breaking
+    change): every block a report carries now has a stored source, so the default answer costs no
+    call and needs no credential, and the flag is what asks GitHub for missing history and a live
+    open pull-request count.
+
     A repository the cache cannot answer for is reported under `unavailable` and left out of the
-    numbers, whether the run was offline or collecting: the two modes fail the same way, so a
-    repository GitHub refused during collection does not also make every cached repository beside it
+    numbers, whether the run refreshed or not: the two modes fail the same way, so a repository
+    GitHub refused during a refresh does not also make every cached repository beside it
     unreportable. Only a run where NOTHING could be reported refuses outright.
     """
     unusable = unusable_request(configured_repositories(configuration), options)
@@ -427,14 +442,14 @@ def emit_evidence(configuration: Configuration, options: Namespace) -> int:
         logging.error("Unusable reporting window: %s", exception)
         return 1
 
-    # One session and one client for both phases of the run, so the second does not discard the
-    # rate-limit budget the first learned. Neither phase contacts GitHub when the run is offline.
-    # ExitStack rather than `with Session()`: an offline run must construct no session at all and
+    # One session and one client for both phases of a refresh, so the second does not discard the
+    # rate-limit budget the first learned. Neither phase contacts GitHub without `--refresh`.
+    # ExitStack rather than `with Session()`: the default run must construct no session at all and
     # resolve no credentials, which `test_evidence_runs_offline_without_token_or_session` pins.
     with ExitStack() as stack:
         client = None
-        if not options.offline:
-            client = github_client(stack.enter_context(Session()), OFFLINE_ADVICE)
+        if options.refresh:
+            client = github_client(stack.enter_context(Session()), REFRESH_ADVICE)
             if client is None:
                 return 1
         loaded = gather_evidence(configuration, options, client, window, reference)
@@ -458,17 +473,15 @@ def emit_evidence(configuration: Configuration, options: Namespace) -> int:
                 ", ".join(item.repository for item in unavailable),
             )
 
-        open_pull_requests = (
-            {}
-            if options.metric is not None
-            else gather_open_pull_requests(
+        open_pull_requests: Mapping[str, OpenPullRequestReport] = {}
+        if client is not None and options.metric is None:
+            open_pull_requests = gather_open_pull_requests(
                 configuration,
                 client,
                 tuple(item.repository for item in evidence),
                 window,
                 reference,
             )
-        )
     report = evidence_report(configuration, options, evidence, unavailable, open_pull_requests)
     sys.stdout.write(f"{evidence_output(configuration, options, report, evidence)}\n")
     # Anything unavailable here is one repository among several that did report, because the case
@@ -617,7 +630,13 @@ def collect_evidence(configuration: Configuration, options: Namespace) -> int:
             inventory = collect_window(
                 configuration,
                 client,
-                collect_inventory(configuration, client, window, sonar_source(configuration, sonar_session)),
+                collect_inventory(
+                    configuration,
+                    client,
+                    window,
+                    reference,
+                    sonar_source(configuration, sonar_session),
+                ),
                 window,
                 reference,
             )

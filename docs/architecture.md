@@ -34,9 +34,11 @@ is a hard no, RED, whatever the team's day-to-day behaviour — means merge-gate
 VETO, rather than merely sitting alongside behavioural evidence.
 
 This reverses "no scoring, no RAG labels" as recorded under scope boundaries, which is why it is
-called out here rather than quietly edited. The rest of that boundary is untouched: still no
-dashboards, and no personal rankings — the actor section added on 2026-08-28 lists a person's
-repositories and their labels in alphabetical order of login, precisely so that it is not one.
+called out here rather than quietly edited. The personal-rankings half of that boundary is untouched:
+the actor section added on 2026-08-28 lists a person's repositories and their labels in alphabetical
+order of login, precisely so that it is not one. The no-dashboards half was itself reversed on
+2026-09-01 — see "Scope boundaries" — and the service and UI it admitted render these labels rather
+than deriving any of their own.
 
 The judgement layer does NOT belong in `behaviour_metrics/` — metrics stay neutral aggregates with no
 target and no verdict, and that separation is what makes them reusable under a changed policy. It
@@ -227,9 +229,10 @@ Explicitly considered and left out as a GRADED question: "is review capacity a c
 `time-to-first-review` already answers most of it, and no threshold on open-pull-request counts has
 an owner. Open (unmerged) pull-request state — a different cohort with a genuinely mutable
 lifetime — IS now collected and reported (the `open_pull_requests` block: opened, closed without
-merge, currently open, stale open; never cached, fetched fresh, unavailable rather than zero
-`--offline`), but display-only. It traces to no decision question and carries no threshold; revisit
-grading it only if the flow question proves too coarse.
+merge, currently open, stale open; stored latest-only since 2026-09-01 with the window its two
+windowed counts cover, observed fresh under `evidence --refresh`, unavailable rather than zero where
+it was refused), but display-only. It traces to no decision question and carries no threshold;
+revisit grading it only if the flow question proves too coarse.
 
 `description-quality` and `traceability-reference` are an accepted exception to "every metric must
 trace to one of these four": they are neutral documentation-habit signals with no threshold owner,
@@ -245,10 +248,18 @@ Three commands with disjoint responsibilities.
   to `lookback.operational_days`, and fetches windowed sources for that window. Emits a *collection
   report* — resolved window, intervals fetched versus reused, fact counts, failures — never metric
   values.
-- **`evidence` reports from the cache over a reporting window.**
-  As a convenience it collects whatever the window needs and the cache lacks, then reports.
-  `--offline` never collects: if the cache does not fully cover the window it refuses and exits
-  non-zero. A silently short window is more dangerous than no answer.
+- **`evidence` reports from the caches over a reporting window, and contacts nothing.**
+  REVERSED 2026-09-01 AT THE USER'S INSTRUCTION, A BREAKING CHANGE: it collected by default and took
+  `--offline` to stop it, and now it is offline-first and `--refresh` is the single live call —
+  collecting the intervals the window lacks and observing open pull-request state fresh. `--offline`
+  is gone; the default IS what it meant. Without `--refresh`, a window the caches do not fully cover
+  is refused rather than reported short, and no credential is resolved and no session opened at all.
+
+  What forced it is that every block a report carries now has a stored source — open pull-request
+  state was the last one that did not, and `collect` stores it since the same date. A read-only
+  service serving several windows off the caches (see "Scope boundaries") cannot have the default
+  path of its own report command reach for GitHub, and a flag nobody remembers to pass is not a
+  guarantee. A run that wants live figures still says so, in one word.
 - **`map-sonar` builds the durable `sonar → github` map. It collects no evidence and reports none.**
   The third command that writes to the observations file, and the only one run BY HAND, periodically:
   it is paced against whatever commit-search allowance GitHub's `x-ratelimit-*` headers report for
@@ -257,6 +268,15 @@ Three commands with disjoint responsibilities.
 
 (`doctor`, `prune` and `trend` take no part in the collect/report split: the first two touch no
 evidence, and the third reports through `evidence`'s own code.)
+
+**`metrics-serve` is a SEPARATE ENTRY POINT, not a fourth command (2026-09-01).** The read-only
+service (`metrics.service`, admitted by the dashboards reversal under "Scope boundaries") serves the
+report `evidence` prints, over HTTP, for one of five fixed window spans. It is its own console script
+with its own small parser because it shares no argument with the commands above but `--config` and
+`--logging` — no window flags, no output format, no repository — and because keeping it out of
+`cli.py` keeps that file's argument surface about collection and reporting. It reports the configured
+cohort, so it makes the same refusal `COHORT_COMMANDS` makes below when no team is configured. FastAPI
+and uvicorn are an optional extra (`uv sync --extra service`), so a collection host installs neither.
 
 **The JSON is the contract; `--format report` is a rendering of it (2026-08-13).** `evidence --format report` prints
 the same evidence as plain ASCII and is PRESENTATION ONLY: `render.py` measures nothing and collects nothing, so
@@ -368,8 +388,8 @@ run exiting `0` would let every downstream denominator read as covering the whol
 repositories are missing from it, which at fourteen is no longer a hypothetical. `3` rather than `2`
 because `argparse` already exits `2` for a usage error, and "you invoked me wrongly" is not "part of
 the org would not answer". Both a partial and a wholly failed run still write their report: naming
-the repositories that refused is the most useful thing a failed run produces. `evidence --offline`
-is the deliberate exception and keeps refusing outright, per the ruling above.
+the repositories that refused is the most useful thing a failed run produces. A cached `evidence`
+run is the deliberate exception and keeps refusing outright, per the ruling above.
 
 ## Run logging (decided 2026-08-29)
 
@@ -490,7 +510,7 @@ confusing.
   SonarCloud is the first current-state source that is not GitHub, and it obeys the same rules: its
   quality gate, coverage, duplication, issue counts and ratings describe the project's HEAD analysis
   now, no history of them is retrievable, and the block carries the `fetched_at` of the collection
-  that stored it so `--offline` shows the last answer rather than refusing.
+  that stored it so a cached report shows the last answer rather than refusing.
 
 KNOWN LIMITATION — A RENAMED REPOSITORY LOSES ITS STORED STATE. `collect` follows GitHub's rename
 redirect and stores the row under the name GitHub answered with, while `evidence` reads it back
@@ -505,14 +525,49 @@ one repository's cost splits across two rows in the same report.
 So `collect --from X --to Y` means: fetch windowed sources for `[X, Y)`, and refresh current-state
 sources as of now. The window does not apply to current state and never will.
 
-**Open pull-request state is a third kind: never cached, DECIDED.** Opened/closed-without-merge/
-currently-open/stale-open counts have no settled state to cache — unlike windowed history, they are
-current by definition, and unlike current-state sources they are cheap enough (one bundled GraphQL
-call with four aliased `search { issueCount }` selections) that a stale "stale for 14 days" figure
-would be worse than the extra call. Fetched fresh on every `evidence` run; `--offline` cannot report
-it and says so with a reason rather than a remembered or zeroed number. `lookback.stale_open_days`
-(default 14) measures from LAST UPDATE, not from opening. Does not widen `lookback.mutable_hours` —
-that would weaken settled merged-history caching for an unrelated reason.
+**Open pull-request state is CURRENT STATE, stored latest-only beside the merge gate. REVERSED
+2026-09-01 at the user's instruction.** It was ruled a third kind — never cached, fetched fresh on
+every `evidence` run, the then-`--offline` path reporting a reason rather than a remembered or zeroed number — on
+the grounds that opened/closed-without-merge/currently-open/stale-open counts have no settled state
+to cache and cost only one bundled GraphQL call (four aliased `search { issueCount }` selections),
+so a stale "stale for 14 days" figure would be worse than the extra call.
+
+What reversed it is that `evidence` must be able to answer with no network at all, because a
+read-only service and UI serve several windows off the caches (see "Scope boundaries"). A block that
+refuses these four counts unless GitHub can be reached is a permanent hole in every report served
+that way, and "we could have stored this and did not" is a worse answer than a timestamped
+observation. So `collect` now observes the counts per repository and stores them latest-only, in the
+same row as the merge gate and the alert counts, replaced on every run.
+
+Three things the reversal does not change:
+
+- THE WINDOW TRAVELS WITH THE COUNTS. Two of the four — opened, closed without merge — are bounded by
+  the collection window, so the stored `OpenPullRequestSnapshot` carries its `starts_at` and
+  `ends_at`. A count over a window nobody remembers cannot be read: 40 opened over ninety days and
+  40 over one week are different repositories. The instant the observation was made is the stored
+  row's `fetched_at`, which is where every other current-state block takes its timestamp from.
+- FRESH IS STILL AVAILABLE, on request: `evidence --refresh` observes the state live and overrides
+  the stored block, which is the answer for a reader who needs the counts as of now rather than as of
+  the last collection.
+- A REFUSAL IS STILL UNAVAILABLE EVIDENCE, recorded as `EvidenceKind.OPEN_PULL_REQUESTS` and never as
+  a zeroed count: "nothing is open" and "nobody would say" are different answers, and a repository
+  whose counts were refused keeps every other block it did report.
+
+The report side, added the same day: `evidence.stored_open_pull_requests` projects the stored snapshot
+into the `open_pull_requests` block beside the five projections already reading that row, and
+`StoredReports` carries all six so a call site can never pair one repository's counts with another's
+gate. The window rides on `OpenPullRequestReport` as its own `starts_at`/`ends_at` rather than as
+prose beside the counts, because the model forbids a detail next to a summary — a sentence under four
+numbers must always be the reason they are missing, never a caveat about them. A row stored before
+this state was collected reports THAT, not four zeros, exactly as the pre-alerts and pre-CODEOWNERS
+rows do. Under `--refresh` the fresh observation carries the REPORTING window it was just measured
+over and replaces the stored block before assembly, so a refreshed report is read exactly like a
+stored one.
+
+`lookback.stale_open_days` (default 14) measures from LAST UPDATE, not from opening, and back from
+the instant the run started rather than from the end of its window — "stale for 14 days" means 14
+days before the observation, whatever window the run was asked for. Does not widen
+`lookback.mutable_hours` — that would weaken settled merged-history caching for an unrelated reason.
 
 **Security alerts SPAN BOTH KINDS, DECIDED 2026-08-14** — the one decision point the security-posture
 plan reserved,
@@ -968,9 +1023,12 @@ threshold, every threshold is a policy judgement that must be arguable (decision
 assessment"), and no boundary for "how much should review coverage improve after enablement" has an
 owner. Extending the assessment over trends requires a fresh user ruling recorded here first.
 
-Open pull-request state CANNOT appear in a trend. It is the third source kind — never cached, current
-by definition — so there is no history to compare against and no honest way to reconstruct one. It
-stays a current-state block in `evidence` only.
+Open pull-request state CANNOT appear in a trend, unaffected by its 2026-09-01 reversal. It is stored
+LATEST-ONLY: every run replaces the row, so there is still no history to compare against and no
+honest way to reconstruct one. It is deliberately not appended as an observation series the way open
+alert counts are — that would be a fresh decision about a source nobody has asked to see over time,
+and taking it silently because the row now exists is exactly how a trend acquires a measure nobody
+chose. It stays a current-state block in `evidence` only.
 
 **Security alerts DO appear, as an observation series rather than as periods (2026-08-15).** Open
 alert counts are appended per collection run under the storage-rule extension above, and a trend
@@ -1062,9 +1120,10 @@ have forced a much wider edge and still lied about the past, because a check com
 questionable merge would repaint it green. Apply the same test to any future source — collect the
 timestamps that let it be evaluated as at the merge instant, or accept a wider edge knowingly.
 
-The mutable interval is cached without recording source coverage, so `--offline` refuses any window
-overlapping it. That is deliberate (decided 2026-08-11): `--offline` means "cached, settled evidence
-or nothing". Document the behaviour; do not soften it.
+The mutable interval is cached without recording source coverage, so a cached report — `evidence`
+with no `--refresh`, `trend --offline` — refuses any window overlapping it. That is deliberate
+(decided 2026-08-11): reporting from the caches means "cached, settled evidence or nothing".
+Document the behaviour; do not soften it.
 
 ## Two-layer evidence model
 
@@ -1197,9 +1256,37 @@ or nothing". Document the behaviour; do not soften it.
 
 ## Scope boundaries
 
-- No dashboards. No personal rankings: the actor section lists a person's repositories and the label
-  of each, ordered alphabetically by login within the group their labels put them under, and nothing
-  scores or ranks people.
+- NO DASHBOARDS WAS REVERSED ON 2026-09-01 AT THE USER'S INSTRUCTION, and a read-only service and UI
+  are in scope. DECIDED. `metrics.service`, run as `metrics-serve`, serves the same
+  `PracticeEvidenceReport` that `metrics evidence` prints — assembled by
+  `evidence.offline_practice_report` for one of the five window spans in `service.WEEKS_OPTIONS` — and
+  `ui/` renders it. What the reversal admits is a SECOND RENDERING of the existing contract, nothing
+  more: no metric, label or count is computed in the service or the UI that the JSON does not already
+  carry or that a reader could not arrive at by adding the report's own rows up, so a figure cannot
+  appear on a page and nowhere in the evidence.
+  THE SERVICE NEVER CONTACTS GITHUB. It holds no client, no session and no credential, reads only the
+  two SQLite files a `collect` run wrote, and reports a window nobody has collected through the
+  report's own `unavailable` entries rather than as thinner data. That last requirement is what forced
+  open pull-request state to become cacheable first — see "Source taxonomy" — and it is the reason the
+  windows on offer are a fixed list rather than a free span: each is a whole report held in memory,
+  keyed on a source stamp of both cache files so a collection landing mid-day is picked up.
+  THE SERVICE ALSO SERVES `/repositories/{repository}/trend`, added 2026-09-01, through
+  `metrics.trend`'s offline path with `client=None` — the same series `metrics trend --offline`
+  prints, and per repository only, so the "no organisation-level trend figure" ruling below stands
+  untouched. A series is cached BESIDE the window bundles rather than inside one: it is anchored to
+  the repository's own enablement instant and cut into periods of its own, so it belongs to no
+  reporting window and would be rebuilt by every span a reader flicks through if a bundle held it.
+  Its key carries the cut, which unlike the five window spans is not a fixed list — `period_days`
+  runs 1 to 365 — so that cache is bounded by count and drops the least recently read, where the
+  bundle cache needs no bound at all. A cut above `MAXIMUM_PERIODS` is REFUSED RATHER THAN
+  TRUNCATED, on the same reasoning that refuses an off-list `?weeks=`: a series quietly stopped at 26
+  periods would be read as the whole history since enablement. The bound is on the series a request
+  RESOLVES to, not only the count it names, because `periods` is optional and leaving it out asks for
+  every whole period since enablement — which is where an unbounded request would otherwise live.
+  No personal rankings, UNCHANGED AND BINDING ON THE UI: the actor section lists a person's
+  repositories and the label of each, ordered alphabetically by login within the group their labels
+  put them under, and nothing scores or ranks people. Every list of people the service serves is
+  alphabetical, and none of them carries a metric to sort by.
 - Scoring and RAG labels were previously excluded; that exclusion was REVERSED on 2026-08-13 for the
   readiness assessment only — see "Readiness assessment" above. Metrics themselves stay neutral.
 - No merger-identity collection.
@@ -1211,6 +1298,20 @@ or nothing". Document the behaviour; do not soften it.
   instruction, and if it is ever asked for, note that a naive worst-label rule would report
   `cannot_assess` for almost every hmcts team while the access problem stands, because a single
   unreadable gate would outrank every assessable repository beside it.
+  - PER-TEAM LABEL COUNTS ARE IN SCOPE (2026-09-01, at the user's instruction), which reverses the
+    no-count half of this ruling for a second time: the first reversal was the per-label repository
+    count of 2026-08-31, admitted for the whole population, and this admits the same distribution per
+    team. `service.TeamRow` and `service.TeamDetail` carry `labels` — how many of one team's
+    repositories hold each readiness label, zeros included — beside how many of them the window could
+    not be reported for at all. It stands on the distinction the earlier reversal turned on, that a
+    distribution is not a verdict, and what forced it is that a team's page is where its repositories
+    are read case by case, which is what the original ruling asked for; a reader arriving there counts
+    the rows by hand otherwise.
+    STILL EXCLUDED, UNCHANGED: no combined team label, no worst-of or pooled-cohort rule, no team
+    score, and no ordering of teams by anything they carry — the teams endpoint lists them in the
+    configured reporting order. A PER-TEAM CONTRIBUTION COUNT is admitted on the same terms
+    (`service.TeamActorRow.contributions`, summed over that team's repositories): it counts merges,
+    combines no label, rate or distribution, and the rows stay alphabetical so nobody is ordered by it.
   - ORDERING AND INDEXING ARE IN SCOPE, and were built on 2026-08-15. Every command reports
     repositories in one fixed order — team identifier, then repository name — so an edit to the
     configuration file cannot reorder a report and make two runs undiffable, and `--format report`
@@ -1324,6 +1425,23 @@ or nothing". Document the behaviour; do not soften it.
     repositories, in code, in rendering or in documentation. A test guards the trend index against
     growing one. If leadership asks for an organisation-level figure, that is a fresh instruction for
     the user to give — record the request, do not build it.
+  - PER-ACTOR BEHAVIOUR METRICS ARE IN SCOPE, PER REPOSITORY ONLY (2026-09-01, at the user's
+    instruction). Each row of `actors` in the JSON now carries the same nine neutral aggregates the
+    repository block beside it carries, measured over that person's merges IN THAT REPOSITORY:
+    `evidence.actor_slice` narrows the cohort by case-folded `author_login` across both routes onto
+    the default branch, and `evidence.metric_summaries` summarises it exactly as a `--metric`
+    drill-down summarises the whole cohort — one computation, so a figure cannot appear in one
+    rendering and not another. The boundary is the one the listing above already keeps: the rows are
+    LISTED per repository and COMBINED nowhere. There is no per-person figure spanning the
+    repositories somebody works in — an average of two coverage rates would weight a repository they
+    merged twice in equally with one they merged eighty times in, which is the cross-repository
+    averaging the entry below excludes — and nobody is ordered by any of them. Bots get no row, so
+    they get no summaries either. If a per-person total, an ordering by metric, or a comparison
+    between people ever appears, cut it back.
+  - THE OWNING TEAM RIDES IN THE REPOSITORY BLOCK from the same date. `RepositoryPracticeEvidence.team`
+    is the identifier `repository_owners` resolves from configuration, carried so that a consumer
+    reading the JSON alone can group by team without the configuration beside it. IT IS ACCOUNTING,
+    NOT A ROLL-UP: the field names an owner, and no team verdict, score or ordering follows it.
 - No collection of WHY a gate was bypassed — ruleset bypass actors were considered and rejected.
 - No schema migrations — recreate the SQLite database on schema change.
 

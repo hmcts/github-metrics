@@ -108,8 +108,8 @@ parsed once, so a file is not a configuration in its own right and is never chec
 `database`, and `teams` may come from whichever file states them, and the team file above does not load alone.
 **The policy file does load alone, for the commands that read no repository cohort**: `map-sonar` resolves every project
 the SonarCloud organisation lists and `prune` deletes stale cache rows, so neither needs a `teams:` section and neither
-asks for one. The commands that do report the cohort — `collect`, `doctor`, `evidence`, `trend` — refuse without it and
-say which command needed it. Everything the
+asks for one. The commands that do report the cohort — `collect`, `doctor`, `evidence`, `trend`, and `metrics-serve` — refuse without
+it and say which command needed it. Everything the
 schema does is unchanged — the same keys, the same defaults, the same rejection of an unknown key — because by the time
 it runs there is only one document. A key given twice is resolved by YAML as it always was, with the last occurrence
 winning, so a whole block is replaced rather than merged into. A relative `database` is resolved from the directory of
@@ -162,17 +162,26 @@ uv run metrics map-sonar --config metrics.example.yaml
 uv run metrics collect --config metrics.example.yaml --from 2026-05-01 --to 2026-08-01
 uv run metrics evidence --config metrics.example.yaml
 uv run metrics evidence --config metrics.example.yaml --format report
+uv run metrics evidence --config metrics.example.yaml --refresh
 uv run metrics evidence --config metrics.example.yaml --repository example-service \
   --metric independent-review-coverage
 uv run metrics trend --config metrics.example.yaml --offline
 uv run metrics trend --config metrics.example.yaml --offline --format report
 ```
 
+**`evidence` contacts nothing unless `--refresh` is given (breaking change, 2026-09-01).** It used to collect by
+default and take `--offline` to stop it; that flag is gone, and the default is what `--offline` used to mean. Every
+block a report carries now has a stored source — the last collection's open pull-request counts included — so the
+default answer costs no GitHub call and needs no credential at all. `--refresh` is the single live call: it collects
+whatever history the requested window lacks and observes open pull-request state as of now, overriding the stored
+block. A run without it refuses a window the cache does not fully cover rather than reporting a short one.
+
 The two collecting commands have disjoint jobs. **`collect` fills the cache and never reports a metric value.**
-**`evidence` reports from the cache**, and as a convenience collects whatever the requested window lacks. Only
+**`evidence` reports from the cache**, and under `--refresh` collects whatever the requested window lacks. Only
 `evidence` computes metrics, so the two commands cannot disagree about a number. `trend` reports the same metrics as a
 series of windows anchored to each repository's enablement date, through the same code — see
-[Trend](#trend-measuring-periods-after-enablement) below.
+[Trend](#trend-measuring-periods-after-enablement) below. `trend` keeps its own `--offline` flag: it still collects by
+default, because a series reaching back to enablement has periods no collection window ever covered.
 
 `doctor` validates the configuration and verifies that the credential the run holds can read every configured
 repository. It does not query GitHub's repository-team endpoint. That began as a permission limit — a fine-grained
@@ -224,9 +233,10 @@ repository, what that phase established, and the calls and seconds it cost, at `
 [   2/1850] rpx-shared-infrastructure  window fully reused (0 calls, 0.0s)
 ```
 
-The two sequences run one after the other, not interleaved: all current state is collected before any window. `evidence`
-collects too and prints no progress lines: it fills its window one repository at a time through a different path, and
-both these lines and the call summary below were left off it deliberately rather than missed.
+The two sequences run one after the other, not interleaved: all current state is collected before any window.
+`evidence --refresh` collects too and prints no progress lines: it fills its window one repository at a time through a
+different path, and both these lines and the call summary below were left off it deliberately rather than missed. Plain
+`evidence` reads the caches and contacts nothing, so there is no collection to report on.
 
 **Every GitHub call logs exactly one line, at a level chosen by what came back** — `GitHub ok` and `GitHub disabled` at
 `DEBUG`, `GitHub errors`, `GitHub refused` and `GitHub failed` at `WARNING`. `--logging` sets the level and defaults to
@@ -293,12 +303,18 @@ are rather than under the successes they arrived among.
 
 Not everything `collect` fetches is windowed. Pull-request, review, and direct-commit facts are historical and
 accumulate in the cache.
-Repository metadata, merge-gate state, CODEOWNERS presence, default-branch maintenance instants and the SonarCloud
+Repository metadata, merge-gate state, open pull-request counts, CODEOWNERS presence, default-branch maintenance
+instants and the SonarCloud
 measures of the project a repository maps to are *current-state*
 sources: GitHub cannot report what branch protection was three months ago, and the question is whether the gate protects
 merges now. SonarCloud is the first current-state source that is not GitHub, and it obeys the same rules. They are therefore always fetched fresh and stored as one latest row per repository, replacing the previous
 one. So `collect --from X --to Y` means: fetch windowed
 sources for `[X, Y)`, and refresh current state as of now.
+
+Open pull-request state is the one current-state source that carries a window with it. Two of its four counts — opened
+in window and closed without merge — are bounded by the collection's own `[X, Y)`, so the window is stored beside them
+as `starts_at`/`ends_at` and printed in the block rather than left to be read off the surrounding report. A stored
+observation was measured over the window of the run that made it, which is not the window whatever reads it back covers.
 
 Open security-alert counts are the one exception to "replacing the previous one". They are current state too, but the
 replaced count cannot be recovered from anything, so each run also **appends** an observation of every readable family
@@ -355,8 +371,9 @@ useful thing such a run produces. Note that a failure need not be a whole reposi
 source withheld records one too, and a protected default branch whose classic branch-protection detail is refused to a
 non-administrator is the common case across hmcts. So `collect` exits `3` on a population where every repository
 reported, and `collect && evidence` stops there. Branch on `1` if the intent is to stop only on a run with nothing
-usable in it. The exception is `evidence --offline`, which refuses outright if the cache does not
-fully cover the window for every selected repository — a silently short window is more dangerous than no answer.
+usable in it. The exception is `evidence`, which refuses outright if the cache does not
+fully cover the window for every selected repository — a silently short window is more dangerous than no answer. Under
+`--refresh` it collects the missing intervals instead and refuses only what GitHub would not answer for.
 
 Successfully collected stable intervals are recorded as source coverage and are not requested again. A window reaching
 the present also refreshes a short mutable edge, `lookback.mutable_hours` (six hours by default), replacing the facts in
@@ -373,10 +390,10 @@ intervals that have not been used for N days, together with any facts they leave
 
 This release widened the pull-request query three times — a review's comment count and its summary body, for
 `review-depth`, and the pull-request body, for `description-quality` and `traceability-reference` — so **every
-previously cached pull-request interval is invalidated**. Run `collect` before relying on `--offline`, which otherwise refuses a window the cache no longer covers.
+previously cached pull-request interval is invalidated**. Run `collect` before relying on `evidence`, which otherwise refuses a window the cache no longer covers.
 At fourteen repositories that first run is a full refetch rather than an edge refresh.
 
-`evidence` reports the requested window, collecting whatever the cache lacks unless `--offline` is given. With only
+`evidence` reports the requested window from the caches, collecting whatever they lack only under `--refresh`. With only
 `--config`, it evaluates every enabled practice rule for every configured repository and reports each repository's
 findings under `behaviour`, beside the `merge_gate` block described below: the gate is the governance a repository
 declares, `behaviour` is what its merges actually did. The initial `unreviewed-merge` rule groups authors whose merges
@@ -386,6 +403,12 @@ authors are deliberately not excluded — an agent-authored merge with no human 
 though `excluded_logins` can omit specific service accounts. Each rule has independent enablement, severity, and
 minimum-occurrence configuration. Repositories without cached evidence are listed under `unavailable` rather than
 silently omitted.
+
+Each repository block also names the `team` the configuration says owns it, and carries a `metrics` array holding the
+nine neutral aggregates the readable report has always shown: one entry per metric with its identifier, its aggregate
+observation and the classification counts behind it — the same figures a `--metric` drill-down emits over the same
+window, computed once and shared, so the two renderings cannot disagree. The team is accounting, not a roll-up: it says
+who owns a repository, and no team label, score or ordering follows from it.
 
 Each repository in the practice report also carries a `merge_gate` block holding the state the last `collect` stored,
 with the `fetched_at` instant it was read. The two halves of that report describe different times on purpose:
@@ -421,18 +444,20 @@ Each repository also carries an `open_pull_requests` block: everything above cov
 is the one place the report says what is in flight or stuck. It counts pull requests **opened in the reporting
 window**, **closed without merge** in that window, **currently open** right now, and **stale open** — currently open
 and last updated more than `lookback.stale_open_days` (14 by default) ago, measured from the last update, not from
-when the pull request was opened. Unlike every other source, this state is **never cached**: an open pull request has
-no settled state to cache, the four counts cost one bundled GraphQL call, and a cached "stale for 14 days" figure that
-is itself stale would be worse than the extra call. It is therefore fetched fresh on every `evidence` run that is not
-`--offline`, and `--offline` cannot report it at all — the block carries the reason instead of a remembered or zeroed
-count, because unavailable data must never become zero. The block carries `fetched_at`, the instant it was read, beside
-the four counts. Like the merge gate, it is display only and appears in the practice report, not in a `--metric`
-drill-down.
+when the pull request was opened. Like the merge gate, it is **current state**: `collect` observes the four counts and
+stores them latest-only, together with the collection window the two windowed counts were measured over, because a
+count over a window nobody remembers cannot be read. A repository whose counts GitHub refused records that as
+unavailable evidence and keeps every other block it did report — unavailable data must never become zero. The block
+carries `fetched_at`, the instant it was read, and `starts_at`/`ends_at`, the window the two windowed counts cover,
+beside the four counts. `evidence` serves it from that stored row; `evidence --refresh` observes it live instead and
+carries the reporting window it just measured. A row stored before this state was collected reports that as its reason
+rather than as four zeros. Like the merge gate, it is display only and appears in the practice report, not in a
+`--metric` drill-down.
 
 Each repository also carries a `security` block: the open security alerts of all three families — `dependabot`,
 `code_scanning` and `secret_scanning` — each with an `open` total and a `by_severity` breakdown. Like the merge gate it
 is **current state**, stored latest-only by `collect` and served with the `fetched_at` instant it was read, so
-`--offline` shows the last collection's answer rather than refusing. GitHub cannot say what was open in May, and the
+`evidence` shows the last collection's answer rather than refusing. GitHub cannot say what was open in May, and the
 question this answers is what is unfixed *now*; how long alerts took to resolve is a historical question this
 deliberately does not answer yet.
 
@@ -472,7 +497,7 @@ practice report rather than in a `--metric` drill-down.
 Each repository also carries a `codeowners` and a `maintenance` block, answering the gov.uk minimum standard for
 publicly accessible systems: is there a named owner, and is the repository maintained. Both are **current state**,
 collected by `collect` in one bundled GraphQL query per repository, stored latest-only beside the merge gate, and
-served with the `fetched_at` instant they were read, so `--offline` shows the last collection's answer. Both are
+served with the `fetched_at` instant they were read, so `evidence` shows the last collection's answer. Both are
 **report-only and ungraded**: the readiness assessment reads neither, per the standing rule that a signal becoming
 visible is not a reason to grade it.
 
@@ -515,7 +540,7 @@ reports the project key, **how the project was resolved**, when it was last anal
 **every condition behind it** — metric, comparator, threshold, actual value and level — and the measures beside them:
 coverage, duplicated lines, lines of code, total violations, the reliability, maintainability and security issue counts,
 security hotspots, and the four ratings as `A`–`E` letters. Like the merge gate it is **current state**, stored
-latest-only by `collect` and served with the `fetched_at` instant it was read, so `--offline` shows the last
+latest-only by `collect` and served with the `fetched_at` instant it was read, so `evidence` shows the last
 collection's answer. SonarCloud is read anonymously; setting `SONAR_TOKEN` or `SONARCLOUD_TOKEN` widens the project
 listing to private projects.
 
@@ -839,12 +864,13 @@ counts forwards from the start; giving all three is rejected. With no window opt
 it; that guard exists to catch a mistyped number, not to cap intent, because a pattern of behaviour may need the life of
 a project to be visible.
 
-`--offline` never contacts GitHub, and refuses outright if the cache does not fully cover the requested window rather
+Reporting from the caches — `evidence` without `--refresh`, and `trend --offline` — contacts GitHub not at all, and
+refuses outright if the cache does not fully cover the requested window rather
 than emitting a short one — for **either** source, naming the one it could not answer for: a window whose pull requests
 are cached but whose direct commits were never collected would understate every governance denominator by exactly the
 bypasses it could not see — a silently truncated window is more dangerous than no answer. Because the mutable edge is
-cached without recording coverage, `--offline` also refuses any window overlapping the last `mutable_hours`. That is
-intended: `--offline` means settled, cached evidence or nothing. Ask for a window ending at the most recent UTC midnight
+cached without recording coverage, a cached report also refuses any window overlapping the last `mutable_hours`. That is
+intended: it means settled, cached evidence or nothing. Ask for a window ending at the most recent UTC midnight
 and it is served from cache.
 
 Merge-gate collection first uses effective repository rulesets. If none apply, it requests detailed classic branch
@@ -925,8 +951,8 @@ read; the SonarCloud project with how it was resolved, its analysis instant, its
 it, and its measures and ratings — or the reason no project is mapped; the CODEOWNERS files found with their sizes and
 whether GitHub recognises the location, or `absent`, or the reason
 the state is unavailable; the maintenance instants (last commit, last human commit, search bound) with the 6/12/24-month
-window table and the reason beneath any `unknown`; the open pull-request counts with the instant they were fetched, or
-the reason they are unavailable; one row per metric; the cohort's review events counted by state; and the `unreviewed-merge`
+window table and the reason beneath any `unknown`; the open pull-request counts with the instant they were read and the
+window two of them cover, or the reason they are unavailable; one row per metric; the cohort's review events counted by state; and the `unreviewed-merge`
 findings split into one column per observed size class. A `--metric` drill-down renders instead as that metric's
 aggregate and the classification counts behind it.
 
@@ -1006,10 +1032,11 @@ SonarCloud, read 2026-08-02T09:30Z
 
 Open pull requests, read 2026-08-02T09:30Z
 ------------------------------------------
-  Opened in window      41
-  Closed without merge   6
-  Currently open        18
-  Stale open             7
+  Opened and closed over  2026-05-09T00:00Z to 2026-08-08T00:00Z
+  Opened in window        41
+  Closed without merge    6
+  Currently open          18
+  Stale open              7
 
 Behaviour
 ---------
@@ -1058,10 +1085,22 @@ in `unavailable` contributes no actors, because no facts were read for it.
 "actors": [
   {"actor_login": "alice",
    "repositories": [
-     {"readiness": "red",   "repository": "project-x", "contributions": 41, "blocking": 12},
-     {"readiness": "green", "repository": "project-z", "contributions": 3,  "blocking": 0}]}
+     {"readiness": "red", "repository": "project-x", "contributions": 41, "blocking": 12,
+      "metrics": [{"metric": "independent-review-coverage",
+                   "summary": {"status": "observed", "numerator": 12, "denominator": 41},
+                   "classifications": {"included": 12, "no-review-events": 29}}]},
+     {"readiness": "green", "repository": "project-z", "contributions": 3, "blocking": 0,
+      "metrics": [{"metric": "independent-review-coverage",
+                   "summary": {"status": "observed", "numerator": 3, "denominator": 3},
+                   "classifications": {"included": 3}}]}]}
 ]
 ```
+
+Each row's `metrics` holds the same nine aggregates the repository block carries — abridged to the first of them above —
+measured over **that person's merges in that repository** and nothing else. They are observations listed per repository, never combined across the
+repositories somebody works in: averaging a coverage rate over three merges with one over three hundred would weight the
+two equally and describe neither. Nobody is ordered or compared by any of them, and a bot gets no row at all, so it gets
+no summaries either.
 
 `contributions` counts the merges that person authored in the window, by either route, after the cohort's author
 exclusions. `blocking` sums the `occurrences` behind their practice findings in that repository, so twelve unreviewed
@@ -1146,9 +1185,11 @@ uv run metrics trend --config metrics.example.yaml --period-days 28 --periods 6 
 - `--periods N` caps the series at the `N` periods **nearest the enablement instant**, dropping the most recent ones.
   The series is anchored at enablement and read against the baseline, so cutting the tail preserves the comparison the
   report exists to make. Without it, every whole period between enablement and the most recent UTC midnight is reported.
-- `--offline` behaves exactly as it does for `evidence`: never contacts GitHub, and refuses any period the cache does not
-  fully cover, including one overlapping the mutable edge. Without it, `trend` collects what the cache lacks, which costs
-  one fetch per uncovered period on a cold cache and nothing on a warm one.
+- `--offline` never contacts GitHub, and refuses any period the cache does not fully cover, including one overlapping
+  the mutable edge — which is what `evidence` now does with no flag at all. `trend` keeps the flag because it still
+  collects by default: a series anchored to enablement reaches back over periods no collection window ever covered, so
+  the useful default is the one that fills them, at one fetch per uncovered period on a cold cache and nothing on a
+  warm one.
 
 The **baseline** is the window of one period length ending at the enablement instant, `[enablement - period_days,
 enablement)`. **Periods** are consecutive half-open windows of the same length starting at that instant. The trailing
@@ -1207,8 +1248,8 @@ date, or one enabled too recently for a whole period, resolves no window and cou
 report itself partial forever while most of the organisation is not yet enabled. A wholly failed run still writes its
 report: the per-window reasons are the useful thing it produces.
 
-Open pull-request state **cannot** appear in a trend. It is never cached and current by definition, so there is no
-history to compare against; it stays a current-state block in `evidence` only.
+Open pull-request state **cannot** appear in a trend. It is stored latest-only — every `collect` run replaces the row —
+so there is no history to compare against; it stays a current-state block in `evidence` only.
 
 **Security alerts appear as an observation series, not as periods.** Open alert counts are current state — GitHub cannot
 say what was open last month — so every `collect` run **appends** one observation per repository per readable family
@@ -1292,3 +1333,60 @@ Security alert observations
   observed when collect ran, so a gap between rows is a gap in the collection cadence
   secret-scanning alerts carry no severity, so their severity columns are always zero
 ```
+
+## Dashboard
+
+The same evidence, read in a browser instead of a terminal. Two processes: `metrics-serve` holds the report and
+answers JSON, and a Next.js app in `ui/` renders it. Neither contacts GitHub — the service reads the two SQLite
+files a `collect` run wrote and nothing else — so the whole loop runs without a credential.
+
+```bash
+uv run metrics collect --config metrics.example.yaml --from 2026-05-01 --to 2026-09-01
+uv sync --extra service
+uv run metrics-serve --config metrics.example.yaml
+npm --prefix ui install
+API_URL=http://localhost:8000 npm --prefix ui run dev
+```
+
+The UI is the one part of this repository that needs Node — 18.17 or newer, which is what Next.js 14 requires. The
+Python side needs none of it, and a host that only ever collects can ignore `ui/` entirely.
+
+`collect` is the only step that needs `GH_TOKEN` or the App variables, and it is the step that decides what the
+dashboard can show: a span the caches do not cover is reported as not reported, never as a smaller number. Since
+2026-09-01 it also stores each repository's open pull-request counts, so the dashboard can show them without a live
+call — that is why `collect` has to run before the service, not merely at some point in the past.
+
+FastAPI and uvicorn are an optional extra, so a collection host that will never serve anything installs neither.
+`uv sync --extra service` adds them. The `metrics-serve` script itself is installed either way; without the extra it
+starts and stops on an import error naming `fastapi`.
+
+`metrics-serve` takes `--config` (repeatable, as every command's does), `--host` (default `127.0.0.1`), `--port`
+(default `8000`), `--logging`, and `--max-bundle-age` (default `3600` seconds, and at least `1` — a zero or negative
+age would make every bundle born stale and rebuild the whole cohort on every request). It refuses a configuration with
+no `teams:` section, as every cohort command does, and refuses one whose `lookback.maximum_days` is shorter than the
+shortest span it offers, rather than starting with nothing to serve. It builds one whole report per window span — 1, 4,
+8, 12 and 26 weeks, filtered against the configuration's `lookback.maximum_days` — and holds it until either the age
+limit passes or one of the cache files changes size or mtime, which is how a collection landing at lunchtime reaches a
+page somebody is already reading. The endpoints are `/healthz`, `/windows`, `/overview`, `/repositories`,
+`/repositories/{repository}`, `/repositories/{repository}/trend`, `/actors`, `/actors/{login}`, `/teams` and
+`/teams/{team}`; every data endpoint takes `?weeks=` and refuses a span off the list rather than clamping it. A request
+naming no span gets four weeks, or the longest span the configuration allows below that.
+
+The trend endpoint is the one exception to `?weeks=`: a series is cut into periods from the repository's own
+enablement instant and has no reporting window to select, so it takes `period_days` (default `28`) and an optional
+`periods` instead, and each cut is held beside the window bundles under the same rebuild rules. `period_days` runs 1 to
+365 and `periods` 1 to 26. **A cut is refused rather than truncated**, and that applies to the series a request
+*resolves* to as well as to the number it names: leaving `periods` out asks for every whole period since enablement, so
+a repository enabled long enough ago is refused with the count it asked for until the caller names a cut. A series
+quietly stopped at 26 periods would be read as the whole history since enablement, which is the reading the refusal
+exists to prevent. Because a caller must name a cut, `/windows` publishes the one this service will answer as
+`trend_periods` beside the spans it offers, and the UI asks for that rather than keeping a copy of the bound that could
+drift from it — a series that comes back holding the whole cut is labelled on the page as the first periods since
+enablement rather than as all of them. It reports the same `RepositoryTrend` the `metrics trend` contract carries, offline: a period the
+caches do not cover reports that reason and no counts.
+
+The UI fetches server-side, so the service needs no CORS headers and no browser ever calls it directly. `API_URL`
+tells the Next.js server where it is, defaulting to `http://localhost:8000`. `npm --prefix ui run build` then
+`npm --prefix ui start` serves it for real; `npm --prefix ui run check` is the whole UI gate — lint, types, tests,
+build — in one step, as `uv run poe check` is for the Python. See [`ui/README.md`](ui/README.md) for the pages, the
+design tokens, and the guardrails the UI keeps.

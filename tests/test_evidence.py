@@ -12,7 +12,9 @@ import pytest
 
 from metrics.assessment import ReadinessPolicy
 from metrics.behaviour import commit_query_signature, query_signature
+from metrics.behaviour_metrics import behaviour_metrics
 from metrics.behaviour_metrics.approval_coverage import ApprovalCoverage
+from metrics.behaviour_metrics.base import BehaviourMetric
 from metrics.behaviour_metrics.description_quality import DescriptionQuality
 from metrics.behaviour_metrics.independent_review_coverage import IndependentReviewCoverage
 from metrics.behaviour_metrics.merge_cycle_time import MergeCycleTime
@@ -48,6 +50,8 @@ from metrics.domain import (
     MergeGateReport,
     Merges,
     OpenAlertCount,
+    OpenPullRequestReport,
+    OpenPullRequestSnapshot,
     OpenPullRequestSummary,
     PracticeFinding,
     PullRequestFact,
@@ -81,16 +85,20 @@ from metrics.evidence import (
     StoredReports,
     actor_contributions,
     actor_readiness,
+    actor_slice,
     cached_repository_evidence,
     cohort_summary,
     collected_repository_evidence,
     maintenance_windows,
-    offline_open_pull_request_report,
+    metric_summaries,
+    offline_practice_report,
     open_pull_request_report,
     repository_evidence,
     stored_codeowners,
     stored_maintenance,
     stored_merge_gate,
+    stored_open_pull_requests,
+    stored_reports,
     stored_repository_state,
     stored_security_alerts,
     stored_sonar,
@@ -113,6 +121,11 @@ def unreviewed_merge(configuration: PracticeRuleConfiguration | None = None) -> 
 def uncollected_gate() -> MergeGateReport:
     """Build the merge gate report of a repository whose state has never been collected."""
     return MergeGateReport(detail="no repository state has been collected; run metrics collect")
+
+
+def uncollected_open_pull_requests() -> OpenPullRequestReport:
+    """Build the open pull-request report of a repository whose state has never been collected."""
+    return OpenPullRequestReport(detail="no repository state has been collected; run metrics collect")
 
 
 def uncollected_security() -> SecurityAlertReport:
@@ -139,6 +152,7 @@ def uncollected_reports() -> StoredReports:
     """Build every current-state block of a repository whose state has never been collected."""
     return StoredReports(
         merge_gate=uncollected_gate(),
+        open_pull_requests=uncollected_open_pull_requests(),
         security=uncollected_security(),
         codeowners=uncollected_codeowners(),
         maintenance=uncollected_maintenance(),
@@ -149,6 +163,11 @@ def uncollected_reports() -> StoredReports:
 def default_policy() -> ReadinessPolicy:
     """Build the readiness policy with its default thresholds."""
     return ReadinessPolicy(AssessmentConfiguration(), TrivialityConfiguration())
+
+
+def all_metrics() -> tuple[BehaviourMetric, ...]:
+    """Build every behaviour metric with the default traceability patterns."""
+    return behaviour_metrics(TraceabilityConfiguration())
 
 
 def cached_facts() -> RepositoryEvidence:
@@ -461,8 +480,9 @@ def test_repository_practice_evidence_honors_rule_controls() -> None:
             unreviewed_merge(PracticeRuleConfiguration(enabled=False)),
         ),
         default_policy(),
-        offline_open_pull_request_report(),
         uncollected_reports(),
+        "civil",
+        all_metrics(),
     )
 
     assert excluded.behaviour == ()
@@ -478,8 +498,9 @@ def test_repository_practice_evidence_collates_every_enabled_rule() -> None:
             unreviewed_merge(PracticeRuleConfiguration(enabled=False)),
         ),
         default_policy(),
-        offline_open_pull_request_report(),
         uncollected_reports(),
+        "civil",
+        all_metrics(),
     )
 
     assert len(report.behaviour) == 2
@@ -491,12 +512,74 @@ def test_repository_practice_evidence_omits_a_disabled_assessment() -> None:
     report = cached_facts().practices(
         (unreviewed_merge(),),
         ReadinessPolicy(AssessmentConfiguration(enabled=False), TrivialityConfiguration()),
-        offline_open_pull_request_report(),
         uncollected_reports(),
+        "civil",
+        all_metrics(),
     )
 
     assert report.assessment is None
     assert report.behaviour
+
+
+def test_repository_practice_evidence_carries_the_owning_team_and_the_cohort_metrics() -> None:
+    """Name the team the configuration says owns the repository, and summarise every metric over it."""
+    report = cached_facts().practices(
+        (unreviewed_merge(),), default_policy(), uncollected_reports(), "civil", all_metrics()
+    )
+
+    assert report.team == "civil"
+    assert tuple(summary.metric for summary in report.metrics) == tuple(metric.identifier for metric in all_metrics())
+
+
+def test_metric_summaries_report_what_the_drill_down_of_each_metric_reports() -> None:
+    """Compute one repository's summaries exactly as a `--metric` drill-down computes its own.
+
+    The point of the shared helper: the readable report, the JSON block and a drill-down are three
+    renderings of one computation, so a figure cannot appear in one of them and not in another.
+    """
+    cached = cached_facts()
+
+    summaries = metric_summaries(cached, all_metrics())
+
+    assert {summary.metric: (summary.summary, summary.classifications) for summary in summaries} == {
+        metric.identifier: (
+            cached.metric(metric, include_identities=False).summary,
+            cached.metric(metric, include_identities=False).classifications,
+        )
+        for metric in all_metrics()
+    }
+
+
+def test_actor_slice_narrows_a_cohort_to_one_person_by_either_route() -> None:
+    """Keep the merges one person authored, however they were spelled and however they arrived."""
+    cached = cached_facts().model_copy(
+        update={
+            "pull_requests": (
+                cached_facts().pull_requests[0].model_copy(update={"author_login": "Author"}),
+                cached_facts().pull_requests[1],
+            ),
+            "direct_commits": (direct_commit("aaa", author_login="AUTHOR"), direct_commit("bbb")),
+        },
+    )
+
+    sliced = actor_slice(cached, "author")
+
+    assert tuple(fact.number for fact in sliced.pull_requests) == (11,)
+    assert tuple(commit.sha for commit in sliced.direct_commits) == ("aaa",)
+
+
+def test_actor_slice_attributes_nothing_to_a_change_nobody_is_named_for() -> None:
+    """Leave a merge GitHub matched to no account out of everybody's slice rather than out of one."""
+    cached = cached_facts().model_copy(
+        update={
+            "pull_requests": (cached_facts().pull_requests[0].model_copy(update={"author_login": None}),),
+            "direct_commits": (direct_commit("aaa").model_copy(update={"author_login": None}),),
+        },
+    )
+
+    sliced = actor_slice(cached, "author")
+
+    assert sliced == Merges(pull_requests=(), direct_commits=())
 
 
 def test_metric_report_measures_time_to_first_independent_review() -> None:
@@ -625,6 +708,7 @@ def collected_state(
     maintenance: MaintenanceEvidence | None = None,
     sonar: SonarMeasures | None = None,
     sonar_project: SonarProjectResolution | None = None,
+    open_pull_requests: OpenPullRequestSnapshot | None = None,
 ) -> RepositoryInventory:
     """Build one collection whose stored state carries the given current-state blocks."""
     collected_at = datetime(2026, 8, 8, 9, tzinfo=UTC)
@@ -653,6 +737,7 @@ def collected_state(
                 maintenance=maintenance,
                 sonar=sonar,
                 sonar_project=sonar_project,
+                open_pull_requests=open_pull_requests,
             ),
         ),
         failures=(),
@@ -1091,14 +1176,16 @@ def test_repository_practice_evidence_grades_nothing_from_sonar_evidence() -> No
     without = cached_facts().practices(
         (unreviewed_merge(),),
         default_policy(),
-        offline_open_pull_request_report(),
         uncollected,
+        "civil",
+        all_metrics(),
     )
     with_sonar = cached_facts().practices(
         (unreviewed_merge(),),
         default_policy(),
-        offline_open_pull_request_report(),
         failing,
+        "civil",
+        all_metrics(),
     )
 
     assert without.assessment is not None
@@ -1203,13 +1290,14 @@ def open_pull_request_data(
     }
 
 
-def test_open_pull_request_report_fetches_the_four_counts_fresh(tmp_path: Path) -> None:
-    """Report the counts and the instant they were fetched, never a cached or remembered figure."""
+def test_open_pull_request_report_observes_the_four_counts_fresh(tmp_path: Path) -> None:
+    """Report the counts, the instant they were observed, and the window two of them cover."""
     client = MagicMock(spec=GitHubClient)
     client.graphql.return_value = open_pull_request_data(5, 1, 3, 2)
     reference = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    requested = window(7)
 
-    report = open_pull_request_report(client, configuration(tmp_path), "cath-service", window(7), reference)
+    report = open_pull_request_report(client, configuration(tmp_path), "cath-service", requested, reference)
 
     assert report.summary == OpenPullRequestSummary(
         opened_in_window=5,
@@ -1218,6 +1306,10 @@ def test_open_pull_request_report_fetches_the_four_counts_fresh(tmp_path: Path) 
         stale_open=2,
     )
     assert report.fetched_at == reference
+    # The reporting window here, as the collection window is on the stored path: a refreshed report
+    # must be readable exactly like a stored one.
+    assert report.starts_at == requested.starts_at
+    assert report.ends_at == requested.ends_at
     assert report.detail is None
 
 
@@ -1256,15 +1348,107 @@ def test_open_pull_request_report_preserves_a_github_failure(tmp_path: Path) -> 
 
     assert report.summary is None
     assert report.fetched_at is None
+    assert report.starts_at is None
     assert report.detail == "GitHub permission denied"
 
 
-def test_offline_open_pull_request_report_refuses_to_answer() -> None:
-    """State that offline evidence never observes this never-cached state."""
-    report = offline_open_pull_request_report()
+def collected_open_pull_requests() -> OpenPullRequestSnapshot:
+    """Build the open pull-request state a collection would have stored, with its own window."""
+    collected_at = datetime(2026, 8, 8, 9, tzinfo=UTC)
+    return OpenPullRequestSnapshot(
+        starts_at=collected_at - timedelta(days=7),
+        ends_at=collected_at,
+        summary=OpenPullRequestSummary(
+            opened_in_window=5,
+            closed_without_merge=1,
+            currently_open=3,
+            stale_open=2,
+        ),
+    )
+
+
+def test_stored_open_pull_requests_report_the_counts_with_the_window_they_cover(tmp_path: Path) -> None:
+    """Serve the stored state with the collection window two of its four counts were measured over."""
+    settings = configuration(tmp_path)
+    snapshot = collected_open_pull_requests()
+    record_repository_state(settings.database, collected_state(merge_gate(), open_pull_requests=snapshot))
+
+    report = stored_open_pull_requests(stored_repository_state(settings, "cath-service"))
+
+    assert report.summary == snapshot.summary
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    # The window of the collection that observed it, which is not the window of the report around it.
+    assert report.starts_at == snapshot.starts_at
+    assert report.ends_at == snapshot.ends_at
+    assert report.detail is None
+
+
+def test_stored_open_pull_requests_report_a_repository_that_was_never_collected(tmp_path: Path) -> None:
+    """State that nothing was collected rather than reporting four counts nobody observed."""
+    report = stored_open_pull_requests(stored_repository_state(configuration(tmp_path), "cath-service"))
 
     assert report.summary is None
-    assert report.detail == "open pull-request state is never cached; omit --offline to observe it"
+    assert report.fetched_at is None
+    assert report.detail == "no repository state has been collected; run metrics collect"
+
+
+def test_stored_open_pull_requests_separate_state_stored_before_they_were_collected(tmp_path: Path) -> None:
+    """Distinguish a row stored without the counts from a repository that was never collected.
+
+    Reporting a pre-2026-09-01 row as four zeros would invent a repository with nothing open, which
+    is the one reading this block has always been forbidden.
+    """
+    settings = configuration(tmp_path)
+    record_repository_state(settings.database, collected_state(merge_gate()))
+
+    report = stored_open_pull_requests(stored_repository_state(settings, "cath-service"))
+
+    assert report.summary is None
+    assert report.fetched_at == STANDARDS_FETCHED_AT
+    assert report.detail == (
+        "open pull-request state was not collected when repository state was stored; run metrics collect"
+    )
+
+
+def test_stored_open_pull_requests_preserve_storage_failure(tmp_path: Path) -> None:
+    """Describe an unreadable state table instead of raising through the report."""
+    with patch("metrics.evidence.load_repository_state", side_effect=StorageError("cache unreadable")):
+        report = stored_open_pull_requests(stored_repository_state(configuration(tmp_path), "cath-service"))
+
+    assert report == OpenPullRequestReport(detail="cache unreadable")
+
+
+def test_stored_reports_project_the_open_pull_request_block_from_the_same_row(tmp_path: Path) -> None:
+    """Carry the block into `StoredReports` beside the five it joined, off one load of the row."""
+    settings = configuration(tmp_path)
+    snapshot = collected_open_pull_requests()
+    record_repository_state(settings.database, collected_state(merge_gate(), open_pull_requests=snapshot))
+
+    reports = stored_reports(stored_repository_state(settings, "cath-service"))
+
+    assert reports.open_pull_requests.summary == snapshot.summary
+    assert reports.open_pull_requests.fetched_at == reports.merge_gate.fetched_at
+
+
+def test_repository_practice_evidence_reads_open_pull_requests_from_the_stored_blocks() -> None:
+    """Take the block from `current_state` rather than from a parameter of its own.
+
+    It was the last block passed separately, which let a call site pair one repository's counts with
+    another's gate — the failure the single `StoredReports` argument exists to make impossible.
+    """
+    stored = replace(
+        uncollected_reports(),
+        open_pull_requests=OpenPullRequestReport(
+            fetched_at=STANDARDS_FETCHED_AT,
+            starts_at=collected_open_pull_requests().starts_at,
+            ends_at=collected_open_pull_requests().ends_at,
+            summary=collected_open_pull_requests().summary,
+        ),
+    )
+
+    report = cached_facts().practices((unreviewed_merge(),), default_policy(), stored, "civil", all_metrics())
+
+    assert report.open_pull_requests == stored.open_pull_requests
 
 
 def pull_request_coverage(requested: ReportingWindow) -> SourceCoverage:
@@ -1506,17 +1690,19 @@ def assessed_practices(
     starts_at = datetime(2026, 7, 1, tzinfo=UTC)
     return RepositoryPracticeEvidence(
         repository=repository,
+        team="civil",
         starts_at=starts_at,
         ends_at=starts_at + timedelta(days=30),
         provenance=WindowProvenance(offline=True, intervals_fetched=0),
         cohort=CohortSummary(merged=0, reported=0, excluded_authors={}),
         assessment=None if label is None else ReadinessAssessment(label=label, blocking=(), caution=(), clear=()),
         merge_gate=uncollected_gate(),
-        open_pull_requests=offline_open_pull_request_report(),
+        open_pull_requests=uncollected_open_pull_requests(),
         security=uncollected_security(),
         codeowners=uncollected_codeowners(),
         maintenance=uncollected_maintenance(),
         sonar=uncollected_sonar(),
+        metrics=(),
         behaviour=behaviour,
     )
 
@@ -1563,6 +1749,7 @@ def test_actor_readiness_orders_repositories_by_contributions_then_by_name() -> 
             (busiest, assessed_practices("project-x")),
             (also_tied, assessed_practices("project-b", ReadinessLabel.GREEN)),
         ),
+        all_metrics(),
     )
 
     assert len(actors) == 1
@@ -1582,7 +1769,7 @@ def test_actor_readiness_lists_actors_alphabetically() -> None:
     """Order the section by login, so a reader can find a person without reading every line."""
     evidence = authored_evidence("cath-service", pull_requests=("carol", "alice", "Bob"))
 
-    actors = actor_readiness(((evidence, assessed_practices("cath-service")),))
+    actors = actor_readiness(((evidence, assessed_practices("cath-service")),), all_metrics())
 
     assert tuple(actor.actor_login for actor in actors) == ("alice", "Bob", "carol")
 
@@ -1594,6 +1781,7 @@ def test_actor_readiness_merges_two_spellings_of_one_login() -> None:
 
     actors = actor_readiness(
         ((smaller, assessed_practices("project-z", ReadinessLabel.GREEN)), (busiest, assessed_practices("project-x"))),
+        all_metrics(),
     )
 
     assert len(actors) == 1
@@ -1608,7 +1796,7 @@ def test_actor_readiness_carries_no_label_for_an_unassessed_repository() -> None
     """Leave the label out where the readiness policy graded nothing, rather than inventing one."""
     evidence = authored_evidence("cath-service", pull_requests=("alice",))
 
-    actors = actor_readiness(((evidence, assessed_practices("cath-service", label=None)),))
+    actors = actor_readiness(((evidence, assessed_practices("cath-service", label=None)),), all_metrics())
 
     assert actors[0].repositories[0].readiness is None
 
@@ -1620,6 +1808,7 @@ def test_actor_readiness_reports_an_actor_present_in_one_repository_only() -> No
 
     actors = actor_readiness(
         ((first, assessed_practices("project-x")), (second, assessed_practices("project-z", ReadinessLabel.GREEN))),
+        all_metrics(),
     )
 
     assert {actor.actor_login: [row.repository for row in actor.repositories] for actor in actors} == {
@@ -1639,7 +1828,7 @@ def test_actor_readiness_sums_blocking_occurrences_across_findings() -> None:
         ),
     )
 
-    actors = actor_readiness(((evidence, practices),))
+    actors = actor_readiness(((evidence, practices),), all_metrics())
 
     assert {actor.actor_login: actor.repositories[0].blocking for actor in actors} == {"Alice": 12, "bob": 0}
 
@@ -1654,6 +1843,7 @@ def test_actor_readiness_counts_blocking_against_the_repository_that_reported_it
             (blocked, assessed_practices("project-x", behaviour=(blocking_finding("alice", 12),))),
             (clean, assessed_practices("project-z", ReadinessLabel.GREEN)),
         ),
+        all_metrics(),
     )
 
     assert tuple((row.repository, row.blocking) for row in actors[0].repositories) == (
@@ -1671,9 +1861,12 @@ def test_actor_readiness_leaves_out_a_bot_that_merged_into_the_cohort() -> None:
     )
     practices = assessed_practices("cath-service", behaviour=(blocking_finding("copilot-swe-agent[bot]", 3),))
 
-    actors = actor_readiness(((evidence, practices),))
+    actors = actor_readiness(((evidence, practices),), all_metrics())
 
     assert tuple(actor.actor_login for actor in actors) == ("alice",)
+    # No bot is measured either: the section lists nobody for an agent, so there is no row of its
+    # merges to read, however many of them the cohort's own denominators still count.
+    assert {actor.actor_login for actor in actors if actor.repositories[0].metrics} == {"alice"}
     # Measured rather than restated from the fixture: the merges the section leaves the bots out of
     # are the same ones the cohort counts, because the two exclusions answer different questions.
     assert cohort_summary(evidence, excluded=()) == CohortSummary(
@@ -1682,3 +1875,76 @@ def test_actor_readiness_leaves_out_a_bot_that_merged_into_the_cohort() -> None:
         excluded_authors={},
         direct_commits=1,
     )
+
+
+def test_actor_readiness_measures_each_person_over_their_own_merges_in_each_repository() -> None:
+    """Summarise one person's merges in one repository, never the repository's whole cohort.
+
+    Alice merged one of the two pull requests this repository reports, so her coverage rate is
+    measured over one merge and not over both — and it is measured again, separately, in the second
+    repository rather than being combined with the first.
+    """
+    busiest = authored_evidence("project-x", pull_requests=("alice", "bob"), direct_commits=("alice",))
+    smaller = authored_evidence("project-z", pull_requests=("alice",))
+
+    actors = actor_readiness(
+        ((busiest, assessed_practices("project-x")), (smaller, assessed_practices("project-z"))),
+        all_metrics(),
+    )
+
+    alice = next(actor for actor in actors if actor.actor_login == "alice")
+    coverage = {
+        row.repository: next(
+            summary.summary for summary in row.metrics if summary.metric == "independent-review-coverage"
+        )
+        for row in alice.repositories
+    }
+    assert [
+        observation.denominator for observation in coverage.values() if isinstance(observation, RateObservation)
+    ] == [
+        2,
+        1,
+    ]
+    assert [row.repository for row in alice.repositories] == ["project-x", "project-z"]
+
+
+def cached_window(settings: Configuration, requested: ReportingWindow) -> None:
+    """Cache one merged pull request and one direct commit covering the whole of one window."""
+    fact = cached_facts().pull_requests[1].model_copy(update={"merged_at": requested.starts_at + timedelta(days=1)})
+    cache_pull_request_facts(settings.database, pull_request_coverage(requested), (fact,), complete=True)
+    cache_direct_commit_facts(
+        settings.database,
+        commit_coverage(requested),
+        (direct_commit("aaa", committed_at=requested.starts_at + timedelta(days=2)),),
+        complete=True,
+    )
+
+
+def test_offline_practice_report_assembles_the_whole_report_from_the_caches(tmp_path: Path) -> None:
+    """Report every configured repository, its team, its metrics and its actors, contacting nothing."""
+    settings = configuration(tmp_path)
+    requested = window(7)
+    cached_window(settings, requested)
+
+    report = offline_practice_report(settings, requested)
+
+    assert report.organization == "hmcts"
+    assert report.unavailable == ()
+    assert [block.repository for block in report.repositories] == ["cath-service"]
+    assert report.repositories[0].team == "civil"
+    assert [summary.metric for summary in report.repositories[0].metrics] == [
+        metric.identifier for metric in all_metrics()
+    ]
+    # The stored current state is read for each repository the cache answered for, and there is none.
+    assert report.repositories[0].merge_gate == uncollected_gate()
+    assert {actor.actor_login for actor in report.actors} == {"second-author", "pusher"}
+
+
+def test_offline_practice_report_reports_an_uncovered_repository_as_unavailable(tmp_path: Path) -> None:
+    """Name the repository the cache cannot answer for rather than reporting a thinner window."""
+    report = offline_practice_report(configuration(tmp_path), window(7))
+
+    assert report.repositories == ()
+    assert report.actors == ()
+    assert [item.repository for item in report.unavailable] == ["cath-service"]
+    assert "cached pull_request evidence does not cover" in report.unavailable[0].detail

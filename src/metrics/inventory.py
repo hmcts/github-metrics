@@ -10,6 +10,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 from requests.exceptions import JSONDecodeError
 
 from metrics.analysis import excluded_authors, is_human_commit_author
+from metrics.behaviour import collect_open_pull_request_state
 from metrics.config import Configuration, owned_repositories
 from metrics.cost import CostMeter, combined
 from metrics.domain import (
@@ -23,6 +24,7 @@ from metrics.domain import (
     MaintenanceEvidence,
     MergeGateEvidence,
     OpenAlertCount,
+    OpenPullRequestSnapshot,
     PullRequestRule,
     ReportingWindow,
     RepositoryCollectionCost,
@@ -1365,20 +1367,74 @@ def collect_merge_gate(
     )
 
 
+@dataclass(frozen=True)
+class OpenPullRequestScope:
+    """Everything one repository's open pull-request counts are measured against.
+
+    Three run-level facts that only mean anything together: two of the four counts are bounded by
+    `window`, and `stale_open` is measured from `reference` back over `stale_open_days`. They travel
+    as one argument because a caller that had the window without the cutoff, or either without the
+    instant they were resolved at, could not ask the question at all.
+    """
+
+    window: ReportingWindow
+    stale_open_days: int
+    reference: datetime
+
+
+def collect_open_pull_requests(
+    client: GitHubClient,
+    organization: str,
+    team_identifier: str,
+    repository: str,
+    pull_request_scope: OpenPullRequestScope,
+) -> OpenPullRequestSnapshot | RepositoryInventoryIssue:
+    """Observe one repository's open pull-request state, or describe why it is unavailable.
+
+    Stored latest-only beside the merge gate since 2026-09-01, with the window its two windowed
+    counts cover, so `evidence` can report the state offline; see architecture.md. A refusal is a
+    failure and never a zeroed count — "none open" and "nobody would say" are different answers.
+    """
+    try:
+        summary = collect_open_pull_request_state(
+            client,
+            organization,
+            repository,
+            pull_request_scope.window,
+            pull_request_scope.stale_open_days,
+            pull_request_scope.reference,
+        )
+    except GitHubError as exception:
+        return RepositoryInventoryIssue(
+            team_identifier=team_identifier,
+            repository=repository,
+            evidence=EvidenceKind.OPEN_PULL_REQUESTS,
+            reason=exception.reason,
+            detail=str(exception),
+        )
+    return OpenPullRequestSnapshot(
+        starts_at=pull_request_scope.window.starts_at,
+        ends_at=pull_request_scope.window.ends_at,
+        summary=summary,
+    )
+
+
 def collect_repository_state(
     client: GitHubClient,
     organization: str,
     team_identifier: str,
     repository: str,
     excluded: frozenset[str],
+    pull_request_scope: OpenPullRequestScope,
     sonar: SonarSource | None = None,
 ) -> tuple[RepositoryInventoryItem | None, tuple[RepositoryInventoryIssue, ...]]:
-    """Collect one repository's metadata, standards, merge gate, open alerts and quality state.
+    """Collect one repository's metadata, standards, merge gate, open alerts, pull requests and quality.
 
     All of it is collected together so that one repository's collection is one measurable unit;
     see `metrics.cost`. A repository whose metadata could not be read is not asked for anything
     else, because there is no default branch to ask about. `excluded` is the comparable
-    `cohort.excluded_authors` set the human-commit search tests authors against.
+    `cohort.excluded_authors` set the human-commit search tests authors against, and
+    `pull_request_scope` what the open pull-request counts are measured against.
 
     `sonar` is None for a run collecting no SonarCloud state, which stores neither measures nor a
     resolution: a row that says nothing about SonarCloud is read back as "not collected", never as a
@@ -1396,6 +1452,13 @@ def collect_repository_state(
     standards = collect_repository_standards(client, organization, team_identifier, result.repository, excluded)
     gate = collect_merge_gate(client, organization, team_identifier, result.repository)
     alerts = collect_security_alerts(client, organization, team_identifier, result.repository.name)
+    open_pull_requests = collect_open_pull_requests(
+        client,
+        organization,
+        team_identifier,
+        result.repository.name,
+        pull_request_scope,
+    )
     quality = (
         None
         if sonar is None
@@ -1421,9 +1484,18 @@ def collect_repository_state(
             **({"maintenance": standards.maintenance} if standards.maintenance is not None else {}),
             **({"sonar_project": quality.resolution} if quality is not None else {}),
             **({"sonar": quality.measures} if quality is not None and quality.measures is not None else {}),
+            # Left unset where the observation was refused, like the merge gate and unlike the alert
+            # block: an absent snapshot reads as "not observed", and a zeroed one would read as a
+            # repository with nothing open.
+            **(
+                {"open_pull_requests": open_pull_requests}
+                if isinstance(open_pull_requests, OpenPullRequestSnapshot)
+                else {}
+            ),
         },
     )
     failures = standards.failures + (() if gate.failure is None else (gate.failure,)) + alerts.failures
+    failures += () if isinstance(open_pull_requests, OpenPullRequestSnapshot) else (open_pull_requests,)
     return item, failures + (() if quality is None or quality.failure is None else (quality.failure,))
 
 
@@ -1467,6 +1539,7 @@ def collect_inventory(
     configuration: Configuration,
     client: GitHubClient,
     window: ReportingWindow,
+    reference: datetime,
     sonar: SonarSource | None = None,
 ) -> RepositoryInventory:
     """Collect current repository state for every configured team, measuring what each one cost.
@@ -1476,6 +1549,11 @@ def collect_inventory(
     configuration file. `costs` is ordered separately, slowest first, because it answers a different
     question.
 
+    `window` and `reference` are the run's own, shared with the windowed phase beside this one: the
+    open pull-request counts are the one current-state block two of whose figures are bounded by the
+    collection window, and the stale cutoff is measured back from the same instant the run resolved
+    that window against.
+
     `sonar` is None for a run collecting no SonarCloud state. When it is given, its client is metered
     beside the GitHub one so that a repository's figure covers everything its collection spent.
     """
@@ -1483,6 +1561,11 @@ def collect_inventory(
     failures: tuple[RepositoryInventoryIssue, ...] = ()
     costs: tuple[RepositoryCollectionCost, ...] = ()
     excluded = excluded_authors(configuration.cohort.excluded_authors)
+    pull_request_scope = OpenPullRequestScope(
+        window=window,
+        stale_open_days=configuration.lookback.stale_open_days,
+        reference=reference,
+    )
     owned = owned_repositories(configuration)
     for position, (team_identifier, repository) in enumerate(owned, start=1):
         meter = CostMeter(client, None if sonar is None else sonar.client)
@@ -1493,6 +1576,7 @@ def collect_inventory(
                 team_identifier,
                 repository,
                 excluded,
+                pull_request_scope,
                 sonar,
             )
         # Keyed on the name GitHub answered with, which is what the window phase meters against: a

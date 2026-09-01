@@ -1,20 +1,22 @@
 """Project cached behaviour facts into auditable evidence."""
 
 from collections import Counter
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from metrics.analysis import Merge, excluded_authors, in_cohort, is_human_account
-from metrics.assessment import ReadinessPolicy
+from metrics.assessment import ReadinessPolicy, readiness_policy
 from metrics.behaviour import collect_open_pull_request_state, requested_coverage, synchronize_merges
+from metrics.behaviour_metrics import behaviour_metrics
 from metrics.behaviour_metrics.base import BehaviourMetric
-from metrics.config import Configuration
+from metrics.config import Configuration, configured_repositories, repository_owners
 from metrics.domain import (
     MAINTENANCE_WINDOWS,
     ActorReadiness,
     ActorRepositoryReadiness,
     BehaviourEvidenceReport,
+    BehaviourMetricSummary,
     CachedBehaviourFacts,
     CodeownersReport,
     CohortSummary,
@@ -26,6 +28,7 @@ from metrics.domain import (
     MergeGateReport,
     Merges,
     OpenPullRequestReport,
+    PracticeEvidenceReport,
     ReportingWindow,
     RepositoryPracticeEvidence,
     SecurityAlertReport,
@@ -35,6 +38,7 @@ from metrics.domain import (
     WindowProvenance,
 )
 from metrics.github import GitHubClient, GitHubError
+from metrics.rules import configured_rules
 from metrics.rules.base import PracticeRule
 from metrics.storage import (
     StorageError,
@@ -45,6 +49,62 @@ from metrics.storage import (
 )
 
 
+def metric_classifications(cohort: Merges, metric: BehaviourMetric) -> dict[str, int]:
+    """Count how one metric classified every merge in a cohort, by either route onto the branch.
+
+    Factored out of `RepositoryEvidence.metric` so that a summary of one person's merges and a
+    drill-down over the whole cohort count classifications by the same rules: a direct commit the
+    metric does not classify is absent rather than counted under a name it never assigned.
+    """
+    classifications = Counter(metric.classification(pull_request) for pull_request in cohort.pull_requests)
+    classifications.update(
+        classification
+        for commit in cohort.direct_commits
+        if (classification := metric.commit_classification(commit)) is not None
+    )
+    return dict(sorted(classifications.items()))
+
+
+def metric_summaries(cohort: Merges, metrics: Iterable[BehaviourMetric]) -> tuple[BehaviourMetricSummary, ...]:
+    """Summarise every given metric over one cohort of merges.
+
+    The cohort is whatever the caller narrowed it to — a whole repository window, or one person's
+    merges inside it — and the summaries say nothing about which: the aggregate is the same
+    computation either way, and what it is measured over is stated by whatever carries the tuple.
+    """
+    return tuple(
+        BehaviourMetricSummary(
+            metric=metric.identifier,
+            summary=metric.summary(cohort),
+            classifications=metric_classifications(cohort, metric),
+        )
+        for metric in metrics
+    )
+
+
+def actor_slice(cohort: Merges, login: str) -> Merges:
+    """Narrow one repository's merges to those one person authored, by either route.
+
+    Matched case-insensitively, because a GitHub login is unique case-insensitively and the actor
+    section already treats `Alice` and `alice` as the one person they are. Both fact tuples are
+    filtered: a person who pushed straight to the default branch contributed there as much as one who
+    merged a pull request, and slicing only the pull requests would measure them as if they had not.
+    """
+    wanted = login.casefold()
+    return Merges(
+        pull_requests=tuple(
+            fact
+            for fact in cohort.pull_requests
+            if fact.author_login is not None and fact.author_login.casefold() == wanted
+        ),
+        direct_commits=tuple(
+            commit
+            for commit in cohort.direct_commits
+            if commit.author_login is not None and commit.author_login.casefold() == wanted
+        ),
+    )
+
+
 class RepositoryEvidence(CachedBehaviourFacts):
     """Build metric and practice reports for one repository reporting window."""
 
@@ -53,12 +113,6 @@ class RepositoryEvidence(CachedBehaviourFacts):
 
     def metric(self, metric: BehaviourMetric, *, include_identities: bool) -> BehaviourEvidenceReport:
         """Build one injected metric's offline evidence report."""
-        classifications = Counter(metric.classification(pull_request) for pull_request in self.pull_requests)
-        classifications.update(
-            classification
-            for commit in self.direct_commits
-            if (classification := metric.commit_classification(commit)) is not None
-        )
         return BehaviourEvidenceReport(
             organization=self.organization,
             repository=self.repository,
@@ -68,7 +122,7 @@ class RepositoryEvidence(CachedBehaviourFacts):
             provenance=self.provenance,
             cohort=self.cohort,
             summary=metric.summary(self),
-            classifications=dict(sorted(classifications.items())),
+            classifications=metric_classifications(self, metric),
             identities_included=include_identities,
             pull_requests=tuple(metric.reference(self.organization, fact) for fact in self.pull_requests)
             if include_identities
@@ -80,15 +134,18 @@ class RepositoryEvidence(CachedBehaviourFacts):
         self,
         rules: Iterable[PracticeRule],
         policy: ReadinessPolicy,
-        open_pull_requests: OpenPullRequestReport,
         current_state: StoredReports,
+        team: str,
+        metrics: Iterable[BehaviourMetric],
     ) -> RepositoryPracticeEvidence:
         """Assess readiness and evaluate every enabled practice rule beside the collected merge gate.
 
-        The stored blocks arrive together in `current_state` because they ARE one thing: five
+        The stored blocks arrive together in `current_state` because they ARE one thing: six
         projections of the single stored row this repository's last collection wrote. Passing them
         one by one grew a parameter for every source added and let a call site pair a repository's
-        gate with another's alerts.
+        gate with another's alerts. The open pull-request block joined them on 2026-09-01: it was
+        the last argument passed separately, and a refresh overrides it in `current_state` before it
+        arrives rather than travelling alongside.
 
         `security` is reported but grades nothing: no open-alert threshold has an owner, and the same
         reasoning keeps description quality out of the label (architecture.md, "Readiness assessment").
@@ -96,20 +153,26 @@ class RepositoryEvidence(CachedBehaviourFacts):
         signal becoming visible is not a reason to grade it. A failing SonarCloud quality gate is the
         sharpest example — it is somebody else's threshold, set per project, and adopting it here
         would import a judgment this tool did not make.
+
+        `team` and `metrics` arrive from the caller for the same reason the stored blocks do: the
+        owning team is configuration and the metric set is built from it, and neither is derivable
+        from a repository's cached facts.
         """
         return RepositoryPracticeEvidence(
             repository=self.repository,
+            team=team,
             starts_at=self.starts_at,
             ends_at=self.ends_at,
             provenance=self.provenance,
             cohort=self.cohort,
             assessment=policy.assess(self, current_state.merge_gate) if policy.enabled else None,
             merge_gate=current_state.merge_gate,
-            open_pull_requests=open_pull_requests,
+            open_pull_requests=current_state.open_pull_requests,
             security=current_state.security,
             codeowners=current_state.codeowners,
             maintenance=current_state.maintenance,
             sonar=current_state.sonar,
+            metrics=metric_summaries(self, metrics),
             behaviour=tuple(finding for rule in rules if rule.enabled for finding in rule.findings(self)),
         )
 
@@ -171,12 +234,18 @@ def actor_blocking_occurrences(practice: RepositoryPracticeEvidence) -> Counter[
 
 def actor_readiness(
     reported: Iterable[tuple[RepositoryEvidence, RepositoryPracticeEvidence]],
+    metrics: Sequence[BehaviourMetric],
 ) -> tuple[ActorReadiness, ...]:
     """List every person who contributed to the reported repositories, with each repository's label.
 
     Takes the pairs rather than either side alone: the contributions come from the cached facts and
     the label and findings come from the practice report built from them, so pairing them at the
     call site is what keeps one repository's merges from being read against another's assessment.
+
+    Each row's metric summaries are measured over that person's merges IN THAT REPOSITORY, sliced
+    from the same facts the repository's own summaries are measured over. They are listed per
+    repository and never combined: a person's cycle time in a repository they merged twice in is not
+    comparable with one they merged eighty times in, and one figure spanning both would say nothing.
     """
     rows: dict[str, list[ActorRepositoryReadiness]] = {}
     spellings: dict[tuple[str, str], str] = {}
@@ -194,6 +263,7 @@ def actor_readiness(
                     # A finding attributed to somebody who authored nothing here cannot exist, but a
                     # person with no findings is the ordinary case and blocks nothing.
                     blocking=blocking.get(actor, 0),
+                    metrics=metric_summaries(actor_slice(evidence, actor), metrics),
                 ),
             )
             spellings[actor, practice.repository] = spelled[actor]
@@ -252,6 +322,7 @@ class StoredReports:
     """
 
     merge_gate: MergeGateReport
+    open_pull_requests: OpenPullRequestReport
     security: SecurityAlertReport
     codeowners: CodeownersReport
     maintenance: MaintenanceReport
@@ -285,12 +356,38 @@ def stored_merge_gate(stored: StoredState) -> MergeGateReport:
     return MergeGateReport(fetched_at=stored.latest.fetched_at, gate=stored.latest.state.merge_gate)
 
 
+def stored_open_pull_requests(stored: StoredState) -> OpenPullRequestReport:
+    """Report the open pull-request state the last collection stored, or why there is none.
+
+    The window travels back out of storage with the counts, because two of the four are bounded by
+    the window they were collected over and a count over a forgotten window cannot be read. A row
+    stored before this state was collected reports the gap rather than four zeros: "nothing is open"
+    and "nobody asked" are different answers. See architecture.md, "Source taxonomy".
+    """
+    if stored.unreadable is not None:
+        return OpenPullRequestReport(detail=stored.unreadable)
+    if stored.latest is None:
+        return OpenPullRequestReport(detail="no repository state has been collected; run metrics collect")
+    snapshot = stored.latest.state.open_pull_requests
+    if snapshot is None:
+        return OpenPullRequestReport(
+            fetched_at=stored.latest.fetched_at,
+            detail="open pull-request state was not collected when repository state was stored; run metrics collect",
+        )
+    return OpenPullRequestReport(
+        fetched_at=stored.latest.fetched_at,
+        starts_at=snapshot.starts_at,
+        ends_at=snapshot.ends_at,
+        summary=snapshot.summary,
+    )
+
+
 def stored_security_alerts(stored: StoredState) -> SecurityAlertReport:
     """Report the security alerts the last collection stored, or state why there are none to report.
 
-    Read from storage rather than fetched, unlike open pull-request state: open alerts are current
-    state stored latest-only beside the merge gate, so `--offline` serves the last collection's
-    answer with its `fetched_at` instead of refusing.
+    Read from storage rather than fetched: open alerts are current state stored latest-only beside
+    the merge gate, so an offline report serves the last collection's answer with its `fetched_at`
+    instead of refusing.
     """
     if stored.unreadable is not None:
         return SecurityAlertReport(detail=stored.unreadable)
@@ -361,6 +458,7 @@ def stored_reports(stored: StoredState) -> StoredReports:
     """Project one stored row into every current-state block a repository's report carries."""
     return StoredReports(
         merge_gate=stored_merge_gate(stored),
+        open_pull_requests=stored_open_pull_requests(stored),
         security=stored_security_alerts(stored),
         codeowners=stored_codeowners(stored),
         maintenance=stored_maintenance(stored),
@@ -434,7 +532,13 @@ def open_pull_request_report(
     window: ReportingWindow,
     reference: datetime,
 ) -> OpenPullRequestReport:
-    """Fetch one repository's open pull-request state fresh. Never cached — see architecture.md."""
+    """Observe one repository's open pull-request state fresh, for the `--refresh` path only.
+
+    The stored block `stored_open_pull_requests` serves is what every other run reports; this exists
+    for the reader who needs the counts as of now rather than as of the last collection, and it
+    overrides that block. The window it carries is the reporting window the two windowed counts were
+    just measured over, so a refreshed report is read exactly like a stored one.
+    """
     try:
         summary = collect_open_pull_request_state(
             client,
@@ -446,16 +550,12 @@ def open_pull_request_report(
         )
     except GitHubError as exception:
         return OpenPullRequestReport(detail=str(exception))
-    return OpenPullRequestReport(fetched_at=reference, summary=summary)
-
-
-def offline_open_pull_request_report() -> OpenPullRequestReport:
-    """Report open pull-request state as unavailable under `--offline`.
-
-    The state is never cached, so there is no settled answer to serve; a remembered or zeroed count
-    would misrepresent what `--offline` actually knows.
-    """
-    return OpenPullRequestReport(detail="open pull-request state is never cached; omit --offline to observe it")
+    return OpenPullRequestReport(
+        fetched_at=reference,
+        starts_at=window.starts_at,
+        ends_at=window.ends_at,
+        summary=summary,
+    )
 
 
 def uncovered_interval(missing: SourceCoverage) -> str:
@@ -523,4 +623,60 @@ def collected_repository_evidence(
             offline=False,
             intervals_fetched=provenance.stable_intervals_fetched + provenance.direct_commit_intervals_fetched,
         ),
+    )
+
+
+def practice_report(
+    configuration: Configuration,
+    reported: Iterable[tuple[RepositoryEvidence, StoredReports]],
+    unavailable: Iterable[EvidenceUnavailable],
+) -> PracticeEvidenceReport:
+    """Assemble the practice report from evidence already loaded, however it was loaded.
+
+    The one assembly both callers use: `offline_practice_report` below loads the evidence from the
+    caches and hands it here, and `metrics evidence` hands over what it loaded — with a `--refresh`
+    run's fresh open pull-request block already substituted into the stored blocks. Neither builds a
+    report of its own, so the rules, the readiness policy, the owning team and the metric set are
+    read from the configuration once and the two paths cannot disagree about any of them.
+
+    Every repository arrives paired with its own stored blocks, and the practice evidence is paired
+    with the facts it was built from before the actor section reads either: that is what stops one
+    repository's merges from being read against another's assessment or another's merge gate.
+    """
+    owners = repository_owners(configuration)
+    metrics = behaviour_metrics(configuration.traceability)
+    rules = configured_rules(configuration)
+    policy = readiness_policy(configuration)
+    paired = tuple(
+        (evidence, evidence.practices(rules, policy, blocks, owners[evidence.repository], metrics))
+        for evidence, blocks in reported
+    )
+    return PracticeEvidenceReport(
+        organization=configuration.organization,
+        repositories=tuple(practice for _, practice in paired),
+        unavailable=tuple(unavailable),
+        actors=actor_readiness(paired, metrics),
+    )
+
+
+def offline_practice_report(configuration: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+    """Report every configured repository's practices for one window from the caches alone.
+
+    The whole report in one call, contacting nothing: a reader that is not the command line — the
+    read-only service the UI is served from — asks for a window and gets the same report `metrics
+    evidence` prints, including the `unavailable` entries for the repositories the cache cannot cover.
+    A window nobody has collected therefore reports itself as uncovered rather than as thinner data.
+    """
+    loaded = tuple(
+        cached_repository_evidence(configuration, repository, window)
+        for repository in configured_repositories(configuration)
+    )
+    return practice_report(
+        configuration,
+        tuple(
+            (item, stored_reports(stored_repository_state(configuration, item.repository)))
+            for item in loaded
+            if isinstance(item, RepositoryEvidence)
+        ),
+        tuple(item for item in loaded if isinstance(item, EvidenceUnavailable)),
     )

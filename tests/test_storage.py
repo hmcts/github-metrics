@@ -260,6 +260,41 @@ def test_load_repository_state_reports_a_repository_that_was_never_collected(tmp
     assert load_repository_state(tmp_path / "metrics.sqlite3", "hmcts", "cath-service") is None
 
 
+def test_load_repository_state_translates_an_unparseable_row(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Expose a row this build cannot parse through the storage boundary, like one it cannot read.
+
+    The payload is validated `extra="forbid"`, so a row written by a newer build raises. Every caller
+    degrades a `StorageError` to a reason on the one repository it is about, while an escaping
+    `ValidationError` would fail the whole report that repository is a single row of.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    record_repository_state(path, inventory)
+    with closing(connect(path)) as connection, connection:
+        (payload,) = connection.execute("SELECT payload FROM repository_state").fetchone()
+        newer = {**json.loads(payload), "a_field_this_build_has_never_heard_of": True}
+        connection.execute("UPDATE repository_state SET payload = ?", (json.dumps(newer),))
+
+    with pytest.raises(StorageError, match="could not read collection cache"):
+        load_repository_state(path, "hmcts", "nfdiv-case-api")
+
+
+def test_load_repository_state_translates_an_unreadable_instant(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Expose a stored instant that will not parse through the same boundary as the payload."""
+    path = tmp_path / "metrics.sqlite3"
+    record_repository_state(path, inventory)
+    with closing(connect(path)) as connection, connection:
+        connection.execute("UPDATE repository_state SET fetched_at = ?", ("not an instant",))
+
+    with pytest.raises(StorageError, match="could not read collection cache"):
+        load_repository_state(path, "hmcts", "nfdiv-case-api")
+
+
 def test_load_repository_state_translates_sqlite_failures(tmp_path: Path) -> None:
     """Expose a failed state read through the storage boundary."""
     with (

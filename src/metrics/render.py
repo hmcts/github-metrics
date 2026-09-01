@@ -18,6 +18,7 @@ from metrics.domain import (
     AlertSeverity,
     BehaviourEvidenceCollection,
     BehaviourEvidenceReport,
+    BehaviourMetricSummary,
     CodeownersReport,
     CohortSummary,
     DistributionObservation,
@@ -56,11 +57,12 @@ from metrics.domain import (
 class RepositoryDrillDown:
     """Carry the metric aggregates and review counts shown beside one repository's practice evidence.
 
-    They are built from the same cached facts as the practice report but form no part of it. The JSON
-    contract is unchanged, and every number they hold is one a `--metric` drill-down already emits.
+    The review counts are the report's own. The metric summaries are the ones the repository block of
+    the JSON now carries, computed by `metric_summaries` for both, so a figure cannot appear in one
+    rendering and not the other.
     """
 
-    behaviour: tuple[BehaviourEvidenceReport, ...]
+    behaviour: tuple[BehaviourMetricSummary, ...]
     review_states: Mapping[str, int]
 
 
@@ -259,10 +261,28 @@ def render_merge_gate(report: MergeGateReport) -> tuple[str, ...]:
     )
 
 
+def measured_window(report: OpenPullRequestReport) -> tuple[tuple[str, str], ...]:
+    """Name the window the two windowed counts cover, as a row, or no row where none travelled.
+
+    Two of the four counts are bounded by a window and two describe now, so the window is printed
+    where the counts are rather than left to be read off the reporting window above them: a stored
+    observation was measured over the window of the collection that made it, which is not the window
+    the surrounding report covers.
+    """
+    if report.starts_at is None or report.ends_at is None:
+        return ()
+    return (("Opened and closed over", f"{instant(report.starts_at)} to {instant(report.ends_at)}"),)
+
+
 def render_open_pull_requests(report: OpenPullRequestReport) -> tuple[str, ...]:
-    """Render the freshly fetched open pull-request state, or the reason there is none to show."""
+    """Render the stored open pull-request state, or the reason there is none to show.
+
+    `read` is the instant the state was OBSERVED — the stored row's `fetched_at` on the default path,
+    the run's own instant under `--refresh` — and never implies which of the two this report is.
+    """
     read = "" if report.fetched_at is None else f", read {instant(report.fetched_at)}"
     title = f"Open pull requests{read}"
+    measured = measured_window(report)
     summary = report.summary
     if summary is None:
         return *heading(title), f"  not available: {report.detail}"
@@ -270,6 +290,7 @@ def render_open_pull_requests(report: OpenPullRequestReport) -> tuple[str, ...]:
         *heading(title),
         *pairs(
             (
+                *measured,
                 ("Opened in window", str(summary.opened_in_window)),
                 ("Closed without merge", str(summary.closed_without_merge)),
                 ("Currently open", str(summary.currently_open)),
@@ -524,9 +545,9 @@ def metric_columns() -> tuple[str, ...]:
     return "Metric", "Rate", "Sample", "Unit", "Median", "p75", "p90"
 
 
-def render_behaviour(reports: Sequence[BehaviourEvidenceReport]) -> tuple[str, ...]:
+def render_behaviour(summaries: Sequence[BehaviourMetricSummary]) -> tuple[str, ...]:
     """Render one row for every metric observed over the cohort."""
-    rows = tuple((report.metric, *observation_cells(report.summary)) for report in reports)
+    rows = tuple((summary.metric, *observation_cells(summary.summary)) for summary in summaries)
     return *heading("Behaviour"), *table(metric_columns(), rows)
 
 

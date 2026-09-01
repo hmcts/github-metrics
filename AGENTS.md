@@ -5,6 +5,9 @@
 - Target Python 3.14 only and manage the project exclusively with uv.
 - Declare dependencies in `pyproject.toml`; update and commit `uv.lock` through uv, never by hand.
 - Keep source under `src/metrics/` and mirror it under `tests/`.
+- The dashboard UI lives in `ui/`, a Next.js app with its own npm dependencies and its own
+  `package-lock.json`. Neither toolchain sees the other's directory: uv does not lint `ui/`, and the UI gate does not
+  run pytest. FastAPI and uvicorn are an optional `service` extra, so the Python side installs neither by default.
 
 ## Shell and Credentials
 
@@ -23,6 +26,9 @@
 Run `uv run poe check` before considering work complete. It must pass Ruff linting and formatting, strict mypy, and
 pytest without weakening their configuration. Use `uv run poe cover` when coverage is relevant.
 
+Work touching `ui/` must also pass `npm --prefix ui run check` — ESLint, `tsc --noEmit`, vitest, and `next build` in one
+step, the UI's equivalent of `uv run poe check`. Run both when a change spans the service and the pages it feeds.
+
 ## Coding Standards
 
 - Write production-quality PEP 8 code with complete English identifiers; do not abbreviate or use single-letter names.
@@ -34,6 +40,19 @@ pytest without weakening their configuration. Use `uv run poe cover` when covera
 - Give every function and method a concise docstring. Comments explain only non-obvious reasons or constraints.
 - Test with pytest using fixtures and meaningful edge cases. Keep tests mirrored to the source layout.
 - Follow DRY and SOLID without introducing abstractions that do not remove real complexity.
+
+In `ui/`, the same rules in TypeScript, plus:
+
+- Keep pure logic in `ui/src/lib`, tested under `ui/src/lib/__tests__`; `ui/src/app` does the fetching and `ui/src/components`
+  the markup. A figure that can be wrong is arithmetic and belongs in `lib`, where a test can reach it.
+- An initialism in a CamelCase name is all-caps or all-lower, never mixed: `RAGCard`, `apiFetch` — not `RagCard`.
+- `'use client'` only where recharts or component state needs it. Everything else is a server component.
+- `ui/src/lib/types.ts` mirrors the service's responses by hand. Every route is served with
+  `response_model_exclude_none`, so an unobserved value arrives as a MISSING KEY: mirror it as `field?: T`, never as
+  `field: T | null`, and guard it with `== null` rather than `=== null`.
+- A figure must read the same on a page as in the text report the same window prints. `ui/src/lib/format.ts` mirrors
+  `metrics.render` function for function, down to Python's half-to-even rounding.
+- See `ui/README.md` for the design tokens and the guardrails the pages keep.
 
 ## Git
 

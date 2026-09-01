@@ -22,8 +22,19 @@ dependencies = [
     "requests>=2.34.2",
 ]
 
+[project.optional-dependencies]
+# Only the read-only service needs a web stack, so a collection host installs neither. Kept an extra
+# rather than a dependency: `metrics collect` and `metrics evidence` run with nothing listening.
+service = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
 [project.scripts]
 metrics = "metrics.cli:main"
+# Its own entry point rather than a `metrics serve` subcommand: the service loads configuration and
+# serves it, sharing no argument with the collection commands, and `cli.py` is heavily edited elsewhere.
+metrics-serve = "metrics.service:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -42,6 +53,9 @@ package = true
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115",
+    # FastAPI's TestClient is httpx-backed, so the service tests need it whether or not anything else does.
+    "httpx>=0.28",
     "mypy>=2.1.0",
     "poethepoet>=0.38.0",
     "pytest>=9.0.3",
@@ -49,6 +63,7 @@ dev = [
     "ruff>=0.15.16",
     "types-pyyaml>=6.0.12.20260724",
     "types-requests>=2.33.0.20260712",
+    "uvicorn>=0.30",
 ]
 
 [tool.ruff]
@@ -85,6 +100,9 @@ dummy-variable-rgx = "_+|unused|.*_unused"
 "cli.py" = [
     "D415",    # the standard entry-point docstring omits terminal punctuation
 ]
+"service.py" = [
+    "D415",    # the standard entry-point docstring omits terminal punctuation
+]
 "scripts/*" = [
     "INP001",  # measurement scripts are run directly, not imported
 ]
@@ -106,6 +124,9 @@ convention = "google"
 python_version = "3.14"
 mypy_path = "src"
 strict = true
+# `mypy .` walks the working tree, so anything git ignores — a scratch script, a checkout of another
+# project kept beside this one for reference — is not this project's code to type check.
+exclude_gitignore = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

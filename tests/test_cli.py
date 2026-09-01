@@ -31,6 +31,7 @@ from metrics.domain import (
     MergeGateReport,
     OpenAlertCount,
     OpenPullRequestReport,
+    OpenPullRequestSnapshot,
     OpenPullRequestSummary,
     PullRequestFact,
     PullRequestRule,
@@ -76,11 +77,27 @@ teams:
     return path
 
 
+def open_pull_request_payload(
+    opened_in_window: int = 0,
+    closed_without_merge: int = 0,
+    currently_open: int = 0,
+    stale_open: int = 0,
+) -> dict[str, object]:
+    """Build one bundled open-pull-request payload, all four counts zero by default."""
+    return {
+        "openedInWindow": {"issueCount": opened_in_window},
+        "closedWithoutMerge": {"issueCount": closed_without_merge},
+        "currentlyOpen": {"issueCount": currently_open},
+        "staleOpen": {"issueCount": stale_open},
+    }
+
+
 def graphql_responses(
     search: dict[str, object],
     history: dict[str, object],
     checks: dict[str, object],
     standards: dict[str, object] | None = None,
+    open_pull_requests: dict[str, object] | None = None,
 ) -> Callable[..., MagicMock]:
     """Answer each GraphQL request with the payload belonging to the document it sent."""
 
@@ -91,6 +108,9 @@ def graphql_responses(
         if "githubCodeowners" in query:
             # The bundled repository-standards query: an empty branch and no CODEOWNERS by default.
             payload = standards if standards is not None else {"repository": {"defaultBranchRef": None}}
+        elif "openedInWindow" in query:
+            # The bundled open-pull-request query, which `collect` now stores the answer to.
+            payload = open_pull_requests if open_pull_requests is not None else open_pull_request_payload()
         elif "defaultBranchRef" in query:
             payload = history
         elif "object(oid:" in query:
@@ -382,13 +402,20 @@ def test_collect_reports_current_state_and_what_the_window_fetched(
     assert output["repositories"][0]["collection"]["pull_request_facts_loaded"] == 0
     assert output["repositories"][0]["collection"]["direct_commit_facts_loaded"] == 1
     assert output["repositories"][0]["collection"]["direct_commit_intervals_fetched"] == 1
-    # One repository's whole run, both phases: seven current-state calls — the repository, the
-    # bundled standards query, its rules, its protection and one page per alert family — and four
-    # GraphQL queries for the window — a pull-request search over the stable interval and another
-    # over the mutable edge, the commit history, and one check rollup for the single direct commit
-    # it returned.
+    # Current state now includes the open pull requests, carrying the window the two windowed counts
+    # of the four were measured over.
+    assert output["repositories"][0]["open_pull_requests"] == {
+        "starts_at": output["starts_at"],
+        "ends_at": output["ends_at"],
+        "summary": {"opened_in_window": 0, "closed_without_merge": 0, "currently_open": 0, "stale_open": 0},
+    }
+    # One repository's whole run, both phases: eight current-state calls — the repository, the
+    # bundled standards query, its rules, its protection, one page per alert family and the bundled
+    # open-pull-request query — and four GraphQL queries for the window — a pull-request search over
+    # the stable interval and another over the mutable edge, the commit history, and one check
+    # rollup for the single direct commit it returned.
     assert output["costs"] == [
-        {"repository": "nfdiv-case-api", "requests": 11, "elapsed_seconds": ANY},
+        {"repository": "nfdiv-case-api", "requests": 12, "elapsed_seconds": ANY},
     ]
     assert "observations" not in json.dumps(output)
     assert datetime.fromisoformat(output["ends_at"]) - datetime.fromisoformat(output["starts_at"]) == timedelta(
@@ -587,7 +614,7 @@ def inaccessible_repository_response() -> Response:
     return response
 
 
-def empty_window_responses() -> Callable[..., MagicMock]:
+def empty_window_responses(open_pull_requests: dict[str, object] | None = None) -> Callable[..., MagicMock]:
     """Answer every windowed query with an empty result, whichever repository asked."""
     return graphql_responses(
         {"search": {"issueCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
@@ -599,7 +626,73 @@ def empty_window_responses() -> Callable[..., MagicMock]:
             },
         },
         {"repository": {"object": {"statusCheckRollup": None}}},
+        open_pull_requests=open_pull_requests,
     )
+
+
+def test_collect_measures_open_pull_requests_against_the_run_s_window_and_instant(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Thread the run's window and instant from the command through to the stored counts.
+
+    The two windowed counts are bounded by the same window the merged history is collected over, and
+    stored beside it. The stale cutoff is measured back from the instant the run started, NOT from
+    the end of that window: a run reporting an old window would otherwise report which pull requests
+    were stale then, under a heading that reads as now.
+    """
+    posted: list[dict[str, object]] = []
+    responses = empty_window_responses(
+        open_pull_request_payload(opened_in_window=9, closed_without_merge=2, currently_open=4, stale_open=1),
+    )
+
+    def record(url: str, *, json: dict[str, object], headers: dict[str, str], timeout: int) -> MagicMock:
+        """Answer as GitHub's GraphQL endpoint would, keeping every document that was posted."""
+        posted.append(json)
+        return responses(url, json=json, headers=headers, timeout=timeout)
+
+    with (
+        patch(
+            "sys.argv",
+            [
+                "metrics",
+                "collect",
+                "--config",
+                str(configuration_path),
+                "--from",
+                "2026-05-01T00:00:00Z",
+                "--to",
+                "2026-06-01T00:00:00Z",
+            ],
+        ),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = record
+
+        assert main() == 0
+
+    output = json.loads(capsys.readouterr().out)
+    snapshot = output["repositories"][0]["open_pull_requests"]
+    assert (snapshot["starts_at"], snapshot["ends_at"]) == (output["starts_at"], output["ends_at"])
+    assert snapshot["summary"] == {
+        "opened_in_window": 9,
+        "closed_without_merge": 2,
+        "currently_open": 4,
+        "stale_open": 1,
+    }
+    variables = [document["variables"] for document in posted if "openedInWindow" in str(document["query"])]
+    assert len(variables) == 1
+    queries = variables[0]
+    assert isinstance(queries, dict)
+    # The requested window, to the second, and the stale cutoff a fortnight back from the run itself
+    # — which the requested window ended three months before.
+    assert queries["openedQuery"].endswith("created:2026-05-01T00:00:00Z..2026-05-31T23:59:59Z")
+    stale_cutoff = datetime.fromisoformat(str(queries["staleOpenQuery"]).split("updated:<")[1])
+    assert stale_cutoff > datetime.fromisoformat(output["ends_at"])
+    assert stale_cutoff <= datetime.now(UTC) - timedelta(days=14)
 
 
 def test_collect_exits_incomplete_when_one_repository_of_three_could_not_be_read(
@@ -826,7 +919,7 @@ def test_collect_summarises_every_call_by_status_outcome_and_endpoint(
         ["2", "404", "refused", f"GET {repository}/branches/{{branch}}/protection"],
         ["2", "403", "refused", f"GET {repository}/secret-scanning/alerts{alerts}"],
         ["2", "403", "disabled", f"GET {repository}/dependabot/alerts{alerts}"],
-        ["10", "200", "ok", "POST https://api.github.com/graphql"],
+        ["12", "200", "ok", "POST https://api.github.com/graphql"],
         ["2", "200", "ok", f"GET {repository}"],
         ["2", "200", "ok", f"GET {repository}/code-scanning/alerts{alerts}"],
         ["2", "200", "ok", f"GET {repository}/rules/branches/{{branch}}?per_page=100"],
@@ -861,7 +954,7 @@ def test_collect_summarises_the_calls_of_a_run_that_could_not_store_what_it_coll
     # account of them at all, and this run's report never reaches stdout to be read instead.
     counts = [int(line.split()[0]) for line in lines[1:]]
     assert len(counts) == 7
-    assert sum(counts) == 22
+    assert sum(counts) == 24
 
 
 def test_prune_reports_removed_intervals(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -1488,9 +1581,9 @@ def collected_gate() -> MergeGateReport:
     )
 
 
-def offline_open_pull_requests() -> OpenPullRequestReport:
-    """Build the open pull-request report of a window that never asked GitHub for it."""
-    return OpenPullRequestReport(detail="open pull-request state is never cached; omit --offline to observe it")
+def refused_open_pull_requests() -> OpenPullRequestReport:
+    """Build the open pull-request report of a refresh GitHub would not answer."""
+    return OpenPullRequestReport(detail="GitHub permission denied")
 
 
 def cached_evidence() -> AbstractContextManager[MagicMock]:
@@ -1511,7 +1604,6 @@ def test_evidence_runs_offline_without_token_or_session(
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--repository",
                 "nfdiv-case-api",
                 "--metric",
@@ -1541,7 +1633,7 @@ def test_evidence_resolves_no_credentials_offline(configuration_path: Path) -> N
     a run that promised to contact nothing has no business reading either.
     """
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.cli.resolve_credentials") as resolve,
         cached_evidence(),
@@ -1557,7 +1649,7 @@ def test_evidence_defaults_to_all_observed_behaviour(
 ) -> None:
     """Emit observed behaviour for every configured repository when no filters are supplied."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.cli.Session") as session_class,
         cached_evidence(),
@@ -1568,6 +1660,20 @@ def test_evidence_defaults_to_all_observed_behaviour(
     assert output["organization"] == "hmcts"
     assert output["unavailable"] == []
     assert output["repositories"][0]["repository"] == "nfdiv-case-api"
+    # The owning team and the nine aggregates ride in the block, so a reader of the JSON alone needs
+    # neither the configuration beside it nor a second `--metric` run to group and read it.
+    assert output["repositories"][0]["team"] == "divorce"
+    assert [summary["metric"] for summary in output["repositories"][0]["metrics"]] == [
+        "independent-review-coverage",
+        "approval-coverage",
+        "review-depth",
+        "merge-cycle-time",
+        "time-to-first-review",
+        "pull-request-size",
+        "checks-passing-at-merge",
+        "description-quality",
+        "traceability-reference",
+    ]
     assert output["repositories"][0]["behaviour"][0]["rule"] == "unreviewed-merge"
     assert output["repositories"][0]["behaviour"][0]["actor_login"] == "author"
     assert output["repositories"][0]["behaviour"][0]["pull_requests"][0]["number"] == 11
@@ -1585,7 +1691,7 @@ def test_evidence_renders_the_same_evidence_as_a_readable_report(
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--format", "report"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--format", "report"],
         ),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
@@ -1634,7 +1740,6 @@ def test_evidence_renders_a_metric_drill_down_as_a_report(
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--metric",
                 "approval-coverage",
                 "--format",
@@ -1660,7 +1765,7 @@ def test_evidence_shows_the_collected_merge_gate_beside_observed_behaviour(
 ) -> None:
     """Report governance and behaviour together, with the instant each was observed."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
@@ -1718,7 +1823,6 @@ def test_evidence_grades_a_metric_against_the_configured_traceability_patterns(
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--metric",
                 "traceability-reference",
             ],
@@ -1749,7 +1853,7 @@ def test_evidence_report_drill_down_uses_the_configured_traceability_patterns(
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--format", "report"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--format", "report"],
         ),
         patch.dict("os.environ", {}, clear=True),
         patch(
@@ -1820,7 +1924,7 @@ def test_evidence_serves_the_security_block_from_what_collect_stored(
     """
     record_repository_state(load_configuration(configuration_path).database, stored_state_for("nfdiv-case-api"))
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -1847,7 +1951,7 @@ def test_evidence_serves_the_standards_blocks_from_what_collect_stored(
     """
     record_repository_state(load_configuration(configuration_path).database, stored_state_for("nfdiv-case-api"))
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -1945,7 +2049,7 @@ def test_collect_then_evidence_decides_the_widest_window_from_an_exhausted_searc
     capsys.readouterr()
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -1963,7 +2067,7 @@ def test_evidence_reports_standards_blocks_for_a_repository_never_collected(
 ) -> None:
     """Report the reason on both blocks for a repository whose state was never collected."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -1977,13 +2081,54 @@ def test_evidence_reports_standards_blocks_for_a_repository_never_collected(
     }
 
 
-def test_evidence_reports_open_pull_requests_as_unavailable_offline(
+def test_evidence_serves_open_pull_requests_from_what_collect_stored(
     configuration_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """State why open pull-request state is missing rather than a remembered or zeroed count."""
+    """Join `collect`'s storage to the open pull-request block, over the real database.
+
+    The block that used to refuse offline is now read back with the window the collection measured
+    its two windowed counts over, which is not the window this report covers.
+    """
+    stored = stored_state_for("nfdiv-case-api")
+    collected_at = stored.collected_at
+    snapshot = OpenPullRequestSnapshot(
+        starts_at=collected_at - timedelta(days=7),
+        ends_at=collected_at,
+        summary=OpenPullRequestSummary(opened_in_window=5, closed_without_merge=1, currently_open=3, stale_open=2),
+    )
+    record_repository_state(
+        load_configuration(configuration_path).database,
+        stored.model_copy(
+            update={"repositories": (stored.repositories[0].model_copy(update={"open_pull_requests": snapshot}),)},
+        ),
+    )
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)["repositories"][0]["open_pull_requests"]
+    assert report["fetched_at"] == "2026-08-08T09:00:00Z"
+    assert report["starts_at"] == "2026-08-01T09:00:00Z"
+    assert report["ends_at"] == "2026-08-08T09:00:00Z"
+    assert report["summary"] == {
+        "opened_in_window": 5,
+        "closed_without_merge": 1,
+        "currently_open": 3,
+        "stale_open": 2,
+    }
+
+
+def test_evidence_reports_open_pull_requests_never_collected_rather_than_zeroing_them(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """State why the counts are missing rather than reporting a repository with nothing open."""
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
@@ -1992,24 +2137,46 @@ def test_evidence_reports_open_pull_requests_as_unavailable_offline(
 
     report = json.loads(capsys.readouterr().out)["repositories"][0]
     assert "summary" not in report["open_pull_requests"]
-    assert (
-        report["open_pull_requests"]["detail"]
-        == "open pull-request state is never cached; omit --offline to observe it"
-    )
+    assert report["open_pull_requests"]["detail"] == "no repository state has been collected; run metrics collect"
 
 
-def test_evidence_reports_open_pull_requests_fetched_fresh_when_collecting(
+def test_evidence_refresh_overrides_the_stored_open_pull_request_block(
     configuration_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Fetch open pull-request state alongside a collecting run and report the counts fresh."""
-    fetched_at = datetime(2026, 8, 8, 12, tzinfo=UTC)
-    summary = OpenPullRequestReport(
-        fetched_at=fetched_at,
+    """Observe open pull-request state live under `--refresh` and report that instead of the stored block."""
+    stored = stored_state_for("nfdiv-case-api")
+    record_repository_state(
+        load_configuration(configuration_path).database,
+        stored.model_copy(
+            update={
+                "repositories": (
+                    stored.repositories[0].model_copy(
+                        update={
+                            "open_pull_requests": OpenPullRequestSnapshot(
+                                starts_at=stored.starts_at,
+                                ends_at=stored.ends_at,
+                                summary=OpenPullRequestSummary(
+                                    opened_in_window=0,
+                                    closed_without_merge=0,
+                                    currently_open=0,
+                                    stale_open=0,
+                                ),
+                            ),
+                        },
+                    ),
+                ),
+            },
+        ),
+    )
+    fresh = OpenPullRequestReport(
+        fetched_at=datetime(2026, 8, 8, 12, tzinfo=UTC),
+        starts_at=datetime(2026, 8, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 8, tzinfo=UTC),
         summary=OpenPullRequestSummary(opened_in_window=5, closed_without_merge=1, currently_open=3, stale_open=2),
     )
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session"),
         patch(
@@ -2017,7 +2184,7 @@ def test_evidence_reports_open_pull_requests_fetched_fresh_when_collecting(
             side_effect=lambda *arguments: evidence_for(arguments[3]),
         ),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
-        patch("metrics.cli.open_pull_request_report", return_value=summary),
+        patch("metrics.cli.open_pull_request_report", return_value=fresh),
     ):
         assert main() == 0
 
@@ -2029,6 +2196,66 @@ def test_evidence_reports_open_pull_requests_fetched_fresh_when_collecting(
         "currently_open": 3,
         "stale_open": 2,
     }
+    # Every other block still comes from the stored row the refresh did not replace.
+    assert report["security"]["fetched_at"] == "2026-08-08T09:00:00Z"
+
+
+def test_evidence_refresh_keeps_the_stored_block_when_github_refuses(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep the stored open pull-request counts when the live observation a refresh asked for failed.
+
+    A rate limit or a 403 on one repository would otherwise answer `--refresh` with strictly less
+    than the same command without it: the stored block is readable and dated, and replacing it with
+    "not available" loses counts that were true as at the instant they record.
+    """
+    stored = stored_state_for("nfdiv-case-api")
+    record_repository_state(
+        load_configuration(configuration_path).database,
+        stored.model_copy(
+            update={
+                "repositories": (
+                    stored.repositories[0].model_copy(
+                        update={
+                            "open_pull_requests": OpenPullRequestSnapshot(
+                                starts_at=stored.starts_at,
+                                ends_at=stored.ends_at,
+                                summary=OpenPullRequestSummary(
+                                    opened_in_window=4,
+                                    closed_without_merge=1,
+                                    currently_open=2,
+                                    stale_open=1,
+                                ),
+                            ),
+                        },
+                    ),
+                ),
+            },
+        ),
+    )
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session"),
+        patch(
+            "metrics.cli.collected_repository_evidence",
+            side_effect=lambda *arguments: evidence_for(arguments[3]),
+        ),
+        patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
+        patch("metrics.cli.open_pull_request_report", return_value=refused_open_pull_requests()),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)["repositories"][0]
+    assert report["open_pull_requests"]["summary"] == {
+        "opened_in_window": 4,
+        "closed_without_merge": 1,
+        "currently_open": 2,
+        "stale_open": 1,
+    }
+    # And the block still dates itself to the collection, not to the refresh that could not answer.
+    assert report["open_pull_requests"]["fetched_at"] == "2026-08-08T09:00:00Z"
 
 
 def test_evidence_fetches_both_phases_over_one_client(configuration_path: Path) -> None:
@@ -2039,7 +2266,7 @@ def test_evidence_fetches_both_phases_over_one_client(configuration_path: Path) 
     first response taught it otherwise.
     """
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session") as session_class,
         patch("metrics.cli.GitHubClient") as client_class,
@@ -2099,7 +2326,7 @@ teams:
         return unavailable if repository == "nfdiv-case-orchestration" else evidence_for(window)
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session"),
         patch("metrics.cli.collected_repository_evidence", side_effect=collected),
@@ -2140,12 +2367,12 @@ def test_evidence_omits_a_failed_repository_from_the_numbers_rather_than_zeroing
         return unavailable if repository == "opal-common-lib" else evidence_for(window, repository)
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
         patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
         patch("metrics.cli.Session"),
         patch("metrics.cli.collected_repository_evidence", side_effect=collected),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
-        patch("metrics.cli.open_pull_request_report", return_value=offline_open_pull_requests()),
+        patch("metrics.cli.open_pull_request_report", return_value=refused_open_pull_requests()),
     ):
         assert main() == 3
 
@@ -2165,7 +2392,7 @@ def test_evidence_metric_drill_down_never_fetches_open_pull_requests(configurati
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--metric", "approval-coverage"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--metric", "approval-coverage"],
         ),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
@@ -2182,7 +2409,7 @@ def test_evidence_assesses_readiness_from_the_gate_and_observed_behaviour(
 ) -> None:
     """Answer the enablement question per repository, and never with a bare label."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
@@ -2222,7 +2449,7 @@ def test_evidence_reds_a_repository_whose_gate_requires_no_review(
     nominal = collected_gate()
     assert nominal.gate is not None
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch(
             "metrics.evidence.stored_merge_gate",
@@ -2273,7 +2500,7 @@ def test_evidence_lists_each_actor_beside_the_readiness_of_what_they_contributed
 ) -> None:
     """Carry the actor section in the JSON contract, built from the same repositories it reports."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
@@ -2281,21 +2508,26 @@ def test_evidence_lists_each_actor_beside_the_readiness_of_what_they_contributed
         assert main() == 0
 
     report = json.loads(capsys.readouterr().out)
+    assert [actor["actor_login"] for actor in report["actors"]] == ["author"]
+    row = report["actors"][0]["repositories"][0]
     # The label is the one the repository block carries, and the merge counted here is the one the
     # unreviewed-merge finding beside it is attributed to.
-    assert report["actors"] == [
-        {
-            "actor_login": "author",
-            "repositories": [
-                {
-                    "readiness": "cannot_assess",
-                    "repository": "nfdiv-case-api",
-                    "contributions": 1,
-                    "blocking": 1,
-                },
-            ],
-        },
+    assert {key: value for key, value in row.items() if key != "metrics"} == {
+        "readiness": "cannot_assess",
+        "repository": "nfdiv-case-api",
+        "contributions": 1,
+        "blocking": 1,
+    }
+    # Every metric the repository block reports, measured over this person's merges in this
+    # repository alone — the one merge they authored here, which nobody reviewed.
+    assert [summary["metric"] for summary in row["metrics"]] == [
+        summary["metric"] for summary in report["repositories"][0]["metrics"]
     ]
+    assert row["metrics"][0] == {
+        "metric": "independent-review-coverage",
+        "summary": {"status": "observed", "numerator": 0, "denominator": 1},
+        "classifications": {"no-review-events": 1},
+    }
 
 
 def test_evidence_narrows_the_actor_section_to_the_requested_repository(
@@ -2317,7 +2549,6 @@ def test_evidence_narrows_the_actor_section_to_the_requested_repository(
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--repository",
                 "nfdiv-case-api",
             ],
@@ -2345,7 +2576,7 @@ def test_evidence_names_each_actor_against_the_repository_their_merges_were_read
         return evidence_authored_by(window, repository, authors[repository])
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.cached_repository_evidence", side_effect=cached),
@@ -2384,7 +2615,7 @@ teams:
     )
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         cached_evidence(),
@@ -2416,7 +2647,7 @@ def test_evidence_gives_an_unavailable_repository_no_actors(
         return evidence_authored_by(window, repository, "alice")
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.cached_repository_evidence", side_effect=cached),
@@ -2438,7 +2669,7 @@ def test_evidence_metric_without_repository_reports_all_cached_repositories(
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--metric", "approval-coverage"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--metric", "approval-coverage"],
         ),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
@@ -2463,7 +2694,7 @@ def test_evidence_rejects_raw_identities_without_metric(
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--include-identities"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--include-identities"],
         ),
         patch.dict("os.environ", {}, clear=True),
     ):
@@ -2482,7 +2713,6 @@ def test_evidence_rejects_unconfigured_repository(configuration_path: Path, capl
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--repository",
                 "other-service",
                 "--metric",
@@ -2508,7 +2738,7 @@ def test_evidence_offline_refuses_a_window_no_repository_covers(
     """
     unavailable = EvidenceUnavailable(repository="nfdiv-case-api", detail="cached evidence does not cover 2026-08-01")
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.cli.cached_repository_evidence", return_value=unavailable),
     ):
@@ -2556,7 +2786,7 @@ teams:
         return unavailable if repository == "nfdiv-case-orchestration" else evidence_for(window)
 
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch("metrics.evidence.stored_merge_gate", return_value=collected_gate()),
         patch("metrics.cli.cached_repository_evidence", side_effect=cached),
@@ -2572,29 +2802,29 @@ teams:
     assert "nfdiv-case-orchestration" in caplog.text
 
 
-def test_evidence_requires_credentials_before_collecting(
+def test_evidence_requires_credentials_only_under_refresh(
     configuration_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Explain that reporting collects unless it is asked to stay offline."""
+    """Explain that dropping the flag reports from the caches, which is the default."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--refresh"]),
         patch.dict("os.environ", {}, clear=True),
     ):
         assert main() == 1
 
-    assert "use --offline to report cached evidence only" in caplog.text
-    # And what was missing, in the same record: the remedy alone leaves a human who wanted to collect
+    assert "omit --refresh to report cached evidence only" in caplog.text
+    # And what was missing, in the same record: the remedy alone leaves a human who wanted to refresh
     # guessing which variables to set.
     assert "GH_APP_ID" in caplog.text
     assert "GH_TOKEN" in caplog.text
 
 
-def test_evidence_collects_the_requested_window(
+def test_evidence_collects_the_requested_window_under_refresh(
     configuration_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Collect whatever the requested window needs when not asked to stay offline."""
+    """Collect whatever the requested window needs when the run was asked to refresh."""
     with (
         patch(
             "sys.argv",
@@ -2603,6 +2833,7 @@ def test_evidence_collects_the_requested_window(
                 "evidence",
                 "--config",
                 str(configuration_path),
+                "--refresh",
                 "--from",
                 "2026-08-01",
                 "--to",
@@ -2615,7 +2846,7 @@ def test_evidence_collects_the_requested_window(
             "metrics.cli.collected_repository_evidence",
             side_effect=lambda *arguments: evidence_for(arguments[3]),
         ) as collect,
-        patch("metrics.cli.open_pull_request_report", return_value=offline_open_pull_requests()) as open_pull_requests,
+        patch("metrics.cli.open_pull_request_report", return_value=refused_open_pull_requests()) as open_pull_requests,
     ):
         assert main() == 0
 
@@ -2632,7 +2863,7 @@ def test_evidence_narrows_the_reporting_window(
 ) -> None:
     """Anchor a relative window to the most recent UTC midnight."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--days", "7"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--days", "7"]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -2664,7 +2895,7 @@ def test_evidence_rejects_an_unusable_reporting_window(
 ) -> None:
     """Refuse a window that is empty, contradictory, unparseable, or too long."""
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline", *arguments]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), *arguments]),
         patch.dict("os.environ", {}, clear=True),
         cached_evidence(),
     ):
@@ -2686,7 +2917,6 @@ def test_evidence_reports_a_longer_window_when_the_maximum_is_raised(
                 "evidence",
                 "--config",
                 str(configuration_path),
-                "--offline",
                 "--days",
                 "120",
                 "--maximum-days",
@@ -2735,7 +2965,7 @@ def test_evidence_reports_direct_commits_beside_the_denominator_they_grew(
         ),
     )
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         bypassed,
     ):
@@ -2759,7 +2989,7 @@ def test_the_readable_report_shows_the_denominator_the_rates_are_measured_over(
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--offline", "--format", "report"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--format", "report"],
         ),
         patch.dict("os.environ", {}, clear=True),
         patch(
@@ -3253,7 +3483,7 @@ def test_evidence_orders_repositories_by_team_and_name_whatever_order_the_file_l
     """
     configuration_path = unordered_configuration_path(tmp_path)
     with (
-        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--offline"]),
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
         patch.dict("os.environ", {}, clear=True),
         patch(
             "metrics.cli.cached_repository_evidence",

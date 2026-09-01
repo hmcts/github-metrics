@@ -52,6 +52,7 @@ class EvidenceKind(StrEnum):
     CODEOWNERS = "codeowners"
     MAINTENANCE = "maintenance"
     SONAR = "sonar"
+    OPEN_PULL_REQUESTS = "open_pull_requests"
 
 
 class EvidenceSource(StrEnum):
@@ -371,9 +372,10 @@ class MergeGateReport(EvidenceModel):
 class OpenPullRequestSummary(EvidenceModel):
     """Describe the open and unmerged pull-request state observed at one instant.
 
-    Fetched fresh on every report and never cached: an open pull request has no settled state to
-    cache, the four counts cost one bundled GraphQL call, and a cached "stale for 14 days" figure
-    that is itself stale would be worse than the extra call. See architecture.md.
+    Two of the four counts are windowed and two are current, which is why the window they were
+    measured over travels with them in `OpenPullRequestSnapshot` rather than being inferred by
+    whoever reads them back. Collected and stored by `collect` since 2026-09-01; `evidence
+    --refresh` still observes it fresh. See architecture.md.
     """
 
     opened_in_window: NonNegativeInt
@@ -382,14 +384,38 @@ class OpenPullRequestSummary(EvidenceModel):
     stale_open: NonNegativeInt
 
 
+class OpenPullRequestSnapshot(EvidenceModel):
+    """Pair one observation of open pull-request state with the window two of its counts cover.
+
+    `starts_at` and `ends_at` are the COLLECTION window `opened_in_window` and
+    `closed_without_merge` were measured over, stored beside them because a count over an
+    unremembered window is uninterpretable: a reader comparing two stored rows has to know whether
+    the figures cover ninety days or one. The instant the whole observation was made is the
+    `fetched_at` of the stored repository state around it, which is where every other current-state
+    block takes its timestamp from too.
+    """
+
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    summary: OpenPullRequestSummary
+
+
 class OpenPullRequestReport(EvidenceModel):
     """Report one repository's open pull-request state, or why it is unavailable.
 
-    Unavailable, never a remembered or zeroed count: this state is never cached, so `--offline`
-    cannot serve it, and a permission or transient failure must not be read as "none open".
+    Unavailable, never a remembered or zeroed count: a permission or transient failure must not be
+    read as "none open", and neither must a row stored before this state was collected.
+
+    `starts_at` and `ends_at` name the window `opened_in_window` and `closed_without_merge` were
+    measured over — the collection window on the stored path, the reporting window on the refresh
+    path. They ride as their own fields rather than as prose beside the counts because the validator
+    below forbids a detail next to a summary: a reader must never have to decide whether a sentence
+    under four numbers is a caveat about them or the reason they are missing.
     """
 
     fetched_at: AwareDatetime | None = None
+    starts_at: AwareDatetime | None = None
+    ends_at: AwareDatetime | None = None
     summary: OpenPullRequestSummary | None = None
     detail: str | None = None
 
@@ -1094,6 +1120,26 @@ class CommitEvidenceReference(EvidenceModel):
     classification: str
 
 
+class BehaviourMetricSummary(EvidenceModel):
+    """Summarise one metric over one cohort, without the named evidence a drill-down carries.
+
+    The three fields are the three a `BehaviourEvidenceReport` holds that are about the METRIC rather
+    than about the window it was measured over: the identifier, the aggregate, and the classifications
+    the aggregate was counted from. The window, the organisation, the provenance and the cohort are
+    left out because whatever carries a tuple of these already states them once — a repository block
+    for the whole cohort, an actor row for one person's merges inside it.
+
+    Carried per repository and never combined across repositories: nine summaries of one person's
+    merges in one repository are an observation, and averaging them over the repositories they
+    contributed to would invent a per-person figure this tool does not measure (architecture.md,
+    "Scope boundaries").
+    """
+
+    metric: str
+    summary: RateObservation | DistributionObservation
+    classifications: dict[str, NonNegativeInt]
+
+
 class BehaviourEvidenceReport(EvidenceModel):
     """Describe an offline aggregate and optional named contributing evidence.
 
@@ -1167,9 +1213,18 @@ class RepositoryPracticeEvidence(EvidenceModel):
 
     The findings are reported as `behaviour` so that the two halves of the block name what they are:
     `merge_gate` is the governance a repository declares, `behaviour` is what its merges actually did.
+
+    `team` is the identifier of the team the configuration says owns this repository. It rides in the
+    block because every reader of the block groups by it — the readable report looked it up from a map
+    passed beside the report, and a consumer reading the JSON alone had no way to.
+
+    `metrics` holds the nine neutral aggregates over this repository's whole cohort, which the
+    readable report has always shown and the JSON did not carry. They are the same figures a
+    `--metric` drill-down emits, computed once and shared, so the two renderings cannot diverge.
     """
 
     repository: str
+    team: str
     starts_at: AwareDatetime
     ends_at: AwareDatetime
     provenance: WindowProvenance
@@ -1181,6 +1236,7 @@ class RepositoryPracticeEvidence(EvidenceModel):
     codeowners: CodeownersReport
     maintenance: MaintenanceReport
     sonar: SonarReport
+    metrics: tuple[BehaviourMetricSummary, ...]
     behaviour: tuple[PracticeFinding, ...]
 
 
@@ -1202,12 +1258,18 @@ class ActorRepositoryReadiness(EvidenceModel):
     cohort's author exclusions. `blocking` counts the occurrences behind their practice findings in
     that repository, so twelve unreviewed merges count as twelve rather than as one finding. Neither
     number judges the person: `blocking` is what a rule already reported, gathered per repository.
+
+    `metrics` summarises the same nine aggregates the repository block carries, measured over THIS
+    PERSON'S merges in THIS REPOSITORY alone. It is a list of observations and nothing more: the rows
+    are never combined across the repositories a person contributed to, and people are never ordered
+    by any of them (architecture.md, "Scope boundaries").
     """
 
     readiness: ReadinessLabel | None = None
     repository: str
     contributions: PositiveInt
     blocking: NonNegativeInt
+    metrics: tuple[BehaviourMetricSummary, ...]
 
 
 class ActorReadiness(EvidenceModel):
@@ -1467,9 +1529,10 @@ class TrendReport(EvidenceModel):
 class RepositoryInventoryItem(EvidenceModel):
     """Associate observed repository state with its configured team.
 
-    `codeowners`, `maintenance`, `sonar` and `sonar_project` default to None so a row stored before
-    they existed still parses, read back as "not collected when repository state was stored" — never
-    as an absent file, an empty branch or a project with nothing measured.
+    `codeowners`, `maintenance`, `sonar`, `sonar_project` and `open_pull_requests` default to None so
+    a row stored before they existed still parses, read back as "not collected when repository state
+    was stored" — never as an absent file, an empty branch, a project with nothing measured or a
+    repository with nothing open.
 
     The two SonarCloud fields are a pair and are read as one: `sonar_project` says which project this
     repository was attributed to and how, `sonar` says what was measured for it. A resolved project
@@ -1486,6 +1549,7 @@ class RepositoryInventoryItem(EvidenceModel):
     maintenance: MaintenanceEvidence | None = None
     sonar: SonarMeasures | None = None
     sonar_project: SonarProjectResolution | None = None
+    open_pull_requests: OpenPullRequestSnapshot | None = None
     collection: BehaviourProvenance | None = None
 
 

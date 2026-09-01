@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from sqlite3 import Connection, Error, connect
 
+from pydantic import ValidationError
+
 from metrics.domain import (
     AlertFamily,
     AlertObservation,
@@ -764,7 +766,15 @@ def repository_project(path: Path, sonar_organization: str, repository: str) -> 
 
 
 def load_repository_state(path: Path, organization: str, repository: str) -> StoredRepositoryState | None:
-    """Load one repository's latest stored current state, or None when it was never collected."""
+    """Load one repository's latest stored current state, or None when it was never collected.
+
+    A row this build cannot PARSE is a `StorageError` like a row it cannot READ, which is why the
+    parses sit inside the same guard as the query. The stored payload is validated `extra="forbid"`,
+    so a row written by a newer build — or a corrupt one — raises rather than returning, and letting
+    that escape would cost far more than the one repository it is about: every caller degrades a
+    `StorageError` to a reason on that repository alone, while an unhandled `ValidationError` fails
+    the whole report the repository is one row of, and takes the service's warm-up down with it.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(connect(path)) as connection, connection:
@@ -773,13 +783,13 @@ def load_repository_state(path: Path, organization: str, repository: str) -> Sto
                 "SELECT fetched_at, payload FROM repository_state WHERE organization = ? AND repository = ?",
                 (organization, repository),
             ).fetchone()
-    except (Error, OSError) as exception:
+        if row is None:
+            return None
+        fetched_at, payload = row
+        return StoredRepositoryState(
+            fetched_at=datetime.fromisoformat(fetched_at),
+            state=RepositoryInventoryItem.model_validate_json(payload),
+        )
+    except (Error, OSError, ValidationError, ValueError) as exception:
         message = f"could not read collection cache: {exception}"
         raise StorageError(message) from exception
-    if row is None:
-        return None
-    fetched_at, payload = row
-    return StoredRepositoryState(
-        fetched_at=datetime.fromisoformat(fetched_at),
-        state=RepositoryInventoryItem.model_validate_json(payload),
-    )
