@@ -1,0 +1,23 @@
+services:
+  api:
+    build: .
+    volumes:
+      - ./${CONFIG:-config.yml}:/app/config.yml:ro
+      - ./.metrics:/app/.metrics
+    networks:
+      - metrics
+
+  ui:
+    build: ./ui
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - metrics
+
+networks:
+  metrics:

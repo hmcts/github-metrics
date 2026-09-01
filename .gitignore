@@ -18,6 +18,8 @@ ai-in-sdlc-github-analysis/
 # configuration — which is why ui/.gitignore had to negate it back — and `completed/` swallowed
 # docs/plans/completed/, where every finished plan lives.
 /*.yml
+# ...except the compose file, which is checked in and happens to sit at the root under that suffix.
+!/docker-compose.yml
 /*.json
 /*.log
 /*.out
