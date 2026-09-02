@@ -52,11 +52,14 @@ and `check` is the one to run wherever the build works, because a page that will
 | --- | --- |
 | `/` | nothing of its own: it redirects to `/repositories`, carrying `?weeks=` through where one was given |
 | `/repositories` | the estate at one span: counts, the label distribution, and the repositories to drill into |
-| `/contributors` | everyone who contributed to a reported repository at that span, alphabetically |
 | `/teams` | every configured team at that span, with the labels its repositories carry |
+| `/contributors` | everyone who contributed to a reported repository at that span, by the labels their repositories carry |
 | `/repositories/[repository]` | one repository's whole evidence block and its periods since enablement |
-| `/contributors/[login]` | which repositories one person worked in, and what was measured in each of them |
 | `/teams/[team]` | what a team owns, how those repositories are labelled, and who worked in them |
+| `/contributors/[login]` | which repositories one person worked in, and what was measured in each of them |
+
+The rows are in the order the nav bar puts them, which from 2026-09-02 reads down the estate:
+repositories, the teams that own them, then the people who work in them.
 
 **The three lists were one page until 2026-09-02**, with the nav pointing at `#repositories`, `#actors` and `#teams`
 anchors down it. They are routes now, so a link names what it lands on and a reader loads the third of the estate they
@@ -205,13 +208,21 @@ every response the service actually sends.
 
 These come from `docs/architecture.md`, "Scope boundaries", and they bind the UI as much as the Python:
 
-- **No personal rankings.** No list of people carries a column to sort by: `ActorsTable`, `TeamActorsTable` and
-  `ContributorsTable` have no sortable headers at all. The first two are alphabetical. The third keeps the
+- **No personal rankings.** No list of people carries a metric column to sort by. `TeamActorsTable` and
+  `ContributorsTable` have no sortable headers at all: the first is alphabetical, the second keeps the
   contributions-descending order the service sends, because a repository page asks which merges make up its window,
   and the five figures beside a login there — contributions, merged pull requests, direct pushes, unreviewed merges,
   median size — are counts of what was done in that one repository (2026-09-02), never scores and never rates to
   compare people on. `Blocking occurrences` was dropped from that table the same day as a second copy of the findings
-  table above it.
+  table above it. `ActorsTable` is the exception, admitted on 2026-09-02: `/contributors` opens sorted by a readiness
+  column listing the distinct labels a person's repositories carry, best first, and `combinationKey` in `lib/rag.ts`
+  orders those combinations `GREEN`, `GREEN, AMBER`, `GREEN, AMBER, RED`, `GREEN, RED`, `AMBER`, `AMBER, RED`, `RED`.
+  It sorts by labels the rows already carry, not by anything derived about a person — and there is still no score, no
+  metric column and no per-person verdict. Somebody the `cannot_assess` exclusion leaves with no label carries the
+  `CANNOT ASSESS` badge rather than the dash an absent value gets, because their repositories were graded and came
+  back unreadable; they sort last in both directions all the same, since `combinationKey` returns nothing for them. All three of its headers sort, the repository count included, because that
+  count is navigation: ordering by it says who appears in the most repositories, which is what the column already
+  prints. A rate, a median or a finding count beside a login would not be allowed one.
 - **No cross-repository averaging.** A person's behaviour metrics are measured per repository and stay in their own
   section on the contributor page. Merges add up across repositories because a sum of merges is still a number of merges;
   a rate, a median or a label never does.

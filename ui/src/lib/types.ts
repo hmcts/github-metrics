@@ -438,9 +438,24 @@ export interface RepositoryDetail {
   detail?: string;
 }
 
+/**
+ * `labels` LISTS the distinct labels this person's reported repositories carry, best first.
+ *
+ * It combines nothing: there is no per-person label, no score and no count beside a name. The
+ * service sends `[]` where nothing is left to label — `cannot_assess` repositories are excluded, as
+ * they are from the text report's actor section, and a readiness policy that is off labels nothing.
+ *
+ * OPTIONAL for the reason `ReadinessCondition.informational` is: the field only exists from
+ * 2026-09-02, and `API_URL` is read per request so a deployment can be pointed at a `metrics-serve`
+ * older than that without a rebuild. A service of this version always sends the key, empty rather
+ * than omitted, so the absent case means an older service and nothing else — but an unguarded read
+ * of it would throw while rendering and take the whole `/contributors` page down, where the guard
+ * shows the list unlabelled.
+ */
 export interface ActorRow {
   login: string;
   repositories: number;
+  labels?: ReadinessLabel[];
 }
 
 export interface ActorDetail {

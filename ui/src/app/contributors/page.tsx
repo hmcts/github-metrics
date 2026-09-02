@@ -9,7 +9,8 @@ import { getActors, getOverview, getWindows } from '@/lib/api';
 import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
 
 /**
- * Everyone who contributed to a reported repository at one window span, alphabetically.
+ * Everyone who contributed to a reported repository at one window span, by their repositories'
+ * labels.
  *
  * A route of its own from 2026-09-02, where it was a section of the overview before. The page carries
  * the organisation header and the list and nothing else: the estate figures and the readiness donut
@@ -45,7 +46,7 @@ export default async function ContributorsPage({
         action={<NavWeekSelector options={windows.options} active={weeks} />}
       />
 
-      <Section heading="Contributors" detail="alphabetical">
+      <Section heading="Contributors" detail="by their repositories' labels">
         {actors.length === 0 ? (
           <EmptyState
             message="Nobody contributed to a reported repository at this span."

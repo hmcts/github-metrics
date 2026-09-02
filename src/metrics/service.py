@@ -48,6 +48,7 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryPracticeEvidence,
     RepositoryTrend,
+    actor_labels,
 )
 from metrics.evidence import collected_through, offline_practice_report
 from metrics.storage import StorageError, observation_database
@@ -256,14 +257,20 @@ class RepositoryDetail(EvidenceModel):
 
 
 class ActorRow(EvidenceModel):
-    """Name one person and how many repositories they contributed to in this window.
+    """Name one person, how many repositories they contributed to, and the labels those carry.
 
-    A count of repositories and nothing else: the list it fills is ALPHABETICAL and carries no metric
-    to order people by, which is the personal-ranking boundary this service is bound by.
+    `labels` LISTS the distinct labels of the person's reported repositories, best first, and
+    COMBINES NOTHING: there is no per-person label, no score and no count beside a name. It is empty
+    where nothing is left to label — `cannot_assess` repositories are excluded, as they are from the
+    text report's actor section, and a readiness policy that is off labels no repository at all.
+
+    A count of repositories and a list of labels the repositories already carry, and nothing else,
+    which is the personal-ranking boundary this service is bound by.
     """
 
     login: str
     repositories: PositiveInt
+    labels: tuple[ReadinessLabel, ...] = ()
 
 
 class ActorDetail(EvidenceModel):
@@ -1000,9 +1007,18 @@ def resolve_periods(period_days: int, periods: int | None, enablement: datetime 
 
 
 def serve_actors(bundle: Bundle) -> tuple[ActorRow, ...]:
-    """List everyone who contributed to a reported repository, alphabetically and never ranked."""
+    """List everyone who contributed to a reported repository, alphabetically and never ranked.
+
+    Each row carries the distinct labels of the repositories the report grades for that person, so a
+    client can group people by what they work in without asking for every person's detail. The count
+    is over every repository they contributed to while the labels are over `reported_repositories`
+    alone, so a row may count more repositories than it carries labels for — a person whose every
+    repository is `cannot_assess` counts them all and lists nothing. The order served stays
+    alphabetical: what a client does with the labels is its own presentation.
+    """
     return tuple(
-        ActorRow(login=actor.actor_login, repositories=len(actor.repositories)) for actor in bundle.actors.values()
+        ActorRow(login=actor.actor_login, repositories=len(actor.repositories), labels=actor_labels(actor))
+        for actor in bundle.actors.values()
     )
 
 

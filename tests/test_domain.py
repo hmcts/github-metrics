@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from metrics.domain import (
+    ActorReadiness,
+    ActorRepositoryReadiness,
     AlertFamily,
     AlertObservation,
     AlertSeverity,
@@ -27,6 +29,7 @@ from metrics.domain import (
     OpenPullRequestSnapshot,
     OpenPullRequestSummary,
     RateObservation,
+    ReadinessLabel,
     RepositoryInventoryIssue,
     RepositoryInventoryItem,
     RepositoryTrend,
@@ -49,6 +52,8 @@ from metrics.domain import (
     TrendThroughput,
     TrendWindow,
     WindowProvenance,
+    actor_labels,
+    reported_repositories,
 )
 
 
@@ -722,3 +727,77 @@ def test_distribution_rejects_negative_percentiles() -> None:
             percentile_75=1,
             percentile_90=1,
         )
+
+
+def actor_repository(repository: str, readiness: ReadinessLabel | None) -> ActorRepositoryReadiness:
+    """Build one repository of a person's readiness list, carrying the label under test."""
+    return ActorRepositoryReadiness(
+        readiness=readiness,
+        repository=repository,
+        contributions=1,
+        blocking=0,
+        metrics=(),
+    )
+
+
+def actor(*labels: ReadinessLabel | None) -> ActorReadiness:
+    """Build one person contributing to a repository per label given, named apart so none collide."""
+    return ActorReadiness(
+        actor_login="alice",
+        repositories=tuple(actor_repository(f"service-{index}", label) for index, label in enumerate(labels)),
+    )
+
+
+def test_one_label_is_carried_alone() -> None:
+    """Report the single label a person's one repository carries."""
+    assert actor_labels(actor(ReadinessLabel.AMBER)) == (ReadinessLabel.AMBER,)
+
+
+def test_distinct_labels_are_returned_best_first() -> None:
+    """Order a combination by `ReadinessLabel` declaration order, whatever order it was found in."""
+    assert actor_labels(actor(ReadinessLabel.RED, ReadinessLabel.GREEN, ReadinessLabel.AMBER)) == (
+        ReadinessLabel.GREEN,
+        ReadinessLabel.AMBER,
+        ReadinessLabel.RED,
+    )
+
+
+def test_a_repeated_label_is_collapsed() -> None:
+    """Collapse multiplicity: six red repositories and one say the same thing about a person."""
+    assert actor_labels(actor(ReadinessLabel.RED, ReadinessLabel.RED, ReadinessLabel.GREEN)) == (
+        ReadinessLabel.GREEN,
+        ReadinessLabel.RED,
+    )
+
+
+def test_a_cannot_assess_repository_carries_no_label() -> None:
+    """Exclude `cannot_assess`, which says a permission is missing rather than how a person works."""
+    assert actor_labels(actor(ReadinessLabel.CANNOT_ASSESS, ReadinessLabel.GREEN)) == (ReadinessLabel.GREEN,)
+
+
+def test_a_person_whose_repositories_are_all_cannot_assess_carries_nothing() -> None:
+    """Leave a person with nothing to show rather than inventing a label for them."""
+    assert actor_labels(actor(ReadinessLabel.CANNOT_ASSESS, ReadinessLabel.CANNOT_ASSESS)) == ()
+
+
+def test_unlabelled_repositories_carry_nothing() -> None:
+    """Carry no label where the readiness policy is off and no repository was labelled at all."""
+    assert actor_labels(actor(None, None)) == ()
+
+
+def test_an_ungraded_repository_beside_a_graded_one_adds_no_label() -> None:
+    """List only the labels that exist: an ungraded repository is not a label of its own here.
+
+    The report's own actor combination reads this person as `GREEN, NOT ASSESSED` and groups them
+    under `Ungrouped`, because a section heading has to put them somewhere. A LIST of labels has
+    nothing to put: `not assessed` is the absence of a label, and inventing one for it would say the
+    readiness policy graded something it did not.
+    """
+    assert actor_labels(actor(ReadinessLabel.GREEN, None)) == (ReadinessLabel.GREEN,)
+
+
+def test_reported_repositories_drops_only_the_unassessable_ones() -> None:
+    """Keep every other repository unchanged, so the exclusion has exactly one spelling."""
+    person = actor(ReadinessLabel.GREEN, ReadinessLabel.CANNOT_ASSESS, None)
+
+    assert [row.repository for row in reported_repositories(person)] == ["service-0", "service-2"]

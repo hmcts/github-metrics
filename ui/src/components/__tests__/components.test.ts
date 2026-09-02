@@ -398,6 +398,24 @@ describe('OrganisationHeader', () => {
   });
 });
 
+describe('Navigation', () => {
+  /**
+   * Order, not presence. Three links whose labels all render is what the site had before
+   * 2026-09-02; what the instruction asked for is that they read down the estate — a repository,
+   * the team that owns it, the people who work in it — so the assertion is on their positions.
+   */
+  it('lists the three estate links in estate order', () => {
+    const markup = renderToStaticMarkup(createElement(Navigation));
+
+    const order = ['Repositories', 'Teams', 'Contributors'].map((label) =>
+      markup.indexOf(`>${label}</a>`),
+    );
+
+    expect(order).not.toContain(-1);
+    expect(order).toStrictEqual([...order].sort((first, second) => first - second));
+  });
+});
+
 describe('SortHeader', () => {
   it('states the column ordering on the header cell and puts the control in a button', () => {
     const markup = renderToStaticMarkup(
@@ -617,7 +635,12 @@ describe('the shared vocabulary', () => {
         }),
       ),
       renderToStaticMarkup(
-        createElement(ActorsTable, { rows: [{ login: 'octocat', repositories: 1 }], weeks: 4 }),
+        createElement(ActorsTable, {
+          // Labelled, so the readiness column's badges are swept for the word and the route too: a
+          // cell that renders through `RAGLabel` is the one part of this list that is not a login.
+          rows: [{ login: 'octocat', repositories: 1, labels: ['green'] }],
+          weeks: 4,
+        }),
       ),
       renderToStaticMarkup(
         createElement(TeamActorsTable, {

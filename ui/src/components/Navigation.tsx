@@ -10,6 +10,10 @@ import { BarChart3, Building2, FolderGit2, Users } from 'lucide-react';
  * built, and in exchange each list has a URL to link to, its own loading state, and a browser Back
  * that goes back rather than jumping up the page it never left.
  *
+ * THE ORDER IS THE ESTATE'S, from 2026-09-02: repositories, then the teams that own them, then the
+ * people who work in them. Contributors sat second until then, which put the widest list of the
+ * three between a repository and the team holding it.
+ *
  * NO HOME LINK. Repositories is the landing page, so a Home button would be a second name for a link
  * already in this bar. `/` redirects there for everything already pointing at it, and the site name
  * to the left goes to the same place — which is what a logo is for.
@@ -41,6 +45,7 @@ export function Navigation() {
             icon={<FolderGit2 className="w-4 h-4" />}
             label="Repositories"
           />
+          <NavigationLink href="/teams" icon={<Building2 className="w-4 h-4" />} label="Teams" />
           {/* The route is spelled the reader's way from 2026-09-02: `/contributors`, over a service
               that still calls the author of a merge an actor and still serves `/actors`. A
               `/contributors` list above an `/actors/[login]` detail was one thing with two names. */}
@@ -49,7 +54,6 @@ export function Navigation() {
             icon={<Users className="w-4 h-4" />}
             label="Contributors"
           />
-          <NavigationLink href="/teams" icon={<Building2 className="w-4 h-4" />} label="Teams" />
         </div>
       </div>
     </nav>

@@ -1,10 +1,12 @@
 /**
  * Column ordering for the tables, and the one rule that is not negotiable while doing it.
  *
- * Repositories and teams may be ordered by any column the reader clicks. PEOPLE MAY NOT: the scope
- * boundaries forbid ranking actors by any metric or finding, so an actor table gets no sortable
- * numeric column and stays alphabetical. Nothing here enforces that — it is a decision about which
- * headers each table hands to `SortHeader`.
+ * Repositories and teams may be ordered by any column the reader clicks. PEOPLE MAY NOT BE RANKED:
+ * the scope boundaries forbid ordering actors by any metric or finding, so no actor table gets a
+ * sortable metric column. What `/contributors` does sort by, from 2026-09-02, is the combination of
+ * labels its rows' repositories already carry, plus the repository count that is navigation beside
+ * it. Nothing here enforces any of that — it is a decision about which headers each table hands to
+ * `SortHeader`.
  *
  * An unmeasured value sorts last in BOTH directions. Sorting descending on "stale open pull
  * requests" is a question about the repositories that have some; a repository whose count could not
@@ -18,6 +20,23 @@ export type SortValue = string | number | undefined;
 
 export function reverse(direction: Direction): Direction {
   return direction === 'ascending' ? 'descending' : 'ascending';
+}
+
+/**
+ * Where a header click leaves the direction: reversed on the column already active, ascending on any
+ * other, which is what "sort by this one" means — from the top of it.
+ *
+ * Carrying the previous column's direction over would open a newly clicked column descending for no
+ * reason a reader could see. It lives here rather than in the two tables that sort so that both
+ * spell the transition once, and so a click's effect can be tested without a click: the components
+ * hold this in `useState` and are rendered statically by the component tests.
+ */
+export function nextDirection<Column>(
+  active: Column | null,
+  next: Column,
+  direction: Direction,
+): Direction {
+  return next === active ? reverse(direction) : 'ascending';
 }
 
 /**

@@ -65,6 +65,38 @@ describe('conditionGroups', () => {
       'the gate requires no status check',
     );
   });
+
+  it('sinks the clear group’s informational rows below the graded ones', () => {
+    const mixed: ReadinessAssessment = {
+      ...assessment,
+      clear: [
+        { condition: 'sufficient-merges', detail: 'reported, not judged', informational: true },
+        { condition: 'codeowners', detail: 'a CODEOWNERS file is present' },
+        { condition: 'approval-coverage', detail: 'reported, not judged', informational: true },
+        { condition: 'protected', detail: 'the default branch is protected', informational: false },
+      ],
+    };
+    expect(conditionGroups(mixed)[2]?.conditions.map((condition) => condition.condition)).toEqual([
+      'codeowners',
+      'protected',
+      'sufficient-merges',
+      'approval-coverage',
+    ]);
+  });
+
+  it('leaves the caution group in the policy’s order, informational rows included', () => {
+    const mixed: ReadinessAssessment = {
+      ...assessment,
+      caution: [
+        { condition: 'reported', detail: 'reported, not judged', informational: true },
+        { condition: 'no required check', detail: 'the gate requires no status check' },
+      ],
+    };
+    expect(conditionGroups(mixed)[1]?.conditions.map((condition) => condition.condition)).toEqual([
+      'reported',
+      'no required check',
+    ]);
+  });
 });
 
 describe('the cohort', () => {

@@ -1417,6 +1417,16 @@ The endpoints are `/healthz`, `/windows`, `/overview`, `/repositories`,
 `/teams/{team}`; every data endpoint takes `?weeks=` and refuses a span off the list rather than clamping it. A request
 naming no span gets four weeks, or the longest span the configuration allows below that.
 
+An `/actors` row is a `login`, the number of `repositories` that login appears in, and `labels` — the **distinct**
+readiness labels of the repositories the report counts for them, best first, which since 2026-09-02 is what the
+dashboard's readiness column shows and sorts on. It lists what the repositories already carry and combines nothing:
+duplicates collapse, so somebody with six red repositories carries `["red"]`, and `cannot_assess` repositories are left
+out exactly as the text report's actor section leaves them out — both go through `domain.reported_repositories`. The
+field is an **empty list**, not an absent one, where that leaves nothing to label or where the readiness policy is off,
+and the row is still served: a person with no label is a person the labels say nothing about, not a person to drop. The
+dashboard shows that row as `CANNOT ASSESS` — the repositories behind it were graded and came back unreadable — and
+sorts it last in either direction, since an unreadable gate has no place in a green-amber-red ordering.
+
 Every one of those spans ends where the caches end, not at today's midnight — the same anchor `metrics evidence` uses
 offline, and for the same reason: a service reading a cache written on Monday would otherwise report the whole estate
 as not reported from Tuesday onwards. So a span served the day after a collection shows the figures that collection

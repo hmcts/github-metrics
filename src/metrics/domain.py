@@ -1297,6 +1297,41 @@ class ActorReadiness(EvidenceModel):
     repositories: tuple[ActorRepositoryReadiness, ...]
 
 
+def reported_repositories(actor: ActorReadiness) -> tuple[ActorRepositoryReadiness, ...]:
+    """Return the repositories of one person that a list about people reports on.
+
+    A `cannot_assess` repository is DROPPED here, by the user's instruction of 2026-08-31. The label
+    is not a grade — it means a half of the question could not be read, most often a merge gate a
+    non-administrator cannot see — so beside a person it says only that somebody else lacks a
+    permission, and at hmcts scale it says that about most repositories most people work in,
+    crowding out the labels the list exists to show. The repositories are unchanged in the JSON, in
+    the index and in the body: this is what a person's row shows, not a re-judging of anything.
+
+    It sits in the domain rather than in a renderer because both the text report and the `/actors`
+    contract draw on it, and the exclusion must have exactly one spelling for the two to agree.
+
+    An actor left with nothing keeps whatever row a caller gives them, but carries no label: a label
+    invented for a person whose repositories could not be assessed is a finding about them.
+    """
+    return tuple(row for row in actor.repositories if row.readiness is not ReadinessLabel.CANNOT_ASSESS)
+
+
+def actor_labels(actor: ActorReadiness) -> tuple[ReadinessLabel, ...]:
+    """Return the DISTINCT labels one person's reported repositories carry, best first.
+
+    Distinct because multiplicity says nothing about a person: red six times and red once both mean
+    everything they work in is red, and telling them apart would separate people by how many
+    repositories they happen to author in. Ordered by `ReadinessLabel` declaration order, so one set
+    of labels reads the same way wherever it is shown, and a label added there orders itself.
+
+    Empty where nothing is left to label — every repository `cannot_assess`, or a readiness policy
+    disabled so no repository carries a label at all. This LISTS labels and combines none of them:
+    there is no per-person verdict here, only the labels the repositories already carry.
+    """
+    carried = {row.readiness for row in reported_repositories(actor)}
+    return tuple(label for label in ReadinessLabel if label in carried)
+
+
 class PracticeEvidenceReport(EvidenceModel):
     """Contain practice findings for the selected configured repositories.
 

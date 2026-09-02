@@ -29,8 +29,7 @@
 Run `uv run poe check` before considering work complete. It must pass Ruff linting and formatting, strict mypy, and
 pytest without weakening their configuration. Use `uv run poe cover` when coverage is relevant.
 
-Work touching `ui/` must also pass `npm --prefix ui run check` — ESLint, `tsc --noEmit`, vitest, and `next build` in one
-step, the UI's equivalent of `uv run poe check`. Run both when a change spans the service and the pages it feeds.
+Work touching `ui/` must also pass `npm --prefix ui run check` (which runs ESLint, `tsc --noEmit`, vitest, and `next build` in one step, the UI's equivalent of `uv run poe check`). Run both when a change spans the service and the pages it feeds.
 
 Where `check`'s `next build` step fails on a case-insensitive mount — `ENOTDIR` or `ENOENT` under
 `.next/standalone`, on a different path each run, which is the environment and not the code — run `npm --prefix ui run

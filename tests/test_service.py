@@ -247,10 +247,15 @@ def practice_evidence(repository: str, team: str, **overrides: object) -> Reposi
     return evidence.model_copy(update=overrides)
 
 
-def actor_repository(repository: str, contributions: int, blocking: int = 0) -> ActorRepositoryReadiness:
+def actor_repository(
+    repository: str,
+    contributions: int,
+    blocking: int = 0,
+    readiness: ReadinessLabel | None = ReadinessLabel.AMBER,
+) -> ActorRepositoryReadiness:
     """State one person's contribution to one repository, as the contract carries it."""
     return ActorRepositoryReadiness(
-        readiness=ReadinessLabel.AMBER,
+        readiness=readiness,
         repository=repository,
         contributions=contributions,
         blocking=blocking,
@@ -1174,12 +1179,51 @@ def test_an_unconfigured_repository_is_not_found(client: TestClient) -> None:
     assert response.json()["detail"] == "repository is not configured: nothing-here"
 
 
-def test_actors_are_listed_alphabetically_with_their_repository_count(client: TestClient) -> None:
+def test_actors_are_listed_alphabetically_with_their_repository_count_and_labels(client: TestClient) -> None:
     rows = client.get("/actors").json()
 
     assert rows == [
-        {"login": "Alice", "repositories": 2},
-        {"login": "bob", "repositories": 1},
+        {"login": "Alice", "repositories": 2, "labels": ["amber"]},
+        {"login": "bob", "repositories": 1, "labels": ["amber"]},
+    ]
+
+
+def test_a_contributors_labels_are_distinct_best_first_and_exclude_the_unassessable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serve the labels a person's repositories carry, `cannot_assess` out and repeats collapsed.
+
+    The repository count is untouched by the exclusion: it says what somebody works in, and the
+    labels say how those repositories are graded where a grade could be reached.
+    """
+    report = practice_report().model_copy(
+        update={
+            "actors": (
+                ActorReadiness(
+                    actor_login="Alice",
+                    repositories=(
+                        actor_repository("cath-service", 3, readiness=ReadinessLabel.RED),
+                        actor_repository("civil-service", 1, readiness=ReadinessLabel.GREEN),
+                        actor_repository("other-service", 1, readiness=ReadinessLabel.RED),
+                    ),
+                ),
+                ActorReadiness(
+                    actor_login="bob",
+                    repositories=(actor_repository("cath-service", 1, readiness=ReadinessLabel.CANNOT_ASSESS),),
+                ),
+            ),
+        },
+    )
+    monkeypatch.setattr("metrics.service.offline_practice_report", lambda _configuration, _window: report)
+    settings = configuration(tmp_path)
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+        rows = connected.get("/actors").json()
+
+    assert rows == [
+        {"login": "Alice", "repositories": 3, "labels": ["green", "red"]},
+        {"login": "bob", "repositories": 1, "labels": []},
     ]
 
 

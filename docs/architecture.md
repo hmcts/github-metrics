@@ -34,9 +34,11 @@ is a hard no, RED, whatever the team's day-to-day behaviour — means merge-gate
 VETO, rather than merely sitting alongside behavioural evidence.
 
 This reverses "no scoring, no RAG labels" as recorded under scope boundaries, which is why it is
-called out here rather than quietly edited. The personal-rankings half of that boundary is untouched:
-the actor section added on 2026-08-28 lists a person's repositories and their labels in alphabetical
-order of login, precisely so that it is not one. The no-dashboards half was itself reversed on
+called out here rather than quietly edited. The personal-rankings half of that boundary holds in the
+report: the actor section added on 2026-08-28 lists a person's repositories and their labels in
+alphabetical order of login, precisely so that it is not one. Its UI half was amended on 2026-09-02 —
+a contributor list may be ordered by the combination of labels its rows' repositories already carry,
+and by nothing else about a person; see "Scope boundaries". The no-dashboards half was itself reversed on
 2026-09-01 — see "Scope boundaries" — and the service and UI it admitted render these labels rather
 than deriving any of their own.
 
@@ -1388,11 +1390,37 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   at once. `/actors/[login]` became `/contributors/[login]`, deliberately breaking bookmarked actor
   URLs rather than leaving a `/contributors` list above an `/actors` detail: THE SERVICE'S `/actors`
   ENDPOINTS AND FIELD NAMES DID NOT MOVE, and must not be renamed to match a route — `actors` is
-  what the JSON contract and the report call them.
-  No personal rankings, UNCHANGED AND BINDING ON THE UI: the actor section lists a person's
-  repositories and the label of each, ordered alphabetically by login within the group their labels
-  put them under, and nothing scores or ranks people. Every list of people the service serves is
-  alphabetical, and none of them carries a metric to sort by.
+  what the JSON contract and the report call them. THE BAR READS DOWN THE ESTATE (2026-09-02, at the
+  user's instruction): Repositories, then Teams, then Contributors — a repository, the team that owns
+  it, then the people who work in it. Contributors sat second until then, which put the widest of the
+  three lists between a repository and the team holding it.
+  No personal rankings, BINDING ON THE UI, and amended on 2026-09-02: the actor section lists a
+  person's repositories and the label of each, ordered alphabetically by login within the group their
+  labels put them under, and nothing scores or ranks people.
+  - A CONTRIBUTOR LIST MAY BE ORDERED BY THE COMBINATION OF LABELS ITS ROWS ALREADY CARRY
+    (2026-09-02, at the user's instruction). This reverses the sentence that stood here — that every
+    list of people is alphabetical and none of them carries a column to sort by. `/contributors`
+    opens sorted by a readiness column holding the DISTINCT labels of a person's reported
+    repositories, best first, and the header reverses it. It is the same grouping the report's
+    `Enable` / `Review` / `Blocked` sections were admitted for on 2026-09-01, read as an order rather
+    than as headings: `ui/src/lib/rag.ts:combinationKey` maps green, amber and red to `1`, `2` and
+    `3`, dedupes, sorts and joins the digits, so `GREEN` precedes `GREEN, AMBER` precedes
+    `GREEN, AMBER, RED` precedes `GREEN, RED`, which no arithmetic on a severity gives. Ties keep the
+    service's alphabetical order because `sorted` is stable, and somebody the `cannot_assess`
+    exclusion leaves with no label keeps their row and sorts last in both directions. THAT ROW
+    CARRIES THE `CANNOT ASSESS` BADGE, on the user's further instruction the same day, where a dash
+    stood first: the repositories behind an empty list were graded and every one of them came back
+    unreadable, and a dash — the site's mark for "nobody measured it" — would report that as nothing
+    having been checked. It is the badge alone and never an ordering: `combinationKey` still returns
+    nothing for an empty list, because `cannot_assess` is not a grade between amber and red here any
+    more than it is anywhere else.
+    WHAT STAYS BINDING IS UNCHANGED: no score, no metric column, no count beside a name and no
+    per-person verdict. The labels are the repositories' own, carried on `ActorRow.labels` as a LIST
+    the service combines nothing into, and the repository count beside a login is how many
+    repositories that login appears in — navigation, as the boundary has always allowed it to be, and
+    its header sorts with the other two for that reason: ordering by it says who appears in the most
+    repositories, which is the fact the column already prints rather than a judgement about anybody.
+    `TeamActorsTable` and `ContributorsTable` are untouched and stay unsortable.
   - A FIGURE ON A PAGE MAY CARRY TONE FROM 2026-09-02, AT THE USER'S INSTRUCTION. This reverses the
     UI's own written rule that colour on a page is the readiness label and nothing else: the
     predecessor tool coloured its figures, the user asked for that back, and a page of about forty
@@ -1479,8 +1507,11 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
     hand, while a team label, an organisation score or a worst-of rule would decide something the
     user declined to decide. What forced it is scale — the hmcts configuration carries 1,863
     non-archived repositories, so the index is 1,863 rows and unreadable as a shape. Still excluded,
-    unchanged: any combined label, any per-team figure, any score, and any ordering of teams or
-    people by what they carry.
+    unchanged: any combined label, any per-team figure, any score, and any ordering of teams by what
+    they carry. The last of those covered people too until 2026-09-02, when ordering a CONTRIBUTOR
+    LIST by the combination of labels its rows' repositories already carry was admitted for the UI —
+    see "No personal rankings" above. Nothing DERIVED about a person orders a list even now, and the
+    report's own actor section is unchanged.
     All four labels print at every run, zero included, so the block diffs line for line; the two
     non-labels the index column can hold — `not assessed`, `unavailable` — print only where something
     carries them, because a zero there is the absence of a state rather than a count of one. Each
@@ -1526,9 +1557,12 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
       as a finding about them, and the heading says the exclusion outright, so a shortened list is
       never read as the whole of somebody's work. RENDERING ONLY — `actors` in the JSON, the index
       and the repository blocks are all unchanged, and the counts in `Repository Summary` still cover
-      the whole population. It is `render.actor_repositories`, the one place to change if it is ever
-      reversed, and the counts in `Actor Summary` are taken from what it returns, so no combination
-      can carry `CANNOT_ASSESS` and nobody it leaves with no repository is counted.
+      the whole population. It is `domain.reported_repositories`, the one place to change if it is
+      ever reversed, and the counts in `Actor Summary` are taken from what it returns, so no
+      combination can carry `CANNOT_ASSESS` and nobody it leaves with no repository is counted. It
+      moved out of `render.py` on 2026-09-02 because the service needs the same exclusion to fill
+      `ActorRow.labels` — `domain.actor_labels` is that list, and both readers of the rule go through
+      the one function rather than the exclusion getting a second spelling.
   - A PER-COMBINATION ACTOR COUNT IS IN SCOPE, AND ITS GROUPS CARRY SUBTOTALS (2026-09-01, at the
     user's instruction). `--format report` prints an `Actor Summary` block immediately above the
     actor list — mirroring `Repository Summary` sitting immediately above the index — counting how

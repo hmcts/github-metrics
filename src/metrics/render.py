@@ -50,6 +50,7 @@ from metrics.domain import (
     TrendThroughput,
     TrendWindow,
     WindowProvenance,
+    reported_repositories,
 )
 
 
@@ -780,22 +781,6 @@ def actor_line(repositories: Sequence[ActorRepositoryReadiness]) -> str:
     return ", ".join(render_readiness_group(group, named=len(groups) > 1) for group in groups)
 
 
-def actor_repositories(actor: ActorReadiness) -> tuple[ActorRepositoryReadiness, ...]:
-    """Return the repositories of one person that the actor section reports on.
-
-    A `cannot_assess` repository is DROPPED here, by the user's instruction of 2026-08-31. The label
-    is not a grade — it means a half of the question could not be read, most often a merge gate a
-    non-administrator cannot see — so on a line about a person it says only that somebody else lacks
-    a permission, and at hmcts scale it says that about most repositories most people work in,
-    crowding out the labels the line exists to show. The repositories are unchanged in the JSON, in
-    the index and in the body: this is a rendering of one section, not a re-judging of anything.
-
-    An actor left with nothing gets no line, because a line naming a person and no label reads as a
-    finding about them.
-    """
-    return tuple(row for row in actor.repositories if row.readiness is not ReadinessLabel.CANNOT_ASSESS)
-
-
 ACTOR_COMBINATION_ORDER = (*READINESS_LABEL_NAMES, actor_readiness_label(None))
 """Every label one person's line can carry, best first, with the absence of a label last.
 
@@ -845,7 +830,7 @@ def actor_group(combination: tuple[str, ...]) -> str:
     """Name the action a combination of labels puts a person under, or say it is not grouped.
 
     Only a combination carrying `NOT ASSESSED` can reach the fallback: all seven non-empty subsets of
-    GREEN, AMBER and RED are mapped, and `actor_repositories` has already dropped `cannot_assess`, so
+    GREEN, AMBER and RED are mapped, and `reported_repositories` has already dropped `cannot_assess`, so
     there is nothing else a graded line can be.
     """
     for name, combinations in ACTOR_GROUPS.items():
@@ -857,13 +842,13 @@ def actor_group(combination: tuple[str, ...]) -> str:
 def actor_combination_counts(actors: Sequence[ActorReadiness]) -> Mapping[tuple[str, ...], int]:
     """Count the people behind each combination of labels the actor section reports.
 
-    Counted over the same `actor_repositories` the rendered lines are built from, so the counts and
+    Counted over the same `reported_repositories` the rendered lines are built from, so the counts and
     the lines cannot disagree. Anyone that leaves with no repository is skipped for the reason they
     get no line: a person with no label beside them is not a finding to count.
     """
     counted: dict[tuple[str, ...], int] = {}
     for item in actors:
-        repositories = actor_repositories(item)
+        repositories = reported_repositories(item)
         if repositories:
             combination = actor_combination(repositories)
             counted[combination] = counted.get(combination, 0) + 1
@@ -949,7 +934,7 @@ def render_actors(actors: Sequence[ActorReadiness]) -> tuple[str, ...]:
     """
     title = "Actors (cannot_assess repositories excluded)"
     reported = tuple(
-        (actor.actor_login, repositories) for actor in actors if (repositories := actor_repositories(actor))
+        (actor.actor_login, repositories) for actor in actors if (repositories := reported_repositories(actor))
     )
     if not reported:
         detail = (

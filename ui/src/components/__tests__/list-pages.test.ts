@@ -52,7 +52,7 @@ const OVERVIEW: OverviewSummary = {
 
 const REPOSITORIES: RepositoryRow[] = [{ repository: 'api', team: 'platform', readiness: 'green' }];
 
-const ACTORS: ActorRow[] = [{ login: 'ada', repositories: 2 }];
+const ACTORS: ActorRow[] = [{ login: 'ada', repositories: 2, labels: ['green'] }];
 
 const TEAMS: TeamRow[] = [
   { team: 'platform', repositories: 2, unavailable: 0, actors: 1, labels: { green: 1 } },

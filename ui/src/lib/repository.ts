@@ -72,6 +72,10 @@ export function yesOrNo(value: boolean | null | undefined): string {
  *
  * The three groups are always returned, empty ones included, because "nothing blocked this
  * repository" is the finding behind a green label and an absent group would leave it unsaid.
+ *
+ * The membership of each group is the policy's and nothing here moves a condition between them. The
+ * one reordering is inside `clear`, where `gradedFirst` sinks the informational rows below the
+ * graded ones; every condition the policy put there is still there, and still exactly once.
  */
 export interface ConditionGroup {
   key: ConditionOutcome;
@@ -80,6 +84,22 @@ export interface ConditionGroup {
   /** What an empty group means, which is a finding rather than an absence of one. */
   empty: string;
   conditions: ReadinessCondition[];
+}
+
+/**
+ * The clear group with its informational rows last, graded ones first.
+ *
+ * Both kinds sit in the same section but say different things: a graded condition was checked and
+ * satisfied, an informational one was reported and never judged, which is why `tone.conditionTone`
+ * gives the first a green bar and the second none. Reading down a section that alternates between
+ * them, the ungraded rows read as checks that happened to lose their colour — so the green ones are
+ * gathered at the top and the uncoloured ones below, where the break between the two is the thing
+ * the eye lands on. Stable within each half: the policy's own order is what remains inside them.
+ */
+function gradedFirst(conditions: ReadinessCondition[]): ReadinessCondition[] {
+  const graded = conditions.filter((condition) => !(condition.informational ?? false));
+  const informational = conditions.filter((condition) => condition.informational ?? false);
+  return [...graded, ...informational];
 }
 
 export function conditionGroups(assessment: ReadinessAssessment): ConditionGroup[] {
@@ -103,7 +123,7 @@ export function conditionGroups(assessment: ReadinessAssessment): ConditionGroup
       heading: 'Clear',
       detail: 'checked, and imposing no ceiling',
       empty: 'Nothing the policy checked came back clear.',
-      conditions: assessment.clear,
+      conditions: gradedFirst(assessment.clear),
     },
   ];
 }

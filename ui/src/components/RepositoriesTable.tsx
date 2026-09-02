@@ -11,7 +11,7 @@ import { filterTarget } from '@/lib/filter';
 import { figure } from '@/lib/format';
 import { RAG_DOT, RAG_LABEL, RAG_STATES, borderClass, severity, type RAGState } from '@/lib/rag';
 import { filterRepositories, orderRepositories, parseState, stateCounts } from '@/lib/rows';
-import { reverse, sorted, type Direction, type SortValue } from '@/lib/sort';
+import { nextDirection, sorted, type Direction, type SortValue } from '@/lib/sort';
 import type { RepositoryRow } from '@/lib/types';
 import { withWeeks } from '@/lib/weeks';
 
@@ -68,7 +68,7 @@ export function RepositoriesTable({
   const counts = stateCounts(filterRepositories(rows, term, null));
 
   function sort(next: Column) {
-    setDirection(next === column ? reverse(direction) : 'ascending');
+    setDirection(nextDirection(column, next, direction));
     setColumn(next);
   }
 

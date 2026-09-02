@@ -18,8 +18,9 @@ import { withWeeks } from '@/lib/weeks';
  * counts of what was done in ONE repository — pull requests merged, pushes straight to the branch,
  * merges that carried no independent review, and the median size of a change — never a score and
  * never a rate to compare people on. A sortable header would turn the block into a league table by
- * offering to order people by the numbers, which the scope boundaries exclude. Alphabetical is the
- * order for a list ABOUT people, which is what `/contributors` is; this list is about one repository.
+ * offering to order people by the numbers, which the scope boundaries exclude. What `/contributors`
+ * sorts by, from 2026-09-02, is the combination of labels its rows' repositories already carry;
+ * these rows carry no label, only counts of what was done in this one repository.
  *
  * `Blocking occurrences` was dropped here on 2026-09-02: it counted the same occurrences the
  * findings table above already lists per rule and per person, and the space reads better spent on

@@ -8,12 +8,14 @@ import {
   RAG_STATES,
   badgeClass,
   borderClass,
+  combinationKey,
   distributionState,
   labelText,
   severity,
   state,
 } from '@/lib/rag';
 import { sorted } from '@/lib/sort';
+import type { ReadinessLabel } from '@/lib/types';
 
 describe('rag maps', () => {
   it('covers every state in every map, so no lookup needs a fallback', () => {
@@ -79,6 +81,57 @@ describe('severity', () => {
       const ordered = sorted(rows, (row) => severity(row.readiness), direction);
       expect(ordered[1]?.readiness).toBeUndefined();
     }
+  });
+});
+
+describe('combinationKey', () => {
+  const COMBINATIONS: { labels: ReadinessLabel[]; key: string }[] = [
+    { labels: ['green'], key: '1' },
+    { labels: ['green', 'amber'], key: '12' },
+    { labels: ['green', 'amber', 'red'], key: '123' },
+    { labels: ['green', 'red'], key: '13' },
+    { labels: ['amber'], key: '2' },
+    { labels: ['amber', 'red'], key: '23' },
+    { labels: ['red'], key: '3' },
+  ];
+
+  it('gives each of the seven combinations its own key', () => {
+    for (const { labels, key } of COMBINATIONS) {
+      expect(combinationKey(labels)).toBe(key);
+    }
+  });
+
+  it('orders the seven as a reader reads them, all green first and all blocked last', () => {
+    const shuffled = [3, 0, 6, 4, 2, 5, 1].map((index) => COMBINATIONS[index]!);
+    const ordered = sorted(shuffled, (row) => combinationKey(row.labels), 'ascending');
+    expect(ordered.map((row) => row.key)).toEqual(['1', '12', '123', '13', '2', '23', '3']);
+  });
+
+  it('reads the same key whatever order the labels arrive in, and however often', () => {
+    expect(combinationKey(['red', 'green', 'amber'])).toBe('123');
+    expect(combinationKey(['red', 'red', 'green', 'red'])).toBe('13');
+  });
+
+  it('leaves a person with nothing left to label unmeasured, so they sort last both ways', () => {
+    expect(combinationKey([])).toBeUndefined();
+    expect(combinationKey(['cannot_assess'])).toBeUndefined();
+    expect(combinationKey(['cannot_assess', 'cannot_assess'])).toBeUndefined();
+    const rows = [{ labels: [] as ReadinessLabel[] }, { labels: ['red'] as ReadinessLabel[] }];
+    for (const direction of ['ascending', 'descending'] as const) {
+      const ordered = sorted(rows, (row) => combinationKey(row.labels), direction);
+      expect(ordered[1]?.labels).toEqual([]);
+    }
+  });
+
+  it('drops a cannot_assess sitting beside a graded label rather than the row', () => {
+    expect(combinationKey(['green', 'cannot_assess'])).toBe('1');
+  });
+
+  // A service older than 2026-09-02 sends no `labels` key, and `API_URL` is read per request, so the
+  // UI can be pointed at one. Reading it as unlabelled is the whole difference between that list
+  // rendering and `/contributors` throwing.
+  it('reads an absent list as an unlabelled person rather than throwing', () => {
+    expect(combinationKey(undefined)).toBeUndefined();
   });
 });
 

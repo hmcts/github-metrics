@@ -97,6 +97,54 @@ export function severity(label: ReadinessLabel | null | undefined): number | und
 }
 
 /**
+ * The digit each state contributes to a combination key, total over `RAGState` as every map here is.
+ *
+ * `cannot_assess` and `none` contribute nothing and SAY SO rather than being left out: a label added
+ * to `ReadinessLabel` then has to be given a digit or ruled out of the order deliberately, where a
+ * partial map would silently drop it and sort everybody carrying only it as if they had no label.
+ */
+const COMBINATION_DIGIT: Record<RAGState, string | undefined> = {
+  green: '1',
+  amber: '2',
+  red: '3',
+  cannot_assess: undefined,
+  none: undefined,
+};
+
+/**
+ * Where a COMBINATION of labels sorts: the distinct digits of its labels, sorted and concatenated.
+ *
+ * The key is a string of digits rather than a number because the order wanted is the order of the
+ * combinations themselves — `green` before `green, amber` before `green, amber, red` before
+ * `green, red`, which is `"1" < "12" < "123" < "13"`. No arithmetic on a severity gives that: a sum
+ * puts `green, red` (1 + 3) level with `green, amber, red` (1 + 2 + 3) or above it depending on the
+ * weights, a maximum loses `green` entirely, and a minimum loses `red`. Comparing text prefix by
+ * prefix is what reads "all green, then green with a caution, then green with a caution and a block,
+ * then green with a block", and it is the whole reason the digits are sorted before they are joined.
+ *
+ * `cannot_assess` is dropped, as `domain.reported_repositories` drops it from the person's line in
+ * the text report — the labels here are the ones the report would print. A person with nothing left
+ * to label has no place in the order and is unmeasured, which `sorted` puts last in both directions:
+ * "who is all green" and "who is blocked" are both questions about the people with a label.
+ *
+ * An ABSENT list reads as an empty one. A service of this version defaults `ActorRow.labels` to `()`
+ * and serves it empty rather than omitting it, so the key can only be missing against a
+ * `metrics-serve` older than 2026-09-02 — which `API_URL` being read per request allows. Such a
+ * person is unlabelled, which is the answer the empty case already gives; iterating the absent list
+ * instead would throw and take the page with it.
+ */
+export function combinationKey(labels: readonly ReadinessLabel[] | undefined): string | undefined {
+  const digits = new Set<string>();
+  for (const label of labels ?? []) {
+    const digit = COMBINATION_DIGIT[label];
+    if (digit !== undefined) {
+      digits.add(digit);
+    }
+  }
+  return digits.size === 0 ? undefined : [...digits].sort().join('');
+}
+
+/**
  * Resolve a key from a label DISTRIBUTION to a state.
  *
  * The service counts ungraded repositories under `not_assessed`, its own key rather than a label, so

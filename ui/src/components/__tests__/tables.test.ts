@@ -3,8 +3,9 @@
  *
  * `RepositoriesTable` is not here: it reads its filters from the router, which this renderer has no
  * context for, so its decidable part is tested as pure functions in `lib/__tests__/rows.test.ts`
- * instead. What these assert is what the guardrails are about — a contributor list with no sortable
- * header and no metric column, and team cards carrying label COUNTS and no combined verdict.
+ * instead. What these assert is what the guardrails are about — a contributor list ordered by the
+ * labels its rows already carry and by nothing else, a team's own people list with no sortable header
+ * at all, and team cards carrying label COUNTS and no combined verdict.
  */
 
 import { createElement } from 'react';
@@ -18,8 +19,10 @@ describe('ActorsTable', () => {
   const markup = renderToStaticMarkup(
     createElement(ActorsTable, {
       rows: [
-        { login: 'alice', repositories: 3 },
-        { login: 'bob', repositories: 1 },
+        { login: 'alice', repositories: 3, labels: ['red'] },
+        { login: 'bob', repositories: 1, labels: [] },
+        { login: 'carol', repositories: 2, labels: ['green', 'amber'] },
+        { login: 'dan', repositories: 4, labels: ['green'] },
       ],
       weeks: 8,
     }),
@@ -31,14 +34,66 @@ describe('ActorsTable', () => {
     expect(markup).toContain('/contributors/bob?weeks=8');
   });
 
-  it('offers no way to order people: no sortable header, no metric column', () => {
-    expect(markup).not.toContain('<button');
-    expect(markup).not.toContain('aria-sort');
-    expect(markup).toContain('Repositories');
+  it('heads three columns, Login then Repositories then Readiness', () => {
+    expect(markup.indexOf('Login')).toBeLessThan(markup.indexOf('Repositories'));
+    expect(markup.indexOf('Repositories')).toBeLessThan(markup.indexOf('Readiness'));
   });
 
-  it('keeps the order it was given rather than imposing one of its own', () => {
+  // Per row rather than over the whole table: a cell handed the wrong person's labels, or every
+  // person's labels, still puts each of these words somewhere in the markup.
+  function cells(login: string): string {
+    return markup.split('<tr').find((row) => row.includes(`>${login}<`)) ?? '';
+  }
+
+  it('carries a badge for every label a person’s repositories hold, and none they do not', () => {
+    expect(cells('carol')).toContain('Ready');
+    expect(cells('carol')).toContain('Caution');
+    expect(cells('carol')).not.toContain('Blocked');
+    expect(cells('alice')).toContain('Blocked');
+    expect(cells('alice')).not.toContain('Ready');
+    expect(markup).toContain('justify-end');
+  });
+
+  // The repositories behind an empty list were graded and came back unreadable, so the cell says so
+  // in the report's own word rather than dashing, which would read as nothing having been checked.
+  it('badges a person with nothing left to label as cannot assess', () => {
+    expect(cells('bob')).toContain('Cannot assess');
+    expect(cells('bob')).not.toContain('>-<');
+    expect(markup).not.toContain('Not assessed');
+  });
+
+  it('opens on readiness ascending: all green first, then a caution, then a block', () => {
+    expect(markup.indexOf('dan')).toBeLessThan(markup.indexOf('carol'));
+    expect(markup.indexOf('carol')).toBeLessThan(markup.indexOf('alice'));
+  });
+
+  // Only the opening render is decidable here: the direction is component state, and `sorted` is
+  // what puts an unmeasured cell last in BOTH directions, asserted over `combinationKey` in
+  // `lib/__tests__/rag.test.ts` and over the reversal itself in `lib/__tests__/sort.test.ts`.
+  it('puts the person with no label last on the render the list opens with', () => {
     expect(markup.indexOf('alice')).toBeLessThan(markup.indexOf('bob'));
+  });
+
+  it('ranks nobody: the headers order labels and counts, and state no verdict', () => {
+    expect(markup).not.toMatch(/score|rank|verdict|average|%/i);
+  });
+
+  it('contains no emoji: a label is a word and a colour', () => {
+    expect(markup).not.toMatch(/\p{Extended_Pictographic}/u);
+  });
+
+  // Against a `metrics-serve` older than 2026-09-02 the field is absent, not empty, and `API_URL` is
+  // read per request so a deployment can be pointed at one. The list must render unlabelled.
+  it('renders a row a service too old to send labels sent, rather than failing', () => {
+    const older = renderToStaticMarkup(
+      createElement(ActorsTable, {
+        rows: [{ login: 'erin', repositories: 2 }],
+        weeks: 8,
+      }),
+    );
+    expect(older).toContain('>erin<');
+    expect(older).toContain('Cannot assess');
+    expect(older).not.toContain('Not assessed');
   });
 });
 

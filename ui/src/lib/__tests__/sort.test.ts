@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compare, reverse, sorted, type SortValue } from '@/lib/sort';
+import { compare, nextDirection, reverse, sorted, type SortValue } from '@/lib/sort';
 
 interface Row {
   repository: string;
@@ -21,6 +21,25 @@ describe('reverse', () => {
   it('flips a direction', () => {
     expect(reverse('ascending')).toBe('descending');
     expect(reverse('descending')).toBe('ascending');
+  });
+});
+
+describe('nextDirection', () => {
+  const readiness = { key: 'readiness' };
+  const login = { key: 'login' };
+
+  it('reverses the column already sorted on, so a second click on it turns it round', () => {
+    expect(nextDirection(readiness, readiness, 'ascending')).toBe('descending');
+    expect(nextDirection(readiness, readiness, 'descending')).toBe('ascending');
+  });
+
+  it('opens a different column ascending rather than carrying the last direction over', () => {
+    expect(nextDirection(readiness, login, 'descending')).toBe('ascending');
+    expect(nextDirection(readiness, login, 'ascending')).toBe('ascending');
+  });
+
+  it('opens the first click ascending where no column is sorted on yet', () => {
+    expect(nextDirection(null, login, 'descending')).toBe('ascending');
   });
 });
 
