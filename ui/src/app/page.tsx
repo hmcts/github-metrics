@@ -6,7 +6,7 @@ import { FilterSearchBox } from '@/components/FilterSearchBox';
 import { MetricCard } from '@/components/MetricCard';
 import { NavWeekSelector } from '@/components/NavWeekSelector';
 import { RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTable';
-import { Section } from '@/components/Section';
+import { Panel, Section } from '@/components/Section';
 import { SummaryPieChart } from '@/components/charts/SummaryPieChart';
 import { TeamsList } from '@/components/TeamsList';
 import { getActors, getOverview, getRepositories, getTeams, getWindows } from '@/lib/api';
@@ -78,28 +78,32 @@ export default async function OverviewPage({
         </div>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <MetricCard
-          label="Repositories"
-          value={overview.repositories}
-          detail={
-            overview.unavailable > 0
-              ? `${overview.repositories - overview.unavailable} reported`
-              : 'all reported'
-          }
-        />
-        <MetricCard label="Teams" value={overview.teams} />
-        <MetricCard
-          label="Actors"
-          value={overview.actors}
-          detail="contributed to a reported repository"
-        />
-        <MetricCard
-          label="Merged pull requests"
-          value={overview.merged_pull_requests}
-          detail={`${count(overview.direct_commits, 'direct commit', 'direct commits')} besides`}
-        />
-      </div>
+      {/* The estate's headline figures share the panel every section is drawn on: the cards
+          themselves are flat now, and four unbounded figures would float on the page background. */}
+      <Panel>
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 p-4">
+          <MetricCard
+            label="Repositories"
+            value={overview.repositories}
+            detail={
+              overview.unavailable > 0
+                ? `${overview.repositories - overview.unavailable} reported`
+                : 'all reported'
+            }
+          />
+          <MetricCard label="Teams" value={overview.teams} />
+          <MetricCard
+            label="Contributors"
+            value={overview.actors}
+            detail="contributed to a reported repository"
+          />
+          <MetricCard
+            label="Merged pull requests"
+            value={overview.merged_pull_requests}
+            detail={`${count(overview.direct_commits, 'direct commit', 'direct commits')} besides`}
+          />
+        </div>
+      </Panel>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <SummaryPieChart
@@ -128,8 +132,10 @@ export default async function OverviewPage({
         </Section>
       </div>
 
+      {/* The id stays `actors`: the navigation links to it and so does anything else already
+          bookmarked. The heading reads CONTRIBUTORS, which is what the list is of. */}
       <div id="actors">
-        <Section heading="Actors" detail="alphabetical">
+        <Section heading="Contributors" detail="alphabetical">
           {actors.length === 0 ? (
             <EmptyState
               message="Nobody contributed to a reported repository at this span."

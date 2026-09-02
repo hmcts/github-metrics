@@ -14,14 +14,26 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import { ActorRepositoriesTable } from '@/components/ActorRepositoriesTable';
+import { ActorsTable } from '@/components/ActorsTable';
+import { AssessmentSection } from '@/components/AssessmentSection';
+import { ContributorsTable } from '@/components/ContributorsTable';
+import { DefinitionList } from '@/components/DefinitionList';
 import { EmptyState } from '@/components/EmptyState';
 import { EntityHeader } from '@/components/EntityHeader';
+import { FindingsTable } from '@/components/FindingsTable';
 import { InfoTooltip } from '@/components/InfoTooltip';
 import { MetricCard } from '@/components/MetricCard';
+import { Navigation } from '@/components/Navigation';
 import { RAGCard, RAGLabel, RAGRow } from '@/components/RAGCard';
 import { Section } from '@/components/Section';
 import { SortHeader } from '@/components/SortHeader';
+import { TeamActorsTable } from '@/components/TeamActorsTable';
+import { TeamsList } from '@/components/TeamsList';
 import { RAG_BORDER } from '@/lib/rag';
+import { people } from '@/lib/team';
+import { TONES, TONE_BORDER, TONE_VALUE } from '@/lib/tone';
+import type { ReadinessAssessment } from '@/lib/types';
 
 describe('MetricCard', () => {
   it('states the figure, its name, and what it was measured over', () => {
@@ -38,12 +50,42 @@ describe('MetricCard', () => {
     expect(markup).toContain('>-<');
   });
 
-  it('grades nothing: the card carries one border whatever the figure is', () => {
+  it('draws no box of its own: the section it sits in is the box', () => {
+    const markup = renderToStaticMarkup(createElement(MetricCard, { label: 'Open', value: 0 }));
+    expect(markup).not.toContain('border');
+    expect(markup).not.toContain('bg-slate');
+  });
+
+  // The card graded nothing at all until 2026-09-02, when the user reversed that rule; these two
+  // cases are what replaced it. The threshold behind a tone is `lib/tone.ts`, tested there — what a
+  // card owes the reader is that an ungraded figure stays uncoloured and a graded one colours only
+  // itself, so a page with a few red figures on it still reads as one surface.
+  it('grades nothing it was given no tone for', () => {
     const low = renderToStaticMarkup(createElement(MetricCard, { label: 'Open', value: 0 }));
     const high = renderToStaticMarkup(createElement(MetricCard, { label: 'Open', value: 900 }));
-    expect(low).toContain('border-slate-800');
-    expect(high).toContain('border-slate-800');
-    expect(high).not.toMatch(/border-(red|amber)-/);
+    expect(low.replace('>0<', '>900<')).toEqual(high);
+    expect(high).not.toMatch(/(border|text|bg)-(red|amber|green)-/);
+    expect(high).not.toContain('rag-');
+    expect(high).toContain(TONE_VALUE.neutral);
+  });
+
+  it('colours the value it was given a tone for, and nothing else on the card', () => {
+    const markup = renderToStaticMarkup(
+      createElement(MetricCard, { label: 'Direct commits', value: 214, detail: 'of 300 merges', tone: 'bad' }),
+    );
+    expect(markup).toContain(`tabular-nums ${TONE_VALUE.bad}`);
+    // The name over the figure and the line under it stay slate: one figure is coloured per card.
+    expect(markup).toContain('text-xs text-slate-400 uppercase');
+    expect(markup).toContain('text-xs text-slate-500 mt-1');
+    expect(markup.match(/rag-/g)).toHaveLength(1);
+    expect(markup).not.toContain('border');
+  });
+
+  it('reads each tone through the one map, so a card cannot invent a colour', () => {
+    for (const tone of TONES) {
+      const markup = renderToStaticMarkup(createElement(MetricCard, { label: 'Coverage', value: '82%', tone }));
+      expect(markup).toContain(TONE_VALUE[tone]);
+    }
   });
 });
 
@@ -66,11 +108,89 @@ describe('Section', () => {
     expect(markup).toContain('rows');
   });
 
+  it('bounds the whole section in one panel, heading included', () => {
+    const markup = renderToStaticMarkup(
+      createElement(Section, { heading: 'Merge gate' }, createElement('p', null, 'rows')),
+    );
+    // The panel opens before the heading and the heading row is divided from the body, so the
+    // reader sees one surface per section rather than a heading floating above loose cards.
+    expect(markup).toMatch(
+      /^<section class="bg-slate-900\/40 border border-slate-800 rounded-lg">.*Merge gate/,
+    );
+    expect(markup).toContain('border-b border-slate-800');
+    expect(markup).toMatch(/<div class="p-4"><p>rows<\/p><\/div><\/section>$/);
+  });
+
   it('omits the detail and control rows when there are none', () => {
     const markup = renderToStaticMarkup(
       createElement(Section, { heading: 'Findings' }, createElement('p', null, 'rows')),
     );
     expect(markup).not.toContain('ml-auto');
+  });
+
+  it('draws no body at all for a section with nothing under its heading', () => {
+    const markup = renderToStaticMarkup(createElement(Section, { heading: 'Findings' }));
+    expect(markup).toContain('Findings');
+    expect(markup).not.toContain('class="p-4"');
+  });
+});
+
+describe('DefinitionList', () => {
+  it('states each label against its own answer, with the detail line under the pair', () => {
+    const markup = renderToStaticMarkup(
+      createElement(DefinitionList, {
+        values: [
+          { label: 'Protected', value: 'yes' },
+          { label: 'dependabot', value: '12', detail: 'critical 0 · high 2' },
+        ],
+      }),
+    );
+    expect(markup).toContain('<dt class="text-sm text-slate-400">Protected</dt>');
+    expect(markup).toContain('>yes<');
+    expect(markup).toContain('critical 0 · high 2');
+    expect(markup).toContain('divide-y divide-slate-800/50');
+  });
+
+  it('colours the answer it was given a tone for, and nothing else on the row', () => {
+    const markup = renderToStaticMarkup(
+      createElement(DefinitionList, {
+        values: [{ label: 'secret-scanning', value: '3', detail: 'no severity is reported', tone: 'bad' }],
+      }),
+    );
+    expect(markup).toContain(TONE_VALUE.bad);
+    // The label and the sentence under it stay slate: one value is coloured per row.
+    expect(markup).toContain('<dt class="text-sm text-slate-400">secret-scanning</dt>');
+    expect(markup).toContain('class="w-full text-xs text-slate-500"');
+    expect(markup.match(/rag-/g)).toHaveLength(1);
+  });
+
+  it('sets a count in tabular figures and an answer in words in neither', () => {
+    const counted = renderToStaticMarkup(
+      createElement(DefinitionList, { values: [{ label: 'Approving reviews required', value: '2' }] }),
+    );
+    const worded = renderToStaticMarkup(
+      createElement(DefinitionList, { values: [{ label: 'Protected', value: 'not disclosed' }] }),
+    );
+    // The dash included: a column of counts with one absent value keeps its digits aligned.
+    const absent = renderToStaticMarkup(
+      createElement(DefinitionList, { values: [{ label: 'code-scanning', value: '-' }] }),
+    );
+    expect(counted).toContain('tabular-nums');
+    expect(absent).toContain('tabular-nums');
+    expect(worded).not.toContain('tabular-nums');
+  });
+
+  it('renders nothing at all for a block with no rows, rather than an empty list', () => {
+    expect(renderToStaticMarkup(createElement(DefinitionList, { values: [] }))).toEqual('');
+  });
+
+  it('reads each tone through the one map, so a row cannot invent a colour', () => {
+    for (const tone of TONES) {
+      const markup = renderToStaticMarkup(
+        createElement(DefinitionList, { values: [{ label: 'Coverage', value: '82%', tone }] }),
+      );
+      expect(markup).toContain(TONE_VALUE[tone]);
+    }
   });
 });
 
@@ -127,6 +247,65 @@ describe('RAG presentation', () => {
     expect(markup).toContain('merge gate');
     expect(markup).toContain('default branch is unprotected');
   });
+
+  it('keeps the label’s own bar on a blocking row, whatever tone it is given', () => {
+    const markup = renderToStaticMarkup(
+      createElement(RAGRow, {
+        label: 'amber',
+        tone: 'good',
+        condition: 'approval-coverage-below-target',
+        detail: 'approval-coverage is 50% (1 of 2)',
+      }),
+    );
+    expect(markup).toContain(RAG_BORDER.amber);
+    expect(markup).not.toContain(TONE_BORDER.good);
+  });
+});
+
+describe('AssessmentSection', () => {
+  /** An assessment whose clear section holds one graded condition and one merely reported. */
+  const assessment: ReadinessAssessment = {
+    label: 'green',
+    blocking: [],
+    caution: [
+      {
+        condition: 'status-checks-not-required',
+        detail: 'status checks required before merging to master: 0',
+      },
+    ],
+    clear: [
+      {
+        condition: 'independent-review-coverage-at-target',
+        detail: 'independent-review-coverage is 100% (10 of 10)',
+        informational: false,
+      },
+      {
+        condition: 'linear-history-not-required',
+        detail: 'merging to master does not require a linear history, which does not bear on the label',
+        informational: true,
+      },
+    ],
+  };
+
+  /** Return the one row markup naming a condition, so a row is read apart from its neighbours. */
+  function row(condition: string): string {
+    const markup = renderToStaticMarkup(createElement(AssessmentSection, { assessment }));
+    const rows = markup.split('<div class="bg-slate-900/50');
+    return rows.find((candidate) => candidate.includes(condition)) ?? '';
+  }
+
+  it('passes a graded clear condition and cautions the section above it', () => {
+    expect(row('independent-review-coverage-at-target')).toContain(TONE_BORDER.good);
+    expect(row('status-checks-not-required')).toContain(TONE_BORDER.warn);
+  });
+
+  it('leaves a condition the policy reported without judging uncoloured', () => {
+    const reported = row('linear-history-not-required');
+    expect(reported).toContain(TONE_BORDER.neutral);
+    expect(reported).not.toMatch(/rag-(green|amber|red)/);
+    // The sentence is still there: the row states what was checked, it just grades nothing.
+    expect(reported).toContain('does not require a linear history');
+  });
 });
 
 describe('EntityHeader', () => {
@@ -146,11 +325,12 @@ describe('EntityHeader', () => {
     expect(markup).toContain('/teams/platform?weeks=4');
   });
 
-  it('grades nothing for an actor or a team, and shows no trail of how you arrived', () => {
+  it('grades nothing for a contributor or a team, and shows no trail of how you arrived', () => {
     const markup = renderToStaticMarkup(
-      createElement(EntityHeader, { kind: 'actor', name: 'octocat' }),
+      createElement(EntityHeader, { kind: 'contributor', name: 'octocat' }),
     );
     expect(markup).toContain('octocat');
+    expect(markup).toContain('contributor');
     expect(markup).not.toContain('border-l-4');
     expect(markup).not.toContain('Not assessed');
     expect(markup).not.toContain('nav');
@@ -211,8 +391,47 @@ describe('the shared vocabulary', () => {
       ),
       renderToStaticMarkup(createElement(EntityHeader, { kind: 'team', name: 'platform' })),
       renderToStaticMarkup(createElement(MetricCard, { label: 'Merged', value: 1 })),
+      renderToStaticMarkup(
+        createElement(DefinitionList, { values: [{ label: 'Protected', value: 'yes', tone: 'good' }] }),
+      ),
       renderToStaticMarkup(createElement(EmptyState, { message: 'Nothing here.' })),
     ].join('');
     expect(markup).not.toMatch(/\p{Extended_Pictographic}/u);
+  });
+
+  /**
+   * The word for a person is CONTRIBUTOR, from 2026-09-02 at the user's instruction.
+   *
+   * Every component that names people at all is rendered here together, because the rename is only
+   * true if it is true everywhere: one heading still reading "Actors" is the whole point of the
+   * change missed. Links are stripped before matching — `/actors/…`, `#actors` and the contract's
+   * own field names keep the old spelling deliberately, and renaming the routes is a separate
+   * change — so what is asserted is the prose, not the plumbing.
+   */
+  it('calls a person a contributor everywhere the reader can see one', () => {
+    const rendered = [
+      renderToStaticMarkup(createElement(Navigation)),
+      renderToStaticMarkup(createElement(EntityHeader, { kind: 'contributor', name: 'octocat' })),
+      renderToStaticMarkup(createElement(FindingsTable, { findings: [], weeks: 4 })),
+      renderToStaticMarkup(createElement(ContributorsTable, { rows: [], weeks: 4 })),
+      renderToStaticMarkup(createElement(ActorsTable, { rows: [], weeks: 4 })),
+      renderToStaticMarkup(createElement(TeamActorsTable, { rows: [], weeks: 4 })),
+      renderToStaticMarkup(
+        createElement(ActorRepositoriesTable, { rows: [], teams: {}, weeks: 4 }),
+      ),
+      renderToStaticMarkup(
+        createElement(TeamsList, {
+          rows: [{ team: 'platform', repositories: 4, unavailable: 0, actors: 6, labels: {} }],
+          weeks: 4,
+        }),
+      ),
+      people({ team: 'platform', repositories: [], actors: [], unavailable: 0, labels: {} }),
+    ].join('');
+    const prose = rendered.replace(/href="[^"]*"/g, '');
+
+    expect(prose).not.toMatch(/actor/i);
+    expect(prose).toContain('Contributor');
+    // The links the prose was measured without are still spelled the service's way.
+    expect(rendered).toContain('href="/#actors"');
   });
 });

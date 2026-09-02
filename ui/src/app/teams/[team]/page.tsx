@@ -21,7 +21,7 @@ import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
  * The label distribution is a count per label and stops there. There is no combined team label, no
  * team score, and no comparison against another team anywhere on this page — the reversal of
  * 2026-09-01 permitted per-team COUNTS for display and nothing beyond them (architecture.md, "Scope
- * boundaries"). The actor list is alphabetical for the same reason the overview's is.
+ * boundaries"). The contributor list is alphabetical for the same reason the overview's is.
  *
  * The repositories table is the shared component, handed this team's rows: a team page and the
  * overview then agree about what a repository row says, and the filter and readiness chips work here
@@ -89,7 +89,7 @@ export default async function TeamPage({
       </Section>
 
       <Section
-        heading="Actors"
+        heading="Contributors"
         detail="alphabetical, counted within this team’s repositories"
       >
         {detail.actors.length === 0 ? (

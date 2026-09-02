@@ -4,16 +4,17 @@ import { notFound } from 'next/navigation';
 import { AssessmentSection } from '@/components/AssessmentSection';
 import { CollectionNotice } from '@/components/CollectionNotice';
 import { ContributorsTable } from '@/components/ContributorsTable';
+import { DefinitionList } from '@/components/DefinitionList';
 import { EmptyState } from '@/components/EmptyState';
 import { EntityHeader } from '@/components/EntityHeader';
 import { FindingsTable } from '@/components/FindingsTable';
 import { MetricCard } from '@/components/MetricCard';
 import { MetricsGrid } from '@/components/MetricsGrid';
 import { NavWeekSelector } from '@/components/NavWeekSelector';
-import { Section } from '@/components/Section';
+import { Panel, Section } from '@/components/Section';
 import { TrendSection } from '@/components/TrendSection';
 import { getRepository, getTrend, getWindows, isNotFound } from '@/lib/api';
-import { count, instant, span } from '@/lib/format';
+import { instant, span } from '@/lib/format';
 import { hasPeriods } from '@/lib/trend';
 import {
   codeownersCard,
@@ -28,6 +29,7 @@ import {
   sonarRows,
   type LabelledValue,
 } from '@/lib/repository';
+import { directCommitTone } from '@/lib/tone';
 import type { RepositoryDetail, SonarReport } from '@/lib/types';
 import { WEEKS_COOKIE, resolveWeeks, withWeeks, type SearchValue } from '@/lib/weeks';
 
@@ -77,11 +79,9 @@ export default async function RepositoryPage({
             {detail.team}
           </Link>
           {evidence ? <span>{span(evidence.starts_at, evidence.ends_at)}</span> : null}
-          {evidence ? (
-            <span className="text-slate-500">
-              {count(evidence.provenance.intervals_fetched, 'interval', 'intervals')} fetched
-            </span>
-          ) : null}
+          {/* provenance.intervals_fetched is deliberately not rendered: how many intervals the
+              collector had to fetch rather than reuse is a caching detail, and "0 intervals fetched"
+              reads to a reader as missing data. The field stays in the contract. */}
         </>
       }
     />
@@ -121,26 +121,37 @@ export default async function RepositoryPage({
       <CollectionNotice windows={windows} />
       {header}
 
-      <ValueCards
-        values={[
-          {
-            label: 'Merges reported',
-            value: String(evidence.cohort.reported),
-            detail: `${evidence.cohort.merged} merged in the span`,
-          },
-          {
-            label: 'Merges excluded',
-            value: String(excludedMerges(evidence.cohort)),
-            detail: excludedDetail(evidence.cohort),
-          },
-          {
-            label: 'Direct commits',
-            value: String(evidence.cohort.direct_commits),
-            detail: 'landed on the default branch without a pull request',
-          },
-          codeownersCard(evidence.codeowners),
-        ]}
-      />
+      {/* The cohort is the page's headline figure rather than a section of it, so it carries the
+          panel without a heading: the cards are flat, and four unbounded figures would float. */}
+      <Panel>
+        <div className="p-4">
+          <ValueCards
+            values={[
+              {
+                label: 'Merges reported',
+                value: String(evidence.cohort.reported),
+                detail: `${evidence.cohort.merged} merged in the span`,
+                // Throughput, and uncoloured on purpose: a busy repository is not a good one.
+                tone: 'neutral',
+              },
+              {
+                label: 'Merges excluded',
+                value: String(excludedMerges(evidence.cohort)),
+                detail: excludedDetail(evidence.cohort),
+                // Excluding Dependabot's merges is the cohort working, not a shortfall in it.
+                tone: 'neutral',
+              },
+              {
+                label: 'Direct commits',
+                value: String(evidence.cohort.direct_commits),
+                detail: 'landed on the default branch without a pull request',
+                tone: directCommitTone(evidence.cohort.direct_commits),
+              },
+              codeownersCard(evidence.codeowners),
+            ]}
+          />
+        </div>
+      </Panel>
 
       {evidence.assessment ? (
         <AssessmentSection assessment={evidence.assessment} />
@@ -160,7 +171,7 @@ export default async function RepositoryPage({
             detail={evidence.merge_gate.detail}
           />
         ) : (
-          <ValueCards values={mergeGateRows(evidence.merge_gate.gate)} />
+          <DefinitionList values={mergeGateRows(evidence.merge_gate.gate)} />
         )}
       </Section>
 
@@ -182,7 +193,7 @@ export default async function RepositoryPage({
             detail={evidence.security.detail}
           />
         ) : (
-          <ValueCards values={securityCards(alerts)} />
+          <DefinitionList values={securityCards(alerts)} />
         )}
       </Section>
 
@@ -190,7 +201,7 @@ export default async function RepositoryPage({
         {evidence.maintenance.windows.length === 0 ? (
           <EmptyState message="No maintenance window was checked for this repository." />
         ) : (
-          <ValueCards values={maintenanceRows(evidence.maintenance)} />
+          <DefinitionList values={maintenanceRows(evidence.maintenance)} />
         )}
       </Section>
 
@@ -202,6 +213,7 @@ export default async function RepositoryPage({
         <MetricsGrid
           summaries={evidence.metrics}
           empty="No behaviour metric was computed for this repository at this span."
+          assessment={evidence.assessment}
         />
       </Section>
 
@@ -253,12 +265,28 @@ function sonarMeasures(report: SonarReport): LabelledValue[] {
   return report.measures === undefined ? [] : sonarRows(report.measures);
 }
 
-/** A row of labelled figures: the one card shape every block on this page is drawn with. */
+/**
+ * A row of labelled figures, for the blocks whose figures are what the reader came for.
+ *
+ * The cohort row, the four open pull-request counts and the Sonar measures — a number each, worth
+ * headline size. The merge gate, the maintenance windows and the alert families are drawn as
+ * `DefinitionList`s instead: they are settings and their answers, and eighteen two-word answers
+ * across a four-across grid read as a field of cards rather than as three blocks.
+ *
+ * The tone rides on the row rather than being decided here, so the threshold behind a colour is in
+ * `lib/tone.ts` where a test can reach it and this stays the page drawing what it was handed.
+ */
 function ValueCards({ values }: { values: readonly LabelledValue[] }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
       {values.map((value) => (
-        <MetricCard key={value.label} label={value.label} value={value.value} detail={value.detail} />
+        <MetricCard
+          key={value.label}
+          label={value.label}
+          value={value.value}
+          detail={value.detail}
+          tone={value.tone}
+        />
       ))}
     </div>
   );

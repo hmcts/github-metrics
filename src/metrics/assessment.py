@@ -15,6 +15,10 @@ is configured or NOT, because it bears on none of the four decision questions an
 was leaving three collected rules out of the assessment entirely. Decision 1 in architecture.md is
 explicit that a check which is never reported cannot be argued with. A `clear` entry has never
 implied approval, so nothing about how a label is reached changes.
+
+Those entries are marked `informational` on the condition since 2026-09-02, so a renderer can say
+what the section has always meant: the three neutral rules and a sufficient cohort were reported and
+not judged. The flag decides no label and adds no line to the text report.
 """
 
 from dataclasses import dataclass
@@ -92,9 +96,16 @@ class ReadinessPolicy:
         """Report one condition that is not disqualifying but that a reader should weigh."""
         return Judgement(Outcome.CAUTION, ReadinessCondition(condition=condition, detail=detail))
 
-    def clear(self, condition: str, detail: str) -> Judgement:
-        """Report one condition that was checked and did not hold the label back."""
-        return Judgement(Outcome.CLEAR, ReadinessCondition(condition=condition, detail=detail))
+    def clear(self, condition: str, detail: str, *, informational: bool = False) -> Judgement:
+        """Report one condition that was checked and did not hold the label back.
+
+        `informational` says the condition was reported without being judged, which is a different
+        thing from having been satisfied — see `ReadinessCondition`.
+        """
+        return Judgement(
+            Outcome.CLEAR,
+            ReadinessCondition(condition=condition, detail=detail, informational=informational),
+        )
 
     def neutral(self, condition: str, detail: str) -> Judgement:
         """Report one rule that was checked and imposes no ceiling in either of its states.
@@ -103,8 +114,15 @@ class ReadinessPolicy:
         trace to none of the four decision questions, so an absent one is not a shortfall and must
         not be dressed as a caution. The detail says so, since a reader meeting an absent rule under
         `clear` would otherwise have to work out why it is there.
+
+        Informational by definition: this method IS the policy declining to judge, so the flag and
+        the sentence in the detail are one statement rather than two that could disagree.
         """
-        return self.clear(condition, f"{detail}, which does not bear on the readiness label")
+        return self.clear(
+            condition,
+            f"{detail}, which does not bear on the readiness label",
+            informational=True,
+        )
 
     def section(self, judgements: tuple[Judgement, ...], outcome: Outcome) -> tuple[ReadinessCondition, ...]:
         """Return the conditions reported in one section of the assessment."""
@@ -300,9 +318,12 @@ class ReadinessPolicy:
                 ReadinessLabel.CANNOT_ASSESS,
                 f"{measured}, below the minimum of {minimum}, so no behavioural condition was graded",
             )
+        # Informational: a cohort large enough to grade is a PRECONDITION for grading rather than a
+        # practice that went well. A repository is not better governed for having merged more.
         return self.clear(
             "sufficient-merges",
             f"{measured}, at or above the minimum of {minimum}",
+            informational=True,
         )
 
     def measured_rate(self, identifier: str, observation: RateObservation) -> tuple[float, str] | None:

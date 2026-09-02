@@ -6,8 +6,13 @@ from pathlib import Path
 import pytest
 
 from metrics.assessment import ReadinessPolicy, readiness_policy
+from metrics.behaviour_metrics.approval_coverage import ApprovalCoverage
+from metrics.behaviour_metrics.checks_passing_at_merge import ChecksPassingAtMerge
 from metrics.behaviour_metrics.independent_review_coverage import IndependentReviewCoverage
+from metrics.behaviour_metrics.merge_cycle_time import MergeCycleTime
 from metrics.behaviour_metrics.pull_request_size import PullRequestSize
+from metrics.behaviour_metrics.review_depth import ReviewDepth
+from metrics.behaviour_metrics.time_to_first_review import TimeToFirstReview
 from metrics.config import (
     AssessmentConfiguration,
     Configuration,
@@ -367,6 +372,108 @@ def test_a_neutral_rule_is_reported_clear_whether_it_is_configured_or_not(
     assert assessment.caution == ()
     assert condition in tuple(item.condition for item in assessment.clear)
     assert detail(assessment, condition) == f"{expected}, which does not bear on the readiness label"
+
+
+def test_a_rule_the_policy_declines_to_judge_is_marked_informational() -> None:
+    """Mark what was reported without being judged, so a renderer need not infer it from a name.
+
+    Every condition `neutral()` produces, and nothing else in the clear section: `clear` means
+    "checked, and did not hold the label back", and a rule nobody grades sitting beside a check that
+    passed reads as approval the policy never gave.
+    """
+    assessment = policy().assess(compliant_facts(), gate())
+    informational = {condition.condition for condition in assessment.clear if condition.informational}
+
+    assert informational == {
+        "branch-deletion-restricted",
+        "linear-history-required",
+        "branch-names-restricted",
+        "sufficient-merges",
+    }
+
+
+def test_an_absent_neutral_rule_is_informational_in_that_state_too() -> None:
+    """Carry the flag whichever way the three neutral rules were observed, as their detail does."""
+    report = gate(restricts_deletions=False, requires_linear_history=False, restricts_branch_names=False)
+    assessment = policy().assess(compliant_facts(), report)
+    informational = {condition.condition for condition in assessment.clear if condition.informational}
+
+    assert informational == {
+        "branch-deletion-not-restricted",
+        "linear-history-not-required",
+        "branch-names-not-restricted",
+        "sufficient-merges",
+    }
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "branch-protected",
+        "pull-request-review-required",
+        "status-checks-required",
+        "independent-review-coverage-at-target",
+        "approval-coverage-at-target",
+        "substantial-changes-reviewed",
+    ],
+)
+def test_a_graded_clear_condition_is_not_informational(condition: str) -> None:
+    """Keep the flag off a check that was actually satisfied: it is the thing green is for."""
+    assessment = policy().assess(compliant_facts(), gate())
+    graded = next(item for item in assessment.clear if item.condition == condition)
+
+    assert graded.informational is False
+
+
+def test_every_graded_metric_condition_is_spelled_with_one_of_four_suffixes() -> None:
+    """Pin the condition names a dashboard reads a behaviour metric card's colour off.
+
+    `ui/src/lib/metrics.ts` finds the condition that graded a metric by appending `-at-target`,
+    `-below-target`, `-above-target` and `-not-observed` to the metric's own identifier, because
+    those are the only spellings `rate`, `review_depth` and `distribution` produce. A fifth spelling
+    here, or a rename of one of the four, would leave every card grey with both suites green — the
+    UI's tests read hand-written fixtures and cannot see this end of the agreement — so it is
+    asserted rather than assumed.
+    """
+    suffixes = {"at-target", "below-target", "above-target", "not-observed"}
+    graded_metrics = (
+        IndependentReviewCoverage,
+        ApprovalCoverage,
+        ChecksPassingAtMerge,
+        ReviewDepth,
+        PullRequestSize,
+        MergeCycleTime,
+        TimeToFirstReview,
+    )
+    cohorts = (
+        # Exemplary: every graded metric sitting at its target.
+        compliant_facts(),
+        # Nothing merged through a pull request, so the flow signals have no sample to place.
+        facts(direct_commits=tuple(direct_commit(number) for number in range(1, 11))),
+        # Nothing reviewed, which puts both coverage rates below their target.
+        facts(*(pull_request(number, reviewed=False, substantial=False) for number in range(1, 11))),
+        # Changes far past the size maximum, which is the distribution form of the same shortfall.
+        facts(*(pull_request(number, reviewed=True, lines=5000) for number in range(1, 11))),
+    )
+    conditions = tuple(condition for cohort in cohorts for condition in reported(policy().assess(cohort, gate())))
+
+    spellings: set[str] = set()
+    for metric in graded_metrics:
+        named = {condition for condition in conditions if condition.startswith(f"{metric.identifier}-")}
+        assert named, f"{metric.identifier} was graded under no condition"
+        spellings |= {condition.removeprefix(f"{metric.identifier}-") for condition in named}
+
+    assert spellings == suffixes
+
+
+def test_the_informational_flag_moves_no_label_and_no_section() -> None:
+    """Confirm the flag is presentation: the same conditions, in the same sections, as before it."""
+    assessment = policy().assess(compliant_facts(), gate())
+
+    assert assessment.label is ReadinessLabel.GREEN
+    assert assessment.blocking == ()
+    assert assessment.caution == ()
+    assert all(condition.label is None for condition in assessment.clear)
 
 
 def test_two_repositories_differing_only_in_linear_history_share_a_label() -> None:

@@ -14,6 +14,11 @@ import { withWeeks } from '@/lib/weeks';
  *
  * The counts are grouped through `distributionSlices`, the same function the donut is drawn from, so a
  * chart and a row can never disagree about which repositories fall under a label.
+ *
+ * The team cards are FLAT, for the reason `MetricCard` is: the list renders inside a `Section`, which
+ * has drawn the box since 2026-09-02, and a grid of bordered cards nested in a bordered panel is the
+ * pattern that change exists to remove. The gap does the separating and the hover tint says the whole
+ * card is the target, which the border was carrying before.
  */
 export function TeamsList({ rows, weeks }: { rows: readonly TeamRow[]; weeks: number }) {
   return (
@@ -21,7 +26,7 @@ export function TeamsList({ rows, weeks }: { rows: readonly TeamRow[]; weeks: nu
       {rows.map((row) => (
         <div
           key={row.team}
-          className="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-3 hover:border-slate-700 transition-colors"
+          className="rounded-lg p-3 space-y-3 hover:bg-slate-800/30 transition-colors"
         >
           <Link
             href={withWeeks(`/teams/${encodeURIComponent(row.team)}`, weeks)}
@@ -34,7 +39,9 @@ export function TeamsList({ rows, weeks }: { rows: readonly TeamRow[]; weeks: nu
             <span className="tabular-nums">
               {count(row.repositories, 'repository', 'repositories')}
             </span>
-            <span className="tabular-nums">{count(row.actors, 'actor', 'actors')}</span>
+            <span className="tabular-nums">
+              {count(row.actors, 'contributor', 'contributors')}
+            </span>
             {row.unavailable > 0 ? (
               <span className="tabular-nums text-slate-500">{row.unavailable} not reported</span>
             ) : null}

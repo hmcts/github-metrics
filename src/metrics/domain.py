@@ -982,11 +982,18 @@ class ReadinessCondition(EvidenceModel):
     `label` is the ceiling the condition imposes on its repository's label, so only a blocking
     condition carries one: a caution and a clear condition impose nothing. Details quantify wherever
     a number exists, because "below the target" is an assertion and "81.2% (78 of 96)" is evidence.
+
+    `informational` marks a condition the policy REPORTS WITHOUT JUDGING, so a renderer can tell a
+    check that was satisfied from one that bears on the label in neither state. Both sit under
+    `clear` — the section means "checked, and did not hold the label back" — and a reader who cannot
+    tell them apart reads a rule nobody grades as a rule that passed. The text report needs no such
+    distinction, because each of these says so in its own detail.
     """
 
     condition: str
     label: ReadinessLabel | None = None
     detail: str
+    informational: bool = False
 
 
 class ReadinessAssessment(EvidenceModel):

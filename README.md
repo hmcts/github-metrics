@@ -631,6 +631,13 @@ Details quantify wherever a number exists — `independent-review-coverage is 81
 the target" is an assertion and a count is evidence. Only blocking conditions carry a `label`: a caution and a clear
 condition impose no ceiling, so they have none to report.
 
+Every condition also carries `informational`, which is `true` where the policy **reported it without judging it** — the
+three merge-gate rules described below that bear on the label in neither state, and the `sufficient-merges` precondition
+that says the window held enough to grade rather than that anything went well. It is a rendering aid, so a reader can
+tell a check that was satisfied from one nobody grades: `metrics evidence --format report` prints no extra line for it,
+the dashboard sets those rows in no colour, and the flag moves no label and no section. Every other condition carries it
+as `false`.
+
 Governance can veto. A merge gate that requires no approving review is `red` however well the team behaves day to day,
 and so is a default branch with no protection at all: both mean nothing stands between an agent and `master`. Behavioural
 shortfalls are graded rather than absolute — `independent-review-coverage`, `approval-coverage` and
@@ -1419,8 +1426,9 @@ caches do not cover reports that reason and no counts.
 The UI fetches server-side, so the service needs no CORS headers and no browser ever calls it directly. `API_URL`
 tells the Next.js server where it is, defaulting to `http://localhost:8000`. `npm --prefix ui run build` then
 `npm --prefix ui start` serves it for real; `npm --prefix ui run check` is the whole UI gate — lint, types, tests,
-build — in one step, as `uv run poe check` is for the Python. See [`ui/README.md`](ui/README.md) for the pages, the
-design tokens, and the guardrails the UI keeps.
+build — in one step, as `uv run poe check` is for the Python. Its build step needs a case-sensitive filesystem, so on
+a case-insensitive mount the three commands that judge a change are `lint`, `typecheck` and `test` run separately. See
+[`ui/README.md`](ui/README.md) for that, the pages, the design tokens, and the guardrails the UI keeps.
 
 ### In containers
 
@@ -1436,7 +1444,8 @@ Collection stays on the host, because it is the step that needs a credential and
 `./.metrics` is mounted read-write, so the configuration's `database` must resolve inside `.metrics` or the service
 starts with nothing to serve.
 
-Only the UI is published, on `http://localhost:3000`; the API answers at `http://api:8000` on the compose network
+Only the UI is published, on `http://localhost` — port 80 on the host, mapped to the container's 3000; the API
+answers at `http://api:8000` on the compose network
 alone, which is the same server-side-only arrangement the local loop has. The UI waits for the API's `/healthz` to
 answer, and the API's healthcheck allows a minute before it starts failing, so the first `up` is slower than the ones
 after it. The API image installs the `service` extra and nothing else, and its build context is an allowlist

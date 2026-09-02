@@ -766,7 +766,10 @@ between repositories follows the newer analysis, and a re-run holding stale data
 
 **REPORT-ONLY AND UNGRADED.** `ReadinessPolicy` reads none of it — the same standing rule that keeps
 security, CODEOWNERS and maintenance out of the label: a signal becoming visible is not a reason to
-grade it. A failing quality gate imposes no ceiling and carries no colour. The conditions are
+grade it. A failing quality gate imposes no ceiling and is graded by nothing in the report. The
+dashboard sets it in a presentation tone from 2026-09-02 — see "A FIGURE ON A PAGE MAY CARRY TONE"
+under Scope boundaries — which is a colour on a page and not a grade: no boundary in
+`ui/src/lib/tone.ts` reaches `assessment.py` or the JSON. The conditions are
 nevertheless printed in full, as the merge gate prints its rules, because "the gate failed" is an
 assertion and "coverage 62.1 against a threshold of 80" is the evidence for it. Grading any of this
 is a fresh user ruling and belongs here first.
@@ -1353,6 +1356,51 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   repositories and the label of each, ordered alphabetically by login within the group their labels
   put them under, and nothing scores or ranks people. Every list of people the service serves is
   alphabetical, and none of them carries a metric to sort by.
+  - A FIGURE ON A PAGE MAY CARRY TONE FROM 2026-09-02, AT THE USER'S INSTRUCTION. This reverses the
+    UI's own written rule that colour on a page is the readiness label and nothing else: the
+    predecessor tool coloured its figures, the user asked for that back, and a page of about forty
+    uncoloured boxes could not be read at a glance. THE READINESS POLICY REMAINS THE ONLY THING THAT
+    GRADES A REPOSITORY. Its label, its three condition lists and the ceiling each blocking
+    condition imposes are untouched, and no threshold in `assessment.py` is restated in the UI.
+    What the reversal admits is PRESENTATION over figures the report already states without grading
+    — an open critical alert, a quality gate reading ERROR, a coverage percentage — as four states
+    (`good`, `warn`, `bad`, `neutral`) in one place, `ui/src/lib/tone.ts`, with `neutral` the
+    default for any figure that table does not name.
+    THE UI'S THRESHOLDS ARE PRESENTATION WHICH THE REPORT NEITHER STATES NOR DEPENDS ON. `render.py`
+    prints no colour, the JSON carries no tone field, and a boundary moved in `tone.ts` changes what
+    a page looks like and nothing a reader could cite. That is what keeps the reversal from growing
+    into a second grading system, and it splits along one line: where the policy has already judged
+    a figure the page carries ITS verdict — a behaviour metric card reads the
+    `<metric>-at-target`, `-below-target`, `-above-target` or `-not-observed` condition that graded
+    it, so a card can never contradict the CLEAR list above it — and where the policy judges nothing
+    the boundary is stated in `tone.ts` with a comment naming its `assessment.py` counterpart where
+    one exists, so page and policy can be checked against each other by reading them side by side.
+    TWO REFUSALS ARE PART OF THE RULING. An unreadable figure stays uncoloured: a gate field GitHub
+    withheld, an alert family it refused and a Sonar measure a project never reported are absences,
+    and green there would report a missing permission as a check that passed. And the three
+    merge-gate rules `ReadinessPolicy.neutral()` reports without judging stay uncoloured too,
+    because colouring them would grade what the policy deliberately does not. `informational` on
+    `ReadinessCondition` exists for the second of those — it marks a condition the policy reports
+    without judging, which is the neutral trio and `sufficient-merges` — so a renderer can tell a
+    satisfied check from one that bears on the label in neither state. It adds no line to the text
+    report and changes no label.
+  - PER-PERSON COUNTS BESIDE A LOGIN ON A REPOSITORY PAGE ARE IN SCOPE (2026-09-02, at the user's
+    instruction). The contributors table on `/repositories/[repository]` carries, per login,
+    contributions, pull requests merged, pushes straight onto the default branch, merges that
+    carried no independent review, and the median size of a change. Each is a count or a median of
+    what was done IN ONE REPOSITORY, derived in `ui/src/lib/contributor.ts` from the per-actor
+    metric summaries the service sends verbatim, by the subtraction a reader could do from the
+    report's own numerators and denominators.
+    ORDERING OR RANKING PEOPLE BY THEM STAYS EXCLUDED, UNCHANGED. The table keeps the
+    contributions-descending order the service sends and has no sortable headers, and its doc
+    comment says why: the order is about which merges make up this window, never about who did most.
+    No column is a rate, no figure spans the repositories somebody works in, and nothing compares
+    one login with another. If a sortable header, a rank column or a cross-repository sum appears,
+    cut it back.
+    `Blocking occurrences` WAS DROPPED from that table the same day. It counted the occurrences the
+    findings table above it already lists per rule and per person, so the column was a second copy
+    of a block the reader had just passed. RENDERING ONLY — `ActorRow.blocking` in the JSON and the
+    `Actor Summary` the report prints are untouched.
 - Scoring and RAG labels were previously excluded; that exclusion was REVERSED on 2026-08-13 for the
   readiness assessment only — see "Readiness assessment" above. Metrics themselves stay neutral.
 - No merger-identity collection.

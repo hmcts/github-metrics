@@ -158,6 +158,86 @@ describe('mergeGateRows', () => {
     const rows = mergeGateRows(gate({ unmodelled_rules: ['merge_queue', 'tag_name_pattern'] }));
     expect(value(rows, 'Rules not interpreted')).toBe('merge_queue, tag_name_pattern');
   });
+
+  function tone(rows: ReturnType<typeof mergeGateRows>, label: string): string | undefined {
+    return rows.find((row) => row.label === label)?.tone;
+  }
+
+  it('reads a gate requiring no approval and no check as badly as it configures', () => {
+    const rows = mergeGateRows(gate());
+    expect(tone(rows, 'Protected')).toBe('good');
+    expect(tone(rows, 'Rules observed')).toBe('good');
+    expect(tone(rows, 'Approving reviews required')).toBe('bad');
+    expect(tone(rows, 'Required status checks')).toBe('bad');
+    // No pull-request rule dismisses a stale review, which is the caution `assessment.stale_reviews`
+    // raises rather than a veto.
+    expect(tone(rows, 'Dismiss stale reviews on push')).toBe('warn');
+  });
+
+  it('reads a gate that requires review and checks as satisfying both', () => {
+    const rows = mergeGateRows(
+      gate({
+        pull_requests: [
+          {
+            dismiss_stale_reviews_on_push: true,
+            require_code_owner_review: true,
+            require_last_push_approval: false,
+            required_approving_review_count: 1,
+            required_review_thread_resolution: false,
+          },
+        ],
+        status_checks: [
+          { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'build' }] },
+        ],
+        applies_to_administrators: true,
+      }),
+    );
+    expect(tone(rows, 'Approving reviews required')).toBe('good');
+    expect(tone(rows, 'Required status checks')).toBe('good');
+    expect(tone(rows, 'Dismiss stale reviews on push')).toBe('good');
+    expect(tone(rows, 'Applies to administrators')).toBe('good');
+  });
+
+  it('grades an unprotected branch red and one whose rules could not be read not at all', () => {
+    const rows = mergeGateRows(gate({ protected: false, rules_observed: false }));
+    expect(tone(rows, 'Protected')).toBe('bad');
+    // cannot_assess, not a failure: the rules were not readable, which is not the same as absent.
+    expect(tone(rows, 'Rules observed')).toBe('neutral');
+  });
+
+  it('colours no rule of a protected gate GitHub refused to disclose', () => {
+    // `inventory.merge_gate_without_rule_details` for a permission-denied read: protected, with the
+    // same empty rule arrays a gate carrying no rules has. The policy stops at
+    // `merge-gate-rules-not-observable`, so red on these rows would report a missing Administration
+    // permission as a gate requiring no review.
+    const rows = mergeGateRows(gate({ protected: true, rules_observed: false }));
+    expect(tone(rows, 'Protected')).toBe('good');
+    expect(tone(rows, 'Rules observed')).toBe('neutral');
+    expect(tone(rows, 'Approving reviews required')).toBe('neutral');
+    expect(tone(rows, 'Required status checks')).toBe('neutral');
+    expect(tone(rows, 'Dismiss stale reviews on push')).toBe('neutral');
+    // The printed values are what `render.py` prints for the same block, uncoloured rather than
+    // reworded: the page and the text report state one thing.
+    expect(value(rows, 'Approving reviews required')).toBe('0');
+    expect(value(rows, 'Required status checks')).toBe('none');
+    expect(value(rows, 'Dismiss stale reviews on push')).toBe('no');
+  });
+
+  it('colours no field GitHub withheld and none the policy reports without judging', () => {
+    const rows = mergeGateRows(gate({ requires_linear_history: true, restricts_branch_names: true }));
+    // A gate field GitHub did not disclose: `applies_to_administrators` is absent on this fixture.
+    expect(value(rows, 'Applies to administrators')).toBe('not disclosed');
+    expect(tone(rows, 'Applies to administrators')).toBe('neutral');
+    // The neutral trio from `ReadinessPolicy.neutral()`, coloured in neither state.
+    expect(tone(rows, 'Restricts deletions')).toBe('neutral');
+    expect(tone(rows, 'Requires linear history')).toBe('neutral');
+    expect(tone(rows, 'Restricts branch names')).toBe('neutral');
+    // Facts about what was looked at rather than answers about it.
+    expect(tone(rows, 'Branch')).toBe('neutral');
+    expect(tone(rows, 'Rules not interpreted')).toBe('neutral');
+    // Cautioned by `assessment.force_pushes`, unnamed by the tone table, so neutral by its default.
+    expect(tone(rows, 'Blocks force pushes')).toBe('neutral');
+  });
 });
 
 describe('openPullRequestCards', () => {
@@ -194,6 +274,18 @@ describe('openPullRequestCards', () => {
     const cards = openPullRequestCards({ summary });
     expect(cards.every((card) => card.detail === undefined)).toBe(true);
   });
+
+  it('colours the one count that ages and leaves throughput uncoloured', () => {
+    expect(openPullRequestCards({ summary }).map((card) => card.tone)).toEqual([
+      'neutral',
+      'neutral',
+      'neutral',
+      'warn',
+    ]);
+    expect(
+      openPullRequestCards({ summary: { ...summary, stale_open: 0 } })[3]?.tone,
+    ).toBe('good');
+  });
 });
 
 describe('security alerts', () => {
@@ -223,6 +315,25 @@ describe('security alerts', () => {
     expect(severityDetail('dependabot', { by_severity: {} })).toBe('not available');
   });
 
+  it('takes a family’s colour from its severities, and refuses one for a family nobody read', () => {
+    const [dependabot, codeScanning, secretScanning] = securityCards(alerts);
+    expect(dependabot?.tone).toBe('bad');
+    // The unreadable case: a refused family is not a clean one, so it is not coloured as one.
+    expect(codeScanning?.tone).toBe('neutral');
+    expect(secretScanning?.tone).toBe('good');
+  });
+
+  it('weighs a family holding only medium and low alerts rather than condemning it', () => {
+    const cards = securityCards({
+      ...alerts,
+      dependabot: { open: 3, by_severity: { medium: 1, low: 2 } },
+      secret_scanning: { open: 1, by_severity: {} },
+    });
+    expect(cards[0]?.tone).toBe('warn');
+    // A leaked credential has no low-severity form, and secret scanning reports no severity at all.
+    expect(cards[2]?.tone).toBe('bad');
+  });
+
   it('says secret scanning carries no severity instead of printing four zeros', () => {
     expect(severityDetail('secret-scanning', alerts.secret_scanning)).toBe(
       'no severity is reported for this family',
@@ -247,13 +358,26 @@ describe('maintenance', () => {
 
   it('answers each window with its own two answers', () => {
     const rows = maintenanceRows(report);
-    expect(rows[0]).toEqual({ label: '3 months', value: 'yes', detail: 'human commit: yes' });
+    expect(rows[0]).toEqual({
+      label: '3 months',
+      value: 'yes',
+      tone: 'good',
+      detail: 'human commit: yes',
+    });
   });
 
   it('keeps an unsearched human answer unknown, with the reason beside it', () => {
     expect(maintenanceRows(report)[1]?.detail).toBe(
       'human commit: unknown — the search stopped at 2026-02-01',
     );
+  });
+
+  it('weighs a window with no commit in it rather than condemning the repository', () => {
+    const rows = maintenanceRows({
+      ...report,
+      windows: [{ months: 3, committed_within: false }, { months: 12, committed_within: true }],
+    });
+    expect(rows.map((row) => row.tone)).toEqual(['warn', 'good']);
   });
 
   it('states the instants the window answers were derived from', () => {
@@ -300,6 +424,7 @@ describe('codeownersCard', () => {
       label: 'CODEOWNERS',
       value: '-',
       detail: 'the contents endpoint was refused',
+      tone: 'neutral',
     });
     expect(codeownersCard({}).detail).toBe('not available');
   });
@@ -314,9 +439,15 @@ describe('codeownersCard', () => {
       },
     });
     expect(card.value).toBe('2 files');
+    expect(card.tone).toBe('good');
     expect(card.detail).toBe(
       '.github/CODEOWNERS (240 bytes, recognised by GitHub) · docs/CODEOWNERS.md (0 bytes, not recognised by GitHub)',
     );
+  });
+
+  it('weighs a repository with no CODEOWNERS and grades one nobody could look in not at all', () => {
+    expect(codeownersCard({ codeowners: { files: [] } }).tone).toBe('warn');
+    expect(codeownersCard({ detail: 'the contents endpoint was refused' }).tone).toBe('neutral');
   });
 });
 
@@ -345,12 +476,56 @@ describe('SonarCloud', () => {
   it('draws every measure, leaving an unreported one visibly absent', () => {
     const rows = sonarRows(measures);
     expect(rows).toHaveLength(12);
-    expect(rows[0]).toEqual({ label: 'Coverage', value: '62.1%' });
-    expect(rows[1]).toEqual({ label: 'Duplicated lines', value: '-' });
+    expect(rows[0]).toEqual({ label: 'Coverage', value: '62.1%', tone: 'bad' });
+    expect(rows[1]).toEqual({ label: 'Duplicated lines', value: '-', tone: 'neutral' });
   });
 
   it('prints a million lines of code as a million, not in exponent form', () => {
     expect(sonarRows(measures)[2]?.value).toBe('1000000');
+  });
+
+  it('carries a tone on every measure and every rating', () => {
+    const rows = sonarRows(measures);
+    const tone = (label: string) => rows.find((row) => row.label === label)?.tone;
+    expect(tone('Coverage')).toBe('bad');
+    expect(tone('Reliability rating')).toBe('good');
+    // The size of the project: the denominator for the rest, and neither good nor bad.
+    expect(tone('Lines of code')).toBe('neutral');
+    // Absent measures stay uncoloured — a measure nobody reported is not a measure that passed.
+    expect(tone('Duplicated lines')).toBe('neutral');
+    expect(tone('Violations')).toBe('neutral');
+    expect(tone('Maintainability rating')).toBe('neutral');
+    // Off the A-to-E scale, so no letter and no colour rather than a guess at either end.
+    expect(tone('Security rating')).toBe('neutral');
+  });
+
+  it('takes an issue count’s severity from the rating that covers it', () => {
+    const rows = sonarRows({
+      project_key: 'hmcts_api',
+      coverage: 92.4,
+      duplicated_lines_density: 4.2,
+      violations: 5,
+      reliability_issues: 71,
+      maintainability_issues: 1358,
+      security_issues: 0,
+      security_hotspots: 2,
+      reliability_rating: { value: 4 },
+      maintainability_rating: { value: 1 },
+      security_rating: { value: 1 },
+      security_review_rating: { value: 2 },
+    });
+    const tone = (label: string) => rows.find((row) => row.label === label)?.tone;
+    expect(tone('Coverage')).toBe('good');
+    expect(tone('Duplicated lines')).toBe('warn');
+    // 71 issues under a D reads badly; 1,358 under an A is worth weighing and no worse.
+    expect(tone('Reliability issues')).toBe('bad');
+    expect(tone('Maintainability issues')).toBe('warn');
+    expect(tone('Security issues')).toBe('good');
+    expect(tone('Security hotspots')).toBe('warn');
+    // The one count with no rating of its own: above zero it is amber and never red.
+    expect(tone('Violations')).toBe('warn');
+    expect(tone('Reliability rating')).toBe('bad');
+    expect(tone('Security review rating')).toBe('warn');
   });
 
   it('states the gate beside the project the verdict is about', () => {
@@ -363,6 +538,7 @@ describe('SonarCloud', () => {
       label: 'Quality gate',
       value: 'ERROR',
       detail: 'project hmcts_api · analysed 2026-08-29T04:00Z',
+      tone: 'bad',
     });
   });
 
@@ -380,8 +556,19 @@ describe('SonarCloud', () => {
       label: 'Quality gate',
       value: '-',
       detail: 'no SonarCloud project is mapped to this repository',
+      tone: 'neutral',
     });
     expect(sonarGateCard({}).detail).toBe('not available');
+  });
+
+  it('colours a passing gate green and a project with no gate configured not at all', () => {
+    expect(
+      sonarGateCard({ measures: { ...measures, gate: { level: 'OK', conditions: [] } } }).tone,
+    ).toBe('good');
+    // NONE is Sonar's word for a project with no gate conditions, which is an absence not a pass.
+    expect(
+      sonarGateCard({ measures: { ...measures, gate: { level: 'NONE', conditions: [] } } }).tone,
+    ).toBe('neutral');
   });
 
   it('reports a project that has never been analysed as exactly that', () => {
@@ -389,6 +576,7 @@ describe('SonarCloud', () => {
       label: 'Quality gate',
       value: 'not reported',
       detail: 'never analysed',
+      tone: 'neutral',
     });
   });
 });

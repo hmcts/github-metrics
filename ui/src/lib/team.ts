@@ -21,7 +21,7 @@ export function holdings(detail: TeamDetail): string {
 
 /** How many people authored a reported merge in this team's repositories at this span. */
 export function people(detail: TeamDetail): string {
-  return count(detail.actors.length, 'actor', 'actors');
+  return count(detail.actors.length, 'contributor', 'contributors');
 }
 
 /**

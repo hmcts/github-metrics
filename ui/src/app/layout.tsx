@@ -4,7 +4,7 @@ import { Navigation } from '@/components/Navigation';
 
 export const metadata: Metadata = {
   title: 'GitHub Metrics Dashboard',
-  description: 'Repository, actor, and team evidence from the metrics caches',
+  description: 'Repository, contributor, and team evidence from the metrics caches',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

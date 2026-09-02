@@ -2,6 +2,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { RAGRow } from '@/components/RAGCard';
 import { Section } from '@/components/Section';
 import { conditionGroups } from '@/lib/repository';
+import { conditionTone } from '@/lib/tone';
 import type { ReadinessAssessment } from '@/lib/types';
 
 /**
@@ -12,8 +13,11 @@ import type { ReadinessAssessment } from '@/lib/types';
  * grade a team can argue with and one they can only be told.
  *
  * Only a blocking condition carries a label of its own — it is the ceiling that condition imposed —
- * so a caution and a clear row read as "not assessed" beside their own sentence. That is accurate:
- * neither imposes anything, and colouring them would invent a grade the policy did not give.
+ * so a caution and a clear row carry no badge beside their own sentence. What they carry instead,
+ * since 2026-09-02, is the colour bar `tone.conditionTone` gives them: amber for a caution, green
+ * for a condition that was checked and satisfied, and nothing at all for one the policy reported
+ * without judging. That last group is why the flag exists — a `clear` section where a rule nobody
+ * grades looks exactly like a check that passed reads as approval the policy never gave.
  */
 export function AssessmentSection({ assessment }: { assessment: ReadinessAssessment }) {
   return (
@@ -28,6 +32,7 @@ export function AssessmentSection({ assessment }: { assessment: ReadinessAssessm
                 <RAGRow
                   key={condition.condition}
                   label={condition.label}
+                  tone={conditionTone(group.key, condition)}
                   condition={condition.condition}
                   detail={condition.detail}
                 />

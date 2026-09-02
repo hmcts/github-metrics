@@ -1,8 +1,10 @@
 # metrics dashboard
 
-A Next.js app that reads `metrics-serve` and renders the evidence report as pages. It computes no metric of its own:
-every figure on a page is one the service sent, formatted by a pure function in `src/lib`, so a page and
-`metrics evidence` for the same span state one thing rather than two that can drift.
+A Next.js app that reads `metrics-serve` and renders the evidence report as pages. It measures nothing of its own:
+every figure on a page is one the service sent, or one a reader could reach by adding the report's own rows up
+(`lib/contributor.ts` is the widest case, subtracting the contributor columns out of the summaries a person's row
+carries), formatted by a pure function in `src/lib` — so a page and `metrics evidence` for the same span state one
+thing rather than two that can drift.
 
 ## Run
 
@@ -31,6 +33,19 @@ npm --prefix ui run check
 `check` is the whole gate in one step — `next lint`, `tsc --noEmit`, `vitest run`, `next build` — the counterpart of
 `uv run poe check` for the Python. The Python tooling never sees this directory and this gate never sees the Python.
 
+Its `next build` step needs a case-sensitive filesystem. On a case-insensitive mount the `output: 'standalone'` trace
+copy fails with `ENOTDIR` or `ENOENT` on a `.next/standalone/node_modules/next/dist/...` path that already exists as a
+directory, on a different path each run — the same tree builds clean with `.next` written outside the mount, so it is
+the environment and not the code under it. Where that happens, the three commands that judge a change are
+
+```bash
+npm --prefix ui run lint
+npm --prefix ui run typecheck
+npm --prefix ui run test
+```
+
+and `check` is the one to run wherever the build works, because a page that will not build is not a passing change.
+
 ## Pages
 
 | Route | What it answers |
@@ -57,23 +72,70 @@ The visual language is class-string idioms rather than a theme config, ported fr
 | Element | Classes |
 | --- | --- |
 | page | `bg-slate-950 text-slate-100` |
-| card | `bg-slate-900 border border-slate-800 rounded-lg p-5 hover:border-slate-700` |
+| panel — `Section`, `Panel` | `bg-slate-900/40 border border-slate-800 rounded-lg`, heading row divided by `border-b border-slate-800`, body `p-4` |
 | section heading | `text-sm font-semibold text-slate-300 uppercase tracking-wide` |
+| definition list — `DefinitionList` | `<dl>`, rows `divide-y divide-slate-800/50`, label `text-sm text-slate-400`, value `ml-auto text-sm font-medium text-right` |
 | table | `text-xs`, head `text-slate-400 border-b border-slate-800`, body `divide-y divide-slate-800/50` |
 | row hover | `hover:bg-slate-800/30` |
-| metric value / label | `text-2xl font-semibold` / `text-xs text-slate-400 uppercase tracking-wide` |
+| metric value / label | `text-2xl font-semibold tabular-nums` / `text-xs text-slate-400 uppercase tracking-wide` |
 | links and buttons | `text-indigo-400`, `bg-indigo-600 hover:bg-indigo-500` |
 | nav | `h-14 bg-slate-900 border-b border-slate-800`, sticky |
 
-Logins and repository names are `font-mono`; numeric columns are `tabular-nums`. The readiness palette is named in
-`tailwind.config.ts` as `rag-red #f87171`, `rag-amber #fbbf24`, `rag-green #4ade80`, `rag-none #64748b` and
-`accent #818cf8`, and resolved through `src/lib/rag.ts` — `borderClass` for the `border-l-4` colour bar, `RAG_LABEL`
-for the word, `RAG_HEX` for chart marks, where a class cannot reach.
+**The box is the section, not the figure.** `MetricCard` and the tables draw no border of their own — a repository page
+of nine sections had reached about forty bordered boxes with nothing saying which figures belonged together, so the
+panel moved up a level and a grid of cards inside one reads as a single surface. `Panel` is the same surface without a
+heading, for the two headline card rows that answer the question their page is titled with. A `Section` with no
+children renders its heading and no empty padded body, and a `DefinitionList` with no rows renders nothing at all:
+blank space under a divider reads as content that failed to load, and the page says what is missing with an
+`EmptyState` carrying the reason.
+
+**A settings block is a list, not a grid of cards.** The twelve merge-gate fields, the three maintenance windows and
+the three alert families go through `DefinitionList`, where the labels line up and the block is read down. Twelve
+two-word answers at headline size across a four-across grid put `yes` and `not disclosed` in the same weight as the
+cohort figures above them. Cards stay for a headline figure — the cohort row, the open pull-request counts, the Sonar
+measures — where the number is what the reader came for and the label only names it.
+
+Logins and repository names are `font-mono`; numeric columns are `tabular-nums`, and `DefinitionList` applies it to a
+numeric answer only, a dash included, so a column of counts stays aligned while `not disclosed` keeps the
+proportional face.
+
+### Colour
+
+Two palettes, one file: `tailwind.config.ts` names `rag-red #f87171`, `rag-amber #fbbf24`, `rag-green #4ade80`,
+`rag-none #64748b` and `accent #818cf8`. Two modules resolve them, and the split is which of them is judging.
+
+`src/lib/rag.ts` carries the report's own judgement — the four readiness LABELS. `borderClass` for the `border-l-4`
+colour bar, `RAG_LABEL` for the word, `RAG_HEX` for chart marks where a class cannot reach.
+
+`src/lib/tone.ts` carries the four presentation tones — `good`, `warn`, `bad`, `neutral` — over figures the report
+states without grading. **This reverses the rule that colour on a page is the readiness label and nothing else,
+on 2026-09-02 at the user's instruction** (see `docs/architecture.md`, "Scope boundaries"). The rules that hold it in
+place:
+
+- **Tone colours the value and only the value**, through `valueClass`; the label and the detail stay slate whatever the
+  tone, so a coloured page reads as one surface with a few figures standing out of it rather than as a traffic light.
+  `borderClass` there is the row equivalent, and keeps a neutral row's bar at the panel's own slate so a list does not
+  jog in and out as the eye goes down it.
+- **`neutral` is the default and the majority.** A branch name, a line count, how many merges were reported — any
+  figure with no threshold worth stating renders exactly as it did before the module existed, which is what keeps a
+  colour meaning something where there is one.
+- **The threshold lives in `tone.ts` and nowhere else.** No component holds a boundary and no hex literal appears in
+  one. Each function names its `assessment.py` counterpart in a comment where one exists, so a page and the policy can
+  be checked against each other by reading them side by side.
+- **Where the policy already graded a figure, the page carries its verdict.** A behaviour metric card takes its tone
+  from the assessment condition that graded the metric, so a card can never contradict the CLEAR list above it, and a
+  blocking assessment row keeps the readiness label it imposed rather than a second opinion in the same colour.
+- **An unreadable figure stays uncoloured**, and so do the three merge-gate rules the policy reports without judging.
+  A gate field GitHub withheld, an alert family it refused and a Sonar measure a project never reported are absences —
+  green there would report a missing permission as a check that passed — and `ReadinessCondition.informational` is how
+  a row says it was reported without being judged.
 
 **No emoji anywhere.** A coloured square carries no text, does not survive a screen reader, and renders differently
 on every platform. A label reaches a page as a colour bar plus a word: the bar is decoration, the word is the
 information, and neither is load-bearing alone. `cannot_assess` is slate rather than a shade between amber and red,
 because the report means "half the question could not be read", not "nearly bad".
+
+### Absent values
 
 An unmeasured value is a dash and never a zero. "Nobody measured it" and "somebody measured nothing" are different
 findings, and `src/lib/format.ts` keeps them apart the way `metrics.render` does — down to rounding halves to even, as
@@ -89,9 +151,13 @@ every response the service actually sends.
 
 These come from `docs/architecture.md`, "Scope boundaries", and they bind the UI as much as the Python:
 
-- **No personal rankings.** Every list of people is alphabetical and carries no column to sort by. `ActorsTable` and
-  `TeamActorsTable` have no sortable headers at all, and the counts beside a login — repositories, merges — are
-  counts of things done, never scores.
+- **No personal rankings.** No list of people carries a column to sort by: `ActorsTable`, `TeamActorsTable` and
+  `ContributorsTable` have no sortable headers at all. The first two are alphabetical. The third keeps the
+  contributions-descending order the service sends, because a repository page asks which merges make up its window,
+  and the five figures beside a login there — contributions, merged pull requests, direct pushes, unreviewed merges,
+  median size — are counts of what was done in that one repository (2026-09-02), never scores and never rates to
+  compare people on. `Blocking occurrences` was dropped from that table the same day as a second copy of the findings
+  table above it.
 - **No cross-repository averaging.** A person's behaviour metrics are measured per repository and stay in their own
   section on the actor page. Merges add up across repositories because a sum of merges is still a number of merges;
   a rate, a median or a label never does.

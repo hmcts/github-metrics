@@ -41,11 +41,11 @@ describe('holdings', () => {
 
 describe('people', () => {
   it('counts everyone who authored a reported merge in the team', () => {
-    expect(people(team())).toBe('2 actors');
+    expect(people(team())).toBe('2 contributors');
   });
 
   it('counts nobody where the span holds no reported merge for the team', () => {
-    expect(people(team({ actors: [] }))).toBe('0 actors');
+    expect(people(team({ actors: [] }))).toBe('0 contributors');
   });
 });
 

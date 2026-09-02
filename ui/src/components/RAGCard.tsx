@@ -1,5 +1,6 @@
 import clsx from 'clsx';
 import { badgeClass, borderClass, labelText } from '@/lib/rag';
+import { borderClass as toneBorderClass, type Tone } from '@/lib/tone';
 import type { ReadinessLabel } from '@/lib/types';
 
 /**
@@ -69,18 +70,30 @@ export function RAGCard({
  * carries a label — it is the ceiling that condition imposed — and stamping the readiness policy's
  * "nothing was graded" wording onto a condition that deliberately grades nothing would read as a
  * gap in the assessment instead of as its normal shape.
+ *
+ * `tone` colours the bar on a row that carries no label, which is how a caution, a clear condition
+ * and one the policy reported without judging tell themselves apart down the left edge. A LABEL
+ * ALWAYS WINS: the policy's own ceiling is the stronger statement, and two colours on one row would
+ * be two verdicts about it. What decides a row's tone is `tone.conditionTone`, not this component.
  */
 export function RAGRow({
   label,
+  tone,
   condition,
   detail,
 }: {
   label?: ReadinessLabel;
+  tone?: Tone;
   condition: string;
   detail: string;
 }) {
   return (
-    <div className={clsx('bg-slate-900/50 rounded-r py-2 pl-3 pr-4', borderClass(label))}>
+    <div
+      className={clsx(
+        'bg-slate-900/50 rounded-r py-2 pl-3 pr-4',
+        label ? borderClass(label) : toneBorderClass(tone),
+      )}
+    >
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm text-slate-200">{condition}</span>
         {label ? <RAGLabel label={label} /> : null}

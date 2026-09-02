@@ -39,6 +39,7 @@ from metrics.config import (
 )
 from metrics.domain import (
     ActorReadiness,
+    BehaviourMetricSummary,
     EvidenceModel,
     PracticeEvidenceReport,
     ReadinessLabel,
@@ -190,16 +191,24 @@ class RepositoryRow(EvidenceModel):
 
 
 class ContributorRow(EvidenceModel):
-    """State how much one person contributed to one repository, and what a rule found there.
+    """State how much one person contributed to one repository, and what was measured over it.
 
-    The two counts are the ones `ActorRepositoryReadiness` already carries, re-read per repository so
-    a repository page can list its contributors without loading every actor. Neither judges the
+    Every field is the one `ActorRepositoryReadiness` already carries, re-read per repository so a
+    repository page can list its contributors without loading every actor. None of them judges the
     person: `blocking` re-reports occurrences a practice rule already found.
+
+    `metrics` is carried VERBATIM and THIS SERVICE DERIVES NOTHING FROM IT. The summaries are that
+    person's merges in this repository alone, and a page that wants how many pull requests they
+    merged or how many merged unreviewed subtracts it out of the review coverage denominator itself
+    (`ui/src/lib/contributor.ts`). Deriving it here would put a second arithmetic beside the one the
+    contract already states, and the rows stay contributions-ordered counts of what was done rather
+    than anything people are ordered by (architecture.md, "Scope boundaries").
     """
 
     login: str
     contributions: PositiveInt
     blocking: NonNegativeInt
+    metrics: tuple[BehaviourMetricSummary, ...] = ()
 
 
 class RepositoryDetail(EvidenceModel):
@@ -413,7 +422,12 @@ def contributor_rows(report: PracticeEvidenceReport) -> Mapping[str, tuple[Contr
         (
             (
                 row.repository,
-                ContributorRow(login=actor.actor_login, contributions=row.contributions, blocking=row.blocking),
+                ContributorRow(
+                    login=actor.actor_login,
+                    contributions=row.contributions,
+                    blocking=row.blocking,
+                    metrics=row.metrics,
+                ),
             )
             for actor in report.actors
             for row in actor.repositories

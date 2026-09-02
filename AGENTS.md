@@ -32,6 +32,11 @@ pytest without weakening their configuration. Use `uv run poe cover` when covera
 Work touching `ui/` must also pass `npm --prefix ui run check` — ESLint, `tsc --noEmit`, vitest, and `next build` in one
 step, the UI's equivalent of `uv run poe check`. Run both when a change spans the service and the pages it feeds.
 
+Where `check`'s `next build` step fails on a case-insensitive mount — `ENOTDIR` or `ENOENT` under
+`.next/standalone`, on a different path each run, which is the environment and not the code — run `npm --prefix ui run
+lint`, `npm --prefix ui run typecheck` and `npm --prefix ui run test` instead. Those three are the parts that judge the
+change; `check` is still the command to run wherever the build works. See [`ui/README.md`](ui/README.md).
+
 ## Coding Standards
 
 - Write production-quality PEP 8 code with complete English identifiers; do not abbreviate or use single-letter names.

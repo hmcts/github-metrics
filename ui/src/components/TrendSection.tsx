@@ -98,7 +98,13 @@ function MetricSeriesCard({ chart }: { chart: MetricChart }) {
   );
 }
 
-/** The card every chart on this page sits in: a title, what it is measured in, and the canvas. */
+/**
+ * The card every chart in this section sits in: a title, what it is measured in, and the canvas.
+ *
+ * Flat, like `MetricCard`: the section is the box, and a bordered chart card inside a bordered
+ * panel was one of the nested boxes this page was rebuilt to lose. A chart is bounded by its own
+ * axes, so the grid gap is enough to keep two of them apart.
+ */
 function ChartCard({
   title,
   detail,
@@ -109,7 +115,7 @@ function ChartCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
+    <div className="space-y-3">
       <div className="flex flex-wrap items-baseline gap-x-2">
         <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wide font-mono">{title}</h3>
         <span className="text-xs text-slate-500">{detail}</span>

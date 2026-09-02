@@ -15,6 +15,7 @@ import { ContributorsTable } from '@/components/ContributorsTable';
 import { FindingsTable } from '@/components/FindingsTable';
 import { MetricsGrid } from '@/components/MetricsGrid';
 import { RAG_BORDER } from '@/lib/rag';
+import { TONE_VALUE } from '@/lib/tone';
 import type { BehaviourMetricSummary, PracticeFinding, ReadinessAssessment } from '@/lib/types';
 
 const ASSESSMENT: ReadinessAssessment = {
@@ -83,6 +84,33 @@ describe('MetricsGrid', () => {
     expect(markup.indexOf('independent-review-coverage')).toBeLessThan(
       markup.indexOf('merge-cycle-time'),
     );
+  });
+
+  it('colours a card from the condition that graded that metric', () => {
+    const graded: ReadinessAssessment = {
+      label: 'red',
+      blocking: [
+        {
+          condition: 'independent-review-coverage-below-target',
+          label: 'red',
+          detail: '81.2%, below the 95% target',
+        },
+      ],
+      caution: [],
+      clear: [{ condition: 'merge-cycle-time-at-target', detail: '4.5 hours, at or below the target' }],
+    };
+    const markup = renderToStaticMarkup(
+      createElement(MetricsGrid, { summaries, empty: 'none', assessment: graded }),
+    );
+    expect(markup).toContain(TONE_VALUE.bad);
+    expect(markup).toContain(TONE_VALUE.good);
+  });
+
+  it('leaves every card colourless with no assessment, as an actor page renders it', () => {
+    const markup = renderToStaticMarkup(createElement(MetricsGrid, { summaries, empty: 'none' }));
+    expect(markup).not.toContain(TONE_VALUE.good);
+    expect(markup).not.toContain(TONE_VALUE.warn);
+    expect(markup).not.toContain(TONE_VALUE.bad);
   });
 
   it('says why there are no metrics rather than drawing an empty grid', () => {
@@ -156,24 +184,103 @@ describe('FindingsTable', () => {
 });
 
 describe('ContributorsTable', () => {
+  /** One person's own summaries for this repository, as the service now sends them per row. */
+  function contributor(
+    login: string,
+    contributions: number,
+    numerator: number,
+    denominator: number,
+    classifications: Record<string, number>,
+  ) {
+    return {
+      login,
+      contributions,
+      blocking: 0,
+      metrics: [
+        {
+          metric: 'independent-review-coverage',
+          summary: { status: 'observed' as const, numerator, denominator },
+          classifications,
+        },
+        {
+          metric: 'pull-request-size',
+          summary: { status: 'observed' as const, sample_size: 4, unit: 'lines', median: 214 },
+          classifications: { included: 4 },
+        },
+      ],
+    };
+  }
+
   const markup = renderToStaticMarkup(
     createElement(ContributorsTable, {
+      // Four distinct figures on purpose — 9 contributions, 6 merged, 3 pushed straight to the
+      // branch, 2 merged unreviewed — so a column rendering another column's count cannot pass.
       rows: [
-        { login: 'carol', contributions: 9, blocking: 2 },
-        { login: 'alice', contributions: 3, blocking: 0 },
+        contributor('carol', 9, 4, 9, { included: 4, 'no-review-events': 2, 'direct-commit': 3 }),
+        contributor('alice', 3, 3, 3, { included: 3 }),
       ],
       weeks: 4,
     }),
   );
 
+  /** One row's cells, in the order the reader meets them across the table. */
+  function cells(login: string): { text: string; className: string }[] {
+    const row = markup.split('<tr').find((each) => each.includes(`>${login}<`));
+    expect(row).toBeDefined();
+    return [...(row ?? '').matchAll(/<td class="([^"]*)"[^>]*>(.*?)<\/td>/g)].map((match) => ({
+      className: match[1] ?? '',
+      text: (match[2] ?? '').replace(/<[^>]*>/g, ''),
+    }));
+  }
+
   it('keeps the service’s order, which is about the changes rather than the people', () => {
     expect(markup.indexOf('carol')).toBeLessThan(markup.indexOf('alice'));
     expect(markup).not.toContain('aria-sort');
+    expect(markup).not.toContain('<button');
   });
 
-  it('links each login and re-reports what a rule already found there', () => {
+  it('links each login and states what that person did rather than what a rule found', () => {
     expect(markup).toContain('/actors/carol?weeks=4');
-    expect(markup).toContain('Blocking occurrences');
+    expect(markup).toContain('Merged PRs');
+    expect(markup).toContain('Direct pushes');
+    expect(markup).toContain('Unreviewed merges');
+    expect(markup).toContain('Median size');
+    expect(markup).toContain('214 lines');
+  });
+
+  it('drops the blocking count, which the findings table above already lists per person', () => {
+    expect(markup).not.toContain('Blocking occurrences');
+  });
+
+  it('puts each figure under its own heading rather than another figure’s', () => {
+    expect(cells('carol').map((cell) => cell.text)).toEqual(['carol', '9', '6', '3', '2', '214 lines']);
+  });
+
+  it('colours a bypassed process amber and never red, and leaves a clean row green', () => {
+    const carol = cells('carol');
+    // Only the two columns about bypassed process carry tone, and both cap at amber.
+    expect(carol[3]?.className).toContain(TONE_VALUE.warn);
+    expect(carol[4]?.className).toContain(TONE_VALUE.warn);
+    expect(carol[2]?.className).toContain('text-slate-300');
+    expect(carol[5]?.className).toContain('text-slate-300');
+    // Nobody pushed straight to the branch and nothing merged unreviewed, which reads well.
+    const alice = cells('alice');
+    expect(alice[3]?.className).toContain(TONE_VALUE.good);
+    expect(alice[4]?.className).toContain(TONE_VALUE.good);
+    expect(markup).not.toContain(TONE_VALUE.bad);
+  });
+
+  it('leaves an absent count as a dash in the table’s own slate rather than as a zero', () => {
+    const absent = renderToStaticMarkup(
+      createElement(ContributorsTable, {
+        rows: [{ login: 'dave', contributions: 2, blocking: 0, metrics: [] }],
+        weeks: 4,
+      }),
+    );
+
+    expect(absent).toContain('>-<');
+    expect(absent).not.toContain(TONE_VALUE.neutral);
+    expect(absent).not.toContain(TONE_VALUE.good);
   });
 
   it('contains no emoji: this page states figures in words and colour bars', () => {

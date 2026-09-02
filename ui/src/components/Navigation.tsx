@@ -28,7 +28,15 @@ export function Navigation() {
             icon={<FolderGit2 className="w-4 h-4" />}
             label="Repositories"
           />
-          <NavigationLink href="/#actors" icon={<Users className="w-4 h-4" />} label="Actors" />
+          {/* The anchor stays `#actors` — the section id, the route and the contract field are all
+              still spelled that way. The word the reader sees is CONTRIBUTORS, from 2026-09-02: it
+              is what these people are, where "actor" is the service's own name for the author of a
+              merge. Renaming the routes is a separate change. */}
+          <NavigationLink
+            href="/#actors"
+            icon={<Users className="w-4 h-4" />}
+            label="Contributors"
+          />
           <NavigationLink href="/#teams" icon={<Building2 className="w-4 h-4" />} label="Teams" />
         </div>
       </div>

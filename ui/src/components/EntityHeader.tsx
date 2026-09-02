@@ -4,14 +4,19 @@ import { borderClass } from '@/lib/rag';
 import type { ReadinessLabel } from '@/lib/types';
 
 /**
- * The head of a repository, actor or team page: where you are now, and nothing about how you got here.
+ * The head of a repository, contributor or team page: where you are now, and nothing about how you
+ * got here.
  *
- * NO BREADCRUMBS. Drill-through here is a graph, not a tree — a repository leads to its actors, an
- * actor back to other repositories, either to a team — so a trail would claim a hierarchy that does
- * not exist and would differ depending on which link the reader happened to follow. The `context`
- * line instead names what this entity is related to, as links onward.
+ * NO BREADCRUMBS. Drill-through here is a graph, not a tree — a repository leads to its
+ * contributors, a contributor back to other repositories, either to a team — so a trail would claim
+ * a hierarchy that does not exist and would differ depending on which link the reader happened to
+ * follow. The `context` line instead names what this entity is related to, as links onward.
+ *
+ * The kind is RENDERED, as the word above the entity name, which is why its members are the reader's
+ * words rather than the contract's: `contributor` from 2026-09-02, where the service still calls the
+ * author of a merge an actor and the route is still `/actors/…`.
  */
-export type EntityKind = 'repository' | 'actor' | 'team';
+export type EntityKind = 'repository' | 'contributor' | 'team';
 
 export function EntityHeader({
   kind,
@@ -22,7 +27,7 @@ export function EntityHeader({
 }: {
   kind: EntityKind;
   name: string;
-  /** Present only for a repository: actors and teams are never graded. */
+  /** Present only for a repository: contributors and teams are never graded. */
   label?: ReadinessLabel;
   context?: React.ReactNode;
   /** The header's own control — the week selector, which every page carries at the top right. */

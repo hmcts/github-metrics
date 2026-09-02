@@ -46,10 +46,17 @@ export interface BehaviourMetricSummary {
   classifications: Record<string, number>;
 }
 
+/**
+ * `informational` marks a condition the policy reported without judging — the three neutral
+ * merge-gate rules and a sufficient cohort. It arrives as `false` for a graded condition rather than
+ * being omitted, since the service sends the boolean it holds, but is ABSENT from a block stored
+ * before the field existed; every read of it guards on `== null` for that reason.
+ */
 export interface ReadinessCondition {
   condition: string;
   label?: ReadinessLabel;
   detail: string;
+  informational?: boolean;
 }
 
 export interface ReadinessAssessment {
@@ -409,10 +416,17 @@ export interface RepositoryRow {
   detail?: string;
 }
 
+/**
+ * `metrics` is this person's own summaries for this repository, sent verbatim by the service.
+ *
+ * The columns the table shows are subtracted out of it by `lib/contributor.ts`: the service derives
+ * nothing from these, so the page and the JSON a reader can curl carry the same figures.
+ */
 export interface ContributorRow {
   login: string;
   contributions: number;
   blocking: number;
+  metrics: BehaviourMetricSummary[];
 }
 
 export interface RepositoryDetail {

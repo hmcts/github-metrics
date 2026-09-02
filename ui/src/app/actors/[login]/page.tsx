@@ -48,7 +48,7 @@ export default async function ActorPage({
       <CollectionNotice windows={windows} />
 
       <EntityHeader
-        kind="actor"
+        kind="contributor"
         name={actor.actor_login}
         action={<NavWeekSelector options={windows.options} active={weeks} />}
         context={<span>{activity(actor)}</span>}
@@ -84,9 +84,10 @@ export default async function ActorPage({
 /**
  * Read one person, answering not-found for a login nobody in this window is spelled with.
  *
- * Only a 404 becomes a not-found page. Unlike a repository, an actor is not configured anywhere: the
- * set of them is whoever authored a reported merge, so a login with no contributions in the window
- * genuinely has no page here, and the service says so rather than the page inventing an empty one.
+ * Only a 404 becomes a not-found page. Unlike a repository, a contributor is not configured
+ * anywhere: the set of them is whoever authored a reported merge, so a login with no contributions
+ * in the window genuinely has no page here, and the service says so rather than the page inventing
+ * an empty one.
  */
 async function readActor(login: string, weeks: number): Promise<ActorDetail> {
   try {

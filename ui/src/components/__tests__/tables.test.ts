@@ -3,7 +3,7 @@
  *
  * `RepositoriesTable` is not here: it reads its filters from the router, which this renderer has no
  * context for, so its decidable part is tested as pure functions in `lib/__tests__/rows.test.ts`
- * instead. What these assert is what the guardrails are about — an actor list with no sortable
+ * instead. What these assert is what the guardrails are about — a contributor list with no sortable
  * header and no metric column, and team cards carrying label COUNTS and no combined verdict.
  */
 
@@ -95,7 +95,7 @@ describe('TeamsList', () => {
   it('states what a team owns and who worked in it', () => {
     expect(markup).toContain('/teams/platform?weeks=4');
     expect(markup).toContain('4 repositories');
-    expect(markup).toContain('6 actors');
+    expect(markup).toContain('6 contributors');
     expect(markup).toContain('1 not reported');
   });
 
@@ -109,6 +109,11 @@ describe('TeamsList', () => {
 
   it('dims a label nothing carries instead of dropping it', () => {
     expect(markup).toContain('opacity:0.38');
+  });
+
+  it('draws no box of its own, because the section it renders inside draws one', () => {
+    expect(markup).not.toContain('border');
+    expect(markup).not.toContain('bg-slate-900');
   });
 
   it('says nothing at all when no team was configured', () => {

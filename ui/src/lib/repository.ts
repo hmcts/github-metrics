@@ -17,6 +17,18 @@
  */
 
 import { ABSENT, count, figure, instant, percent, quantity } from '@/lib/format';
+import {
+  alertTone,
+  codeownersTone,
+  gateFieldTone,
+  maintenanceTone,
+  openPullRequestTone,
+  sonarGateTone,
+  sonarMeasureTone,
+  sonarRatingTone,
+  type ConditionOutcome,
+  type Tone,
+} from '@/lib/tone';
 import type {
   CodeownersReport,
   CohortSummary,
@@ -32,11 +44,19 @@ import type {
   SonarReport,
 } from '@/lib/types';
 
-/** One labelled figure: what it is, what it was, and what it was measured over or read from. */
+/**
+ * One labelled figure: what it is, what it was, and what it was measured over or read from.
+ *
+ * The tone is PRESENTATION rather than a fourth figure — how the value reads, resolved through the
+ * threshold table in `lib/tone.ts` and never decided here. Every row a builder in this module
+ * returns states one, `neutral` included, so a figure the page draws with no colour has said so
+ * rather than been forgotten; a row assembled elsewhere may leave it off and reads as neutral.
+ */
 export interface LabelledValue {
   label: string;
   value: string;
   detail?: string;
+  tone?: Tone;
 }
 
 /** Render a tri-state field without turning a value GitHub withheld into a false one. */
@@ -54,7 +74,7 @@ export function yesOrNo(value: boolean | null | undefined): string {
  * repository" is the finding behind a green label and an absent group would leave it unsaid.
  */
 export interface ConditionGroup {
-  key: 'blocking' | 'caution' | 'clear';
+  key: ConditionOutcome;
   heading: string;
   detail: string;
   /** What an empty group means, which is a finding rather than an absence of one. */
@@ -126,19 +146,71 @@ export function mergeGateRows(gate: MergeGateEvidence): LabelledValue[] {
     rule.required_status_checks.map((check) => check.context),
   );
   const dismissed = gate.pull_requests.some((rule) => rule.dismiss_stale_reviews_on_push);
+  // A protected branch whose rules GitHub WITHHELD arrives with the same empty rule arrays as one
+  // that carries no rules at all — `inventory.merge_gate_without_rule_details` builds both, and
+  // `rules_observed` is the only thing that separates them — so the three figures read off those
+  // arrays come out as `0`, `none` and `no` either way and mean opposite things. The policy stops at
+  // `merge-gate-rules-not-observable` there and grades none of the three, so the tone stops with it:
+  // the withheld value is `undefined`, for which `gateFieldTone` answers neutral. The PRINTED value
+  // is untouched and stays what `render.py` prints, so a page and the text report still state one
+  // thing; it is the colour that would have blamed a missing permission on the team.
+  const withheld = !gate.rules_observed;
+  // The branch a gate was read on and the rules this build did not interpret are passed no value
+  // either: `GateValue` is the flag or the count a tone could be read off, and neither of those two
+  // fields is one. `gateFieldTone` answers neutral for both, which is where that stays decided.
   return [
-    { label: 'Branch', value: gate.branch },
-    { label: 'Protected', value: yesOrNo(gate.protected) },
-    { label: 'Rules observed', value: yesOrNo(gate.rules_observed) },
-    { label: 'Approving reviews required', value: String(required) },
-    { label: 'Required status checks', value: [...contexts].sort().join(', ') || 'none' },
-    { label: 'Dismiss stale reviews on push', value: yesOrNo(dismissed) },
-    { label: 'Applies to administrators', value: yesOrNo(gate.applies_to_administrators) },
-    { label: 'Restricts deletions', value: yesOrNo(gate.restricts_deletions) },
-    { label: 'Blocks force pushes', value: yesOrNo(gate.blocks_force_pushes) },
-    { label: 'Requires linear history', value: yesOrNo(gate.requires_linear_history) },
-    { label: 'Restricts branch names', value: yesOrNo(gate.restricts_branch_names) },
-    { label: 'Rules not interpreted', value: gate.unmodelled_rules.join(', ') || 'none' },
+    { label: 'Branch', value: gate.branch, tone: gateFieldTone('branch', undefined) },
+    { label: 'Protected', value: yesOrNo(gate.protected), tone: gateFieldTone('protected', gate.protected) },
+    {
+      label: 'Rules observed',
+      value: yesOrNo(gate.rules_observed),
+      tone: gateFieldTone('rules_observed', gate.rules_observed),
+    },
+    {
+      label: 'Approving reviews required',
+      value: String(required),
+      tone: gateFieldTone('required_approving_review_count', withheld ? undefined : required),
+    },
+    {
+      label: 'Required status checks',
+      value: [...contexts].sort().join(', ') || 'none',
+      tone: gateFieldTone('required_status_checks', withheld ? undefined : contexts.length),
+    },
+    {
+      label: 'Dismiss stale reviews on push',
+      value: yesOrNo(dismissed),
+      tone: gateFieldTone('dismiss_stale_reviews_on_push', withheld ? undefined : dismissed),
+    },
+    {
+      label: 'Applies to administrators',
+      value: yesOrNo(gate.applies_to_administrators),
+      tone: gateFieldTone('applies_to_administrators', gate.applies_to_administrators),
+    },
+    {
+      label: 'Restricts deletions',
+      value: yesOrNo(gate.restricts_deletions),
+      tone: gateFieldTone('restricts_deletions', gate.restricts_deletions),
+    },
+    {
+      label: 'Blocks force pushes',
+      value: yesOrNo(gate.blocks_force_pushes),
+      tone: gateFieldTone('blocks_force_pushes', gate.blocks_force_pushes),
+    },
+    {
+      label: 'Requires linear history',
+      value: yesOrNo(gate.requires_linear_history),
+      tone: gateFieldTone('requires_linear_history', gate.requires_linear_history),
+    },
+    {
+      label: 'Restricts branch names',
+      value: yesOrNo(gate.restricts_branch_names),
+      tone: gateFieldTone('restricts_branch_names', gate.restricts_branch_names),
+    },
+    {
+      label: 'Rules not interpreted',
+      value: gate.unmodelled_rules.join(', ') || 'none',
+      tone: gateFieldTone('unmodelled_rules', undefined),
+    },
   ];
 }
 
@@ -162,10 +234,30 @@ export function openPullRequestCards(report: OpenPullRequestReport): LabelledVal
       : `${instant(report.starts_at)} to ${instant(report.ends_at)}`;
   const read = report.fetched_at === undefined ? undefined : `as at ${instant(report.fetched_at)}`;
   return [
-    { label: 'Opened in window', value: String(summary.opened_in_window), detail: measured },
-    { label: 'Closed without merge', value: String(summary.closed_without_merge), detail: measured },
-    { label: 'Currently open', value: String(summary.currently_open), detail: read },
-    { label: 'Stale open', value: String(summary.stale_open), detail: read },
+    {
+      label: 'Opened in window',
+      value: String(summary.opened_in_window),
+      detail: measured,
+      tone: openPullRequestTone('opened_in_window', summary.opened_in_window),
+    },
+    {
+      label: 'Closed without merge',
+      value: String(summary.closed_without_merge),
+      detail: measured,
+      tone: openPullRequestTone('closed_without_merge', summary.closed_without_merge),
+    },
+    {
+      label: 'Currently open',
+      value: String(summary.currently_open),
+      detail: read,
+      tone: openPullRequestTone('currently_open', summary.currently_open),
+    },
+    {
+      label: 'Stale open',
+      value: String(summary.stale_open),
+      detail: read,
+      tone: openPullRequestTone('stale_open', summary.stale_open),
+    },
   ];
 }
 
@@ -202,6 +294,7 @@ export function securityCards(alerts: SecurityAlertEvidence): LabelledValue[] {
     label: family,
     value: figure(counts[family].open),
     detail: severityDetail(family, counts[family]),
+    tone: alertTone(family, counts[family]),
   }));
 }
 
@@ -215,6 +308,7 @@ export function maintenanceRows(report: MaintenanceReport): LabelledValue[] {
   return report.windows.map((window) => ({
     label: `${window.months} months`,
     value: yesOrNo(window.committed_within),
+    tone: maintenanceTone(window.committed_within),
     detail:
       window.human_detail === undefined
         ? `human commit: ${humanAnswer(window.human_committed_within)}`
@@ -269,18 +363,25 @@ export function maintenanceSummary(report: MaintenanceReport): string {
 export function codeownersCard(report: CodeownersReport): LabelledValue {
   const codeowners = report.codeowners;
   if (codeowners === undefined) {
-    return { label: 'CODEOWNERS', value: ABSENT, detail: report.detail ?? 'not available' };
+    return {
+      label: 'CODEOWNERS',
+      value: ABSENT,
+      detail: report.detail ?? 'not available',
+      tone: codeownersTone(undefined),
+    };
   }
   if (codeowners.files.length === 0) {
     return {
       label: 'CODEOWNERS',
       value: 'absent',
       detail: 'no CODEOWNERS file at any of the checked locations',
+      tone: codeownersTone(0),
     };
   }
   return {
     label: 'CODEOWNERS',
     value: count(codeowners.files.length, 'file', 'files'),
+    tone: codeownersTone(codeowners.files.length),
     detail: codeowners.files
       .map(
         (file) =>
@@ -306,6 +407,7 @@ export function sonarGateCard(report: SonarReport): LabelledValue {
       label: 'Quality gate',
       value: ABSENT,
       detail: [...named, report.detail ?? 'not available'].join(' · '),
+      tone: sonarGateTone(undefined),
     };
   }
   const analysed = measures.analysis_at === undefined ? 'never analysed' : `analysed ${instant(measures.analysis_at)}`;
@@ -313,6 +415,7 @@ export function sonarGateCard(report: SonarReport): LabelledValue {
     label: 'Quality gate',
     value: measures.gate === undefined ? 'not reported' : measures.gate.level,
     detail: [...named, analysed].join(' · '),
+    tone: sonarGateTone(measures.gate?.level),
   };
 }
 
@@ -332,20 +435,70 @@ export function ratingLetter(rating: SonarRating | undefined): string {
   return SONAR_RATING_LETTERS[index - 1] as string;
 }
 
-/** Every measure the project reported, each unreported one left visibly absent. */
+/**
+ * Every measure the project reported, each unreported one left visibly absent.
+ *
+ * The eight counts are toned against the whole measure set rather than against their own value,
+ * because an issue count borrows its severity from the rating that covers it — `lib/tone.ts` reads
+ * both, and a count with no rating beside it is worth weighing and never worse.
+ */
 export function sonarRows(measures: SonarMeasures): LabelledValue[] {
   return [
-    { label: 'Coverage', value: percent(measures.coverage) },
-    { label: 'Duplicated lines', value: percent(measures.duplicated_lines_density) },
-    { label: 'Lines of code', value: quantity(measures.lines_of_code) },
-    { label: 'Violations', value: quantity(measures.violations) },
-    { label: 'Reliability issues', value: quantity(measures.reliability_issues) },
-    { label: 'Maintainability issues', value: quantity(measures.maintainability_issues) },
-    { label: 'Security issues', value: quantity(measures.security_issues) },
-    { label: 'Security hotspots', value: quantity(measures.security_hotspots) },
-    { label: 'Reliability rating', value: ratingLetter(measures.reliability_rating) },
-    { label: 'Maintainability rating', value: ratingLetter(measures.maintainability_rating) },
-    { label: 'Security rating', value: ratingLetter(measures.security_rating) },
-    { label: 'Security review rating', value: ratingLetter(measures.security_review_rating) },
+    { label: 'Coverage', value: percent(measures.coverage), tone: sonarMeasureTone('coverage', measures) },
+    {
+      label: 'Duplicated lines',
+      value: percent(measures.duplicated_lines_density),
+      tone: sonarMeasureTone('duplicated_lines_density', measures),
+    },
+    {
+      label: 'Lines of code',
+      value: quantity(measures.lines_of_code),
+      tone: sonarMeasureTone('lines_of_code', measures),
+    },
+    {
+      label: 'Violations',
+      value: quantity(measures.violations),
+      tone: sonarMeasureTone('violations', measures),
+    },
+    {
+      label: 'Reliability issues',
+      value: quantity(measures.reliability_issues),
+      tone: sonarMeasureTone('reliability_issues', measures),
+    },
+    {
+      label: 'Maintainability issues',
+      value: quantity(measures.maintainability_issues),
+      tone: sonarMeasureTone('maintainability_issues', measures),
+    },
+    {
+      label: 'Security issues',
+      value: quantity(measures.security_issues),
+      tone: sonarMeasureTone('security_issues', measures),
+    },
+    {
+      label: 'Security hotspots',
+      value: quantity(measures.security_hotspots),
+      tone: sonarMeasureTone('security_hotspots', measures),
+    },
+    {
+      label: 'Reliability rating',
+      value: ratingLetter(measures.reliability_rating),
+      tone: sonarRatingTone(measures.reliability_rating),
+    },
+    {
+      label: 'Maintainability rating',
+      value: ratingLetter(measures.maintainability_rating),
+      tone: sonarRatingTone(measures.maintainability_rating),
+    },
+    {
+      label: 'Security rating',
+      value: ratingLetter(measures.security_rating),
+      tone: sonarRatingTone(measures.security_rating),
+    },
+    {
+      label: 'Security review rating',
+      value: ratingLetter(measures.security_review_rating),
+      tone: sonarRatingTone(measures.security_review_rating),
+    },
   ];
 }

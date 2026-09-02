@@ -114,7 +114,8 @@ export function RepositoriesTable({
           detail="Clear the term or the readiness filter to see the whole estate."
         />
       ) : (
-        <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-x-auto">
+        // No border of its own: the table sits inside a `Section` panel that already draws one.
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="text-slate-400 border-b border-slate-800">
               <tr>

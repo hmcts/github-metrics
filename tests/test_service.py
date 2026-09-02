@@ -132,7 +132,11 @@ def record_collection(settings: Configuration, edge: datetime) -> None:
 
 
 def assessment() -> ReadinessAssessment:
-    """Build an amber assessment carrying the one condition that held it below green."""
+    """Build an amber assessment carrying the one condition that held it below green.
+
+    The two clear conditions are the pair the `informational` flag exists to keep apart: a check
+    that was satisfied, and a rule the policy reports without judging.
+    """
     return ReadinessAssessment(
         label=ReadinessLabel.AMBER,
         blocking=(
@@ -143,7 +147,17 @@ def assessment() -> ReadinessAssessment:
             ),
         ),
         caution=(),
-        clear=(),
+        clear=(
+            ReadinessCondition(
+                condition="branch-protected",
+                detail="the default branch main is protected",
+            ),
+            ReadinessCondition(
+                condition="linear-history-not-required",
+                detail="main does not require a linear history",
+                informational=True,
+            ),
+        ),
     )
 
 
@@ -717,12 +731,32 @@ def test_a_repository_reports_its_whole_evidence_block(client: TestClient) -> No
     assert [item["rule"] for item in body["evidence"]["behaviour"]] == ["unreviewed-merge"]
 
 
+def test_the_informational_flag_reaches_a_reader_over_the_wire(client: TestClient) -> None:
+    """Pin the flag on the JSON rather than only on the policy object that carries it.
+
+    The dashboard leaves an informational row uncoloured and colours every other clear condition
+    green, so a serialisation that dropped the flag would report a rule nobody grades as a check
+    that passed — with the policy tests still green, since they read the object and not the body.
+    """
+    conditions = {
+        condition["condition"]: condition
+        for condition in client.get("/repositories/cath-service").json()["evidence"]["assessment"]["clear"]
+    }
+
+    assert conditions["linear-history-not-required"]["informational"] is True
+    assert conditions["branch-protected"]["informational"] is False
+
+
 def test_a_repository_lists_its_contributors_weightiest_first(client: TestClient) -> None:
     contributors = client.get("/repositories/cath-service").json()["contributors"]
+    # The person's own summaries for this repository, sent as the contract carries them: the
+    # repository page subtracts what they merged and what they pushed straight to the branch out of
+    # these, so the figures beside a login and the ones in the JSON are the same figures.
+    summaries = [summary.model_dump(mode="json", exclude_none=True) for summary in metrics()]
 
     assert contributors == [
-        {"login": "Alice", "contributions": 3, "blocking": 2},
-        {"login": "bob", "contributions": 1, "blocking": 0},
+        {"login": "Alice", "contributions": 3, "blocking": 2, "metrics": summaries},
+        {"login": "bob", "contributions": 1, "blocking": 0, "metrics": summaries},
     ]
 
 
@@ -1021,6 +1055,14 @@ def test_contributor_rows_are_grouped_by_the_repository_they_were_measured_in() 
 
     assert sorted(grouped) == ["cath-service", "civil-service"]
     assert [row.login for row in grouped["civil-service"]] == ["Alice"]
+
+
+def test_a_contributor_row_carries_the_actors_own_metrics_unchanged() -> None:
+    grouped = contributor_rows(practice_report())
+
+    # Verbatim: the UI subtracts what a person merged and what they pushed out of these, and the
+    # service deriving any of it here would put a second arithmetic beside the contract's own.
+    assert [row.metrics for row in grouped["civil-service"]] == [metrics()]
 
 
 def test_the_service_serves_the_default_window_and_says_what_it_is_serving(

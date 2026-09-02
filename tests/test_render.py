@@ -71,6 +71,7 @@ from metrics.render import (
     actor_combination_counts,
     actor_group,
     percentage_of,
+    render_assessment,
     render_practice_report,
     render_report,
     render_trend_report,
@@ -437,6 +438,22 @@ def test_a_caution_imposes_no_ceiling_and_shows_no_label(report: str) -> None:
         "    status-checks-not-required\n"
         "      status checks required before merging to master: 0, so CI cannot block a merge\n"
     ) in report
+
+
+def test_an_informational_condition_adds_no_line_to_the_text_report() -> None:
+    """Keep the flag out of the readable report: it is for a renderer that can colour a row.
+
+    The text report needs no such distinction, because each informational condition already says in
+    its own detail that it bears on the label in neither state.
+    """
+    graded = ReadinessCondition(condition="branch-protected", detail="the default branch master is protected")
+    reported = graded.model_copy(update={"informational": True})
+
+    assert render_assessment(
+        ReadinessAssessment(label=ReadinessLabel.GREEN, blocking=(), caution=(), clear=(reported,)),
+    ) == render_assessment(
+        ReadinessAssessment(label=ReadinessLabel.GREEN, blocking=(), caution=(), clear=(graded,)),
+    )
 
 
 def test_an_empty_assessment_section_says_so_rather_than_vanishing(report: str) -> None:
