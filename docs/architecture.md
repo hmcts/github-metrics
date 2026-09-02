@@ -1189,7 +1189,7 @@ each run collecting to the edge the run before it set.
 
 THE ANCHOR IS SAID OUT LOUD. A window that silently means "as at the last collection" is read as "as
 at today", so the collected instant is published on `/windows` (which every page already fetches for
-the span selector) and on the overview header, and the CLI logs it once per run at INFO whenever the
+the span selector) and on each estate list's header, and the CLI logs it once per run at INFO whenever the
 anchor is behind today's midnight. `lookback.stale_collection_days` (default 8 — one missed WEEKLY
 run, not one missed day) is the threshold above which the service marks the collection stale and
 every page shows a warning bar, and the CLI logs a WARNING naming the last collection.
@@ -1352,6 +1352,43 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   periods would be read as the whole history since enablement. The bound is on the series a request
   RESOLVES to, not only the count it names, because `periods` is optional and leaving it out asks for
   every whole period since enablement — which is where an unbounded request would otherwise live.
+  THE CACHE LOCKS PER SPAN, AND A WARMER KEEPS EVERY OFFERED SPAN BUILT (2026-09-02). `WindowCache`
+  held ONE lock for the whole cache, so a cold 26-week build — which walks every configured
+  repository's cached facts — was every other request's wait, including requests for a span already
+  built. It now hands out a lock per span and a lock per series cut through a small guarded registry
+  (`LockRegistry`), keeping the bound that matters, that a span builds once, and dropping the one
+  that was an accident, that only one span could build at a time. The eviction order of the series
+  cache stays under a single lock of its own, because the order is shared by every key and belongs to
+  none of them.
+  The second half is that an hourly `--max-bundle-age` made EVERY span cold again every hour, so the
+  next reader paid the rebuild on the span they were already reading. `WindowCache.warm` builds a
+  span when none is held, when the source stamp has moved, or when the held bundle would go stale
+  inside the margin it is given — which `bundle` cannot do, because `bundle` deliberately returns a
+  bundle that is still usable, and a warmer asking for one would refresh nothing until a reader had
+  already waited. `keep_warm` runs it for every offered span on a daemon thread started and stopped
+  by a FastAPI lifespan handler, on `--warm-interval` (default 300 seconds, validated like the age
+  and REFUSED at or above it, since the interval is also the margin: an interval outlasting the age
+  asks whether a bundle will be usable further ahead than a bundle can live, and the answer for one
+  built a second ago is no, so every span would be rebuilt on every wake). A warm that raises costs a
+  log line and not the thread: a cache file unreadable now may be readable at the next wake, and a
+  thread that died on it would leave a service that looks warm and is not. `main` still builds the
+  default span synchronously before uvicorn listens, despite the warmer building it moments later —
+  a cache the service cannot read must fail while a human is watching.
+  THE THREE ESTATE LISTS ARE ROUTES, NOT SECTIONS OF ONE PAGE (2026-09-02). `/repositories` is the
+  landing page and carries what the overview carried — the organisation header, the four estate
+  figures and the readiness donut — while `/contributors` and `/teams` carry the same header above
+  their own list and nothing else; `/` redirects to `/repositories`, carrying `?weeks=` through so a
+  link to the old landing page does not silently change the window. THE NAV BAR'S OWN THREE LINKS
+  CANNOT CARRY THE SPAN — the layout renders that bar and a layout is handed no search parameters —
+  so `ui/src/middleware.ts` writes the `weeks` cookie for any request that named a span, and the
+  links resolve from it. The selector's write alone was not enough: a reader who arrived on somebody
+  else's `?weeks=26` link had no cookie, and their first nav click reset the window silently. Each
+  list fetches three
+  responses where the overview fetched five, which also stops a cold span being entered four times
+  at once. `/actors/[login]` became `/contributors/[login]`, deliberately breaking bookmarked actor
+  URLs rather than leaving a `/contributors` list above an `/actors` detail: THE SERVICE'S `/actors`
+  ENDPOINTS AND FIELD NAMES DID NOT MOVE, and must not be renamed to match a route — `actors` is
+  what the JSON contract and the report call them.
   No personal rankings, UNCHANGED AND BINDING ON THE UI: the actor section lists a person's
   repositories and the label of each, ordered alphabetically by login within the group their labels
   put them under, and nothing scores or ranks people. Every list of people the service serves is

@@ -1,7 +1,8 @@
 'use client';
 
+import clsx from 'clsx';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useTransition } from 'react';
 import { weeksCookie } from '@/lib/weeks';
 
 /**
@@ -17,6 +18,11 @@ import { weeksCookie } from '@/lib/weeks';
  *
  * `router.replace` rather than `push`: changing the window is re-reading the same page, and a history
  * entry per click would make the back button walk through span changes instead of leaving the page.
+ *
+ * The navigation runs inside a transition so the group can say it is working. The pressed highlight
+ * alone claims the span has changed; while the server render is still in flight it has not, and on a
+ * cold span that render is the slowest thing on the page. The two halves are the whole answer: which
+ * button was pressed, and whether the page behind it has arrived.
  */
 export function NavWeekSelector({ options, active }: { options: readonly number[]; active: number }) {
   const pathname = usePathname();
@@ -24,12 +30,16 @@ export function NavWeekSelector({ options, active }: { options: readonly number[
   // Tracks the click so the button highlights immediately, without waiting for the server render the
   // navigation triggers — otherwise the pressed state lags the whole round trip.
   const [selected, setSelected] = useState<number | null>(null);
+  const [pending, startTransition] = useTransition();
   const current = selected ?? active;
 
   // Dropped the moment a render arrives at a different span. Only the query string changes on a span
   // switch, so React keeps this component mounted and the optimistic value would outlive what it was
   // guessing at: pressing Back would leave the button for the span the reader just left highlighted
   // over figures that are now the other window's.
+  //
+  // The transition ends on the same render this effect answers to, so the guess and the dimming lift
+  // together: neither is left standing over figures the other has already given up on.
   useEffect(() => setSelected(null), [active]);
 
   function choose(weeks: number) {
@@ -39,16 +49,48 @@ export function NavWeekSelector({ options, active }: { options: readonly number[
     // put in the URL with `replaceState` survives a span change.
     const parameters = new URLSearchParams(window.location.search);
     parameters.set('weeks', String(weeks));
-    router.replace(`${pathname}?${parameters.toString()}`);
+    startTransition(() => router.replace(`${pathname}?${parameters.toString()}`));
   }
 
   return (
-    <div className="flex items-center gap-1.5" role="group" aria-label="Reporting window">
+    <WeekSpanButtons options={options} current={current} pending={pending} onChoose={choose} />
+  );
+}
+
+/**
+ * The buttons themselves, with no router and no state of their own.
+ *
+ * Split out because `useTransition` reports `false` under `react-dom/server` by design — there is no
+ * transition to be in — so the pending markup is unreachable through the parent in the renderer the
+ * component tests use. Handed `pending` as a prop, what a reader actually sees while waiting is
+ * asserted directly.
+ *
+ * The buttons stay live while pending: a reader who pressed 26 weeks and thought better of it can
+ * press 4 without waiting out the first navigation, so the group is dimmed rather than disabled.
+ */
+export function WeekSpanButtons({
+  options,
+  current,
+  pending,
+  onChoose,
+}: {
+  options: readonly number[];
+  current: number;
+  pending: boolean;
+  onChoose: (weeks: number) => void;
+}) {
+  return (
+    <div
+      className={clsx('flex items-center gap-1.5 transition-opacity', pending && 'opacity-50')}
+      role="group"
+      aria-label="Reporting window"
+      aria-busy={pending}
+    >
       {options.map((weeks) => (
         <button
           key={weeks}
           type="button"
-          onClick={() => choose(weeks)}
+          onClick={() => onChoose(weeks)}
           aria-pressed={current === weeks}
           aria-label={`${weeks} week window`}
           className={`px-3 py-1.5 rounded text-sm transition-colors ${

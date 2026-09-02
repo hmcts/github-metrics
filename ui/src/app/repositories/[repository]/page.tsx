@@ -11,7 +11,7 @@ import { FindingsTable } from '@/components/FindingsTable';
 import { MetricCard } from '@/components/MetricCard';
 import { MetricsGrid } from '@/components/MetricsGrid';
 import { NavWeekSelector } from '@/components/NavWeekSelector';
-import { Panel, Section } from '@/components/Section';
+import { Panel, Section, SectionPair } from '@/components/Section';
 import { TrendSection } from '@/components/TrendSection';
 import { getRepository, getTrend, getWindows, isNotFound } from '@/lib/api';
 import { instant, span } from '@/lib/format';
@@ -36,11 +36,13 @@ import { WEEKS_COOKIE, resolveWeeks, withWeeks, type SearchValue } from '@/lib/w
 /**
  * One repository's whole evidence block at one window span.
  *
- * The page is the block, in the block's own order: what the readiness policy decided and on what
- * evidence, then the cohort it was decided over, then each collected signal, then the behaviour
- * metrics, the findings, and who authored the window. Nothing is recomputed here — every figure is
- * one the service sent, formatted by `lib/repository.ts` — so the page and `metrics evidence` for
- * the same span are one claim rather than two that can drift.
+ * The page is the block, and mostly in the block's own order: the cohort it was all measured over,
+ * then each collected signal, the findings, and who authored the window. The one departure is
+ * behaviour and readiness, which the page swaps: the metrics sit directly under the cohort row and
+ * the policy's blocking, caution and clear groups follow them, because a reader wants the figures
+ * before the grading drawn from them. Nothing is recomputed here — every figure is one the service
+ * sent, formatted by `lib/repository.ts` — so the page and `metrics evidence` for the same span are
+ * one claim rather than two that can drift.
  *
  * A repository the span cannot be reported for keeps its page and says why. It is a configured
  * repository either way, and a 404 for one would read as a repository nobody has heard of.
@@ -153,6 +155,16 @@ export default async function RepositoryPage({
         </div>
       </Panel>
 
+      {/* Above the assessment on purpose: these are the measurements the policy graded, and a
+          reader takes the verdict better having read the figures it was drawn from. */}
+      <Section heading="Behaviour" detail={span(evidence.starts_at, evidence.ends_at)}>
+        <MetricsGrid
+          summaries={evidence.metrics}
+          empty="No behaviour metric was computed for this repository at this span."
+          assessment={evidence.assessment}
+        />
+      </Section>
+
       {evidence.assessment ? (
         <AssessmentSection assessment={evidence.assessment} />
       ) : (
@@ -164,57 +176,59 @@ export default async function RepositoryPage({
         </Section>
       )}
 
-      <Section heading="Merge gate" detail={read(evidence.merge_gate.fetched_at)}>
-        {evidence.merge_gate.gate === undefined ? (
-          <EmptyState
-            message="The merge gate could not be read for this repository."
-            detail={evidence.merge_gate.detail}
-          />
-        ) : (
-          <DefinitionList values={mergeGateRows(evidence.merge_gate.gate)} />
-        )}
-      </Section>
+      {/* The gate is what open pull requests have to pass, so the rules and the queue are read as
+          one thing rather than a screen apart. */}
+      <SectionPair>
+        <Section heading="Merge gate" detail={read(evidence.merge_gate.fetched_at)}>
+          {evidence.merge_gate.gate === undefined ? (
+            <EmptyState
+              message="The merge gate could not be read for this repository."
+              detail={evidence.merge_gate.detail}
+            />
+          ) : (
+            <DefinitionList values={mergeGateRows(evidence.merge_gate.gate)} />
+          )}
+        </Section>
 
-      <Section heading="Open pull requests" detail={read(evidence.open_pull_requests.fetched_at)}>
-        {openPullRequests.length === 0 ? (
-          <EmptyState
-            message="Open pull-request state was not collected for this repository."
-            detail={evidence.open_pull_requests.detail}
-          />
-        ) : (
-          <ValueCards values={openPullRequests} />
-        )}
-      </Section>
+        <Section heading="Open pull requests" detail={read(evidence.open_pull_requests.fetched_at)}>
+          {openPullRequests.length === 0 ? (
+            <EmptyState
+              message="Open pull-request state was not collected for this repository."
+              detail={evidence.open_pull_requests.detail}
+            />
+          ) : (
+            // Two across rather than the four the full width allowed: in half a row, four counts
+            // are four cramped columns, and two rows of two keep each figure at headline size.
+            <ValueCards values={openPullRequests} columns={2} />
+          )}
+        </Section>
+      </SectionPair>
 
-      <Section heading="Security alerts" detail={read(evidence.security.fetched_at)}>
-        {alerts === undefined ? (
-          <EmptyState
-            message="No security alert family could be read for this repository."
-            detail={evidence.security.detail}
-          />
-        ) : (
-          <DefinitionList values={securityCards(alerts)} />
-        )}
-      </Section>
+      {/* An open alert and the maintenance window that would have patched it are the same question
+          asked twice, which is why they sit together. */}
+      <SectionPair>
+        <Section heading="Security alerts" detail={read(evidence.security.fetched_at)}>
+          {alerts === undefined ? (
+            <EmptyState
+              message="No security alert family could be read for this repository."
+              detail={evidence.security.detail}
+            />
+          ) : (
+            <DefinitionList values={securityCards(alerts)} />
+          )}
+        </Section>
 
-      <Section heading="Maintenance" detail={maintenanceSummary(evidence.maintenance)}>
-        {evidence.maintenance.windows.length === 0 ? (
-          <EmptyState message="No maintenance window was checked for this repository." />
-        ) : (
-          <DefinitionList values={maintenanceRows(evidence.maintenance)} />
-        )}
-      </Section>
+        <Section heading="Maintenance" detail={maintenanceSummary(evidence.maintenance)}>
+          {evidence.maintenance.windows.length === 0 ? (
+            <EmptyState message="No maintenance window was checked for this repository." />
+          ) : (
+            <DefinitionList values={maintenanceRows(evidence.maintenance)} />
+          )}
+        </Section>
+      </SectionPair>
 
       <Section heading="SonarCloud" detail={read(evidence.sonar.fetched_at)}>
         <ValueCards values={[sonarGateCard(evidence.sonar), ...sonarMeasures(evidence.sonar)]} />
-      </Section>
-
-      <Section heading="Behaviour" detail={span(evidence.starts_at, evidence.ends_at)}>
-        <MetricsGrid
-          summaries={evidence.metrics}
-          empty="No behaviour metric was computed for this repository at this span."
-          assessment={evidence.assessment}
-        />
       </Section>
 
       {hasPeriods(series) ? <TrendSection series={series} cut={windows.trend_periods} /> : null}
@@ -275,10 +289,20 @@ function sonarMeasures(report: SonarReport): LabelledValue[] {
  *
  * The tone rides on the row rather than being decided here, so the threshold behind a colour is in
  * `lib/tone.ts` where a test can reach it and this stays the page drawing what it was handed.
+ *
+ * `columns` is how wide the row was given, not how many values it holds: four across at full width,
+ * two across for a row inside half of a `SectionPair`. Four counts squeezed into half a row read as
+ * a strip of digits, and the same four on two rows of two stay figures.
  */
-function ValueCards({ values }: { values: readonly LabelledValue[] }) {
+function ValueCards({ values, columns = 4 }: { values: readonly LabelledValue[]; columns?: 2 | 4 }) {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+    <div
+      className={
+        columns === 2
+          ? 'grid grid-cols-1 sm:grid-cols-2 gap-4'
+          : 'grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4'
+      }
+    >
       {values.map((value) => (
         <MetricCard
           key={value.label}

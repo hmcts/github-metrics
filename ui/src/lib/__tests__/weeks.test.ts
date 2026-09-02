@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { WEEKS_COOKIE, parseWeeks, resolveWeeks, weeksCookie, withWeeks } from '@/lib/weeks';
+import {
+  LANDING_PATH,
+  WEEKS_COOKIE,
+  landingTarget,
+  parseWeeks,
+  rememberableWeeks,
+  resolveWeeks,
+  weeksCookie,
+  withWeeks,
+} from '@/lib/weeks';
 
 /** The spans a service serving the default configuration offers, as `GET /windows` reports them. */
 const OPTIONS: readonly number[] = [1, 4, 8, 12, 26];
@@ -67,6 +76,62 @@ describe('resolveWeeks', () => {
 describe('withWeeks', () => {
   it('carries the span onto a drill-through link', () => {
     expect(withWeeks('/repositories/cath-service', 8)).toBe('/repositories/cath-service?weeks=8');
+  });
+});
+
+describe('landingTarget', () => {
+  it('sends a bare request for the old overview to the repositories list', () => {
+    expect(landingTarget(undefined)).toBe(LANDING_PATH);
+    expect(landingTarget(null)).toBe(LANDING_PATH);
+    expect(landingTarget('  ')).toBe(LANDING_PATH);
+  });
+
+  it('carries a span the link named, so the redirect does not change the window', () => {
+    expect(landingTarget('26')).toBe('/repositories?weeks=26');
+    expect(landingTarget(['26', '4'])).toBe('/repositories?weeks=26');
+  });
+
+  // The spans on offer are not known here, and the landing page resolves what arrives exactly as
+  // the overview did: an unoffered span falls back to the cookie and then to the service's default.
+  it('carries a span off the list rather than dropping it, and encodes whatever was typed', () => {
+    expect(landingTarget('30')).toBe('/repositories?weeks=30');
+    expect(landingTarget('4&x=/y')).toBe('/repositories?weeks=4%26x%3D%2Fy');
+  });
+});
+
+describe('rememberableWeeks', () => {
+  it('remembers the span a link named', () => {
+    expect(rememberableWeeks('26')).toBe(26);
+  });
+
+  it('remembers a span off this service’s list, which resolveWeeks then drops', () => {
+    // The middleware cannot ask `/windows` per request, so the list is not checked here. A cookie
+    // holding 30 is read as no choice by `parseWeeks` and the page falls back, as it does today.
+    expect(rememberableWeeks('30')).toBe(30);
+    expect(parseWeeks(String(rememberableWeeks('30')), OPTIONS)).toBeNull();
+  });
+
+  it('takes the first of a repeated parameter, as the pages do', () => {
+    expect(rememberableWeeks(['26', '4'])).toBe(26);
+  });
+
+  it('remembers nothing where no span was named', () => {
+    expect(rememberableWeeks(undefined)).toBeNull();
+    expect(rememberableWeeks(null)).toBeNull();
+    expect(rememberableWeeks('')).toBeNull();
+    expect(rememberableWeeks('  ')).toBeNull();
+  });
+
+  it('keeps what could not be a span out of a cookie that lives a year', () => {
+    expect(rememberableWeeks('soon')).toBeNull();
+    expect(rememberableWeeks('4.5')).toBeNull();
+    expect(rememberableWeeks('-4')).toBeNull();
+    expect(rememberableWeeks('0')).toBeNull();
+    expect(rememberableWeeks('4; path=/evil')).toBeNull();
+  });
+
+  it('re-spells the span from the number, so the cookie is what parseWeeks matches', () => {
+    expect(rememberableWeeks(' 04 ')).toBe(4);
   });
 });
 

@@ -12,11 +12,13 @@ Its own entry point, `metrics-serve`, rather than a `metrics` subcommand — it 
 the collection commands, and `cli.py` is edited heavily elsewhere.
 """
 
+import asyncio
 import logging
 import threading
 from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -71,6 +73,23 @@ stamp below notices one the moment it does, so this exists only to bound how lon
 served after something the stamp cannot see — a clock, a configuration reload — has moved on.
 """
 
+DEFAULT_WARM_INTERVAL_SECONDS = 300
+"""How often the warmer refreshes every span on offer, absent `--warm-interval`.
+
+Below `DEFAULT_BUNDLE_AGE_SECONDS` on purpose, and by a wide margin: the warmer's interval is also
+the margin it refreshes within, so a span is rebuilt on the wake BEFORE the one where a reader would
+have met a stale bundle. An interval at or above the age would refresh a span only after somebody had
+already waited for it, which is the whole thing the warmer exists to prevent.
+"""
+
+WARMER_SHUTDOWN_SECONDS = 5.0
+"""How long shutdown waits for the warmer to notice the stopping event before leaving it behind.
+
+Bounded rather than open-ended because the thread may be in the middle of a build, and a service
+being shut down should not hold the port for the length of a cohort load. The thread is a daemon, so
+whatever is left of a build when the wait runs out dies with the process rather than outliving it.
+"""
+
 DEFAULT_PERIOD_DAYS = 28
 """How long one period of a series runs when a request names no span, as `metrics trend` defaults it.
 
@@ -90,7 +109,7 @@ be read as the whole history since enablement.
 
 The bound is on the series a request RESOLVES to, not only on the number it names. `periods` is
 optional and, left out, asks for every whole period since enablement, which for a long-lived
-repository at a short `period_days` is hundreds of cache loads under the one build lock. A request
+repository at a short `period_days` is hundreds of cache loads under that cut's build lock. A request
 that resolves above this count is refused with the count it asked for, so the caller names a cut
 rather than being handed a truncated one under the name of the whole history.
 """
@@ -502,20 +521,67 @@ def repository_series(
     return repository_trend(configuration, request, repository, enablement_instants(configuration)[repository])
 
 
+type SeriesKey = tuple[str, int, int | None]
+"""What one held series is keyed by: the repository, the period span, and the period count."""
+
+
+class LockRegistry[Key]:
+    """Hand out one lock per key, guarding the handing out with a lock of its own.
+
+    The guard is held for a dictionary lookup and NEVER ACROSS THE WORK, which is the whole point:
+    the expensive build runs under the key's own lock, where it blocks only the requests that would
+    otherwise have repeated it.
+
+    Reference counted rather than accumulating, because a series key carries the cut a request named
+    and the key space is effectively unbounded (`MAXIMUM_HELD_SERIES`). A lock is dropped only once
+    no thread holds it or waits for it, so dropping cannot race a build: the thread that would
+    collide with an evicted lock is exactly the thread whose count keeps it alive.
+    """
+
+    def __init__(self) -> None:
+        self.guard = threading.Lock()
+        self.locks: dict[Key, threading.Lock] = {}
+        self.holders: Counter[Key] = Counter()
+
+    @contextmanager
+    def hold(self, key: Key) -> Iterator[None]:
+        """Run the caller's block under this key's lock, and under no other key's."""
+        with self.guard:
+            lock = self.locks.setdefault(key, threading.Lock())
+            self.holders[key] += 1
+        try:
+            with lock:
+                yield
+        finally:
+            with self.guard:
+                self.holders[key] -= 1
+                if not self.holders[key]:
+                    del self.holders[key]
+                    del self.locks[key]
+
+
 class WindowCache:
     """Hold one built bundle per span and per series cut, rebuilding on a collection or on age.
 
-    ONE LOCK FOR EVERY SPAN, so two requests for a cold span build it once instead of both walking
-    every configured repository's cached facts. Building under the lock makes a request for another
-    span wait behind it, which is the accepted cost of never doing the same expensive build twice.
+    ONE LOCK PER SPAN AND PER SERIES CUT, not one for the whole cache. The bound it keeps is that a
+    span builds ONCE — two requests for a cold span walk every configured repository's cached facts
+    between them rather than each — while another span is free to build beside it. One lock for
+    every span kept the first half of that at the price of the second: a cold 26-week build held up
+    every other request, including ones for a span already built, which is what a reader flicking
+    the week selector was waiting for.
+
+    The eviction order of `self.series` is the one piece of state that belongs to no single key, so
+    it keeps a lock of its own that `retain` and the least-recently-read reordering both run under.
     """
 
     def __init__(self, configuration: Configuration, maximum_age: timedelta) -> None:
         self.configuration = configuration
         self.maximum_age = maximum_age
-        self.lock = threading.Lock()
+        self.builds: LockRegistry[int] = LockRegistry()
+        self.cuts: LockRegistry[SeriesKey] = LockRegistry()
+        self.eviction = threading.Lock()
         self.bundles: dict[int, ReportBundle] = {}
-        self.series: dict[tuple[str, int, int | None], TrendBundle] = {}
+        self.series: dict[SeriesKey, TrendBundle] = {}
 
     def usable(self, built: CachedBuild, stamp: SourceStamp, reference: datetime) -> bool:
         """Decide whether something held still describes the caches it was built from."""
@@ -524,12 +590,20 @@ class WindowCache:
     def bundle(self, weeks: int) -> ReportBundle:
         """Return the bundle for one span, building it if there is no usable one held.
 
-        The stamp is read outside the lock: it is two `stat` calls, and reading it under the lock
-        would serialise every request behind whichever one is building.
+        The stamp is read outside every lock: it is two `stat` calls, and reading it under a lock
+        would put every request behind whichever one is building.
+
+        Checked once before the lock and again inside it. The check inside is what makes a request
+        that waited for a build return what the builder produced rather than build it again — the
+        held bundle is then newer than this request's own `reference`, which `usable` reads as
+        having no age at all.
         """
         reference = datetime.now(UTC)
         stamp = source_stamp(self.configuration)
-        with self.lock:
+        held = self.bundles.get(weeks)
+        if held is not None and self.usable(held, stamp, reference):
+            return held
+        with self.builds.hold(weeks):
             held = self.bundles.get(weeks)
             if held is not None and self.usable(held, stamp, reference):
                 return held
@@ -537,38 +611,129 @@ class WindowCache:
             self.bundles[weeks] = built
             return built
 
+    def warm(self, weeks: int, margin: timedelta) -> bool:
+        """Build one span's bundle before a reader can meet a stale one, and say whether it built.
+
+        `bundle` CANNOT SERVE THIS. It deliberately returns a bundle that is still usable, so a
+        warmer asking it for one would refresh nothing until the bundle had already expired — which
+        is to say, until a reader had already waited for the rebuild. `margin` is how far ahead of
+        `maximum_age` a bundle is refreshed instead: a span that would go stale before the warmer's
+        next wake is rebuilt on this one, and the reader never meets the build at all.
+
+        Under the span's own build lock and checked again inside it, exactly as `bundle` is, so a
+        warm landing beside a reader's own build waits for it rather than walking the whole cohort's
+        cached facts a second time.
+        """
+        reference = datetime.now(UTC)
+        stamp = source_stamp(self.configuration)
+        if self.warmed(weeks, stamp, reference + margin):
+            return False
+        with self.builds.hold(weeks):
+            if self.warmed(weeks, stamp, reference + margin):
+                return False
+            self.bundles[weeks] = report_bundle(self.configuration, weeks, reference)
+            return True
+
+    def warmed(self, weeks: int, stamp: SourceStamp, horizon: datetime) -> bool:
+        """Say whether the bundle held for one span will still be usable at the given instant."""
+        held = self.bundles.get(weeks)
+        return held is not None and self.usable(held, stamp, horizon)
+
     def trend(self, repository: str, period_days: int, periods: int | None) -> RepositoryTrend:
         """Return one repository's series for one cut of it, building it if none is held.
 
         Keyed by the cut as well as the repository, because two cuts of the same history are two
         different series: reusing a 28-day series for a 7-day request would answer with periods four
         times the length of the ones asked for, and nothing in the response would say so.
+
+        Read before the cut's lock and again inside it, for the reason `bundle` states.
         """
         reference = datetime.now(UTC)
         stamp = source_stamp(self.configuration)
         key = (repository, period_days, periods)
-        with self.lock:
-            held = self.series.get(key)
-            if held is not None and self.usable(held, stamp, reference):
-                # Reinsert so the key moves to the end: `retain` drops from the front, which makes
-                # insertion order least-recently-read order and keeps a reread series out of the way.
-                del self.series[key]
-                self.series[key] = held
-                return held.series
+        held = self.reread(key, stamp, reference)
+        if held is not None:
+            return held
+        with self.cuts.hold(key):
+            held = self.reread(key, stamp, reference)
+            if held is not None:
+                return held
             built = TrendBundle(
                 built_at=reference,
                 stamp=stamp,
                 series=repository_series(self.configuration, repository, period_days, periods, reference),
             )
+            self.store(key, built)
+            return built.series
+
+    def reread(self, key: SeriesKey, stamp: SourceStamp, reference: datetime) -> RepositoryTrend | None:
+        """Return the held series for one cut if it still describes the caches, or nothing.
+
+        Under the eviction lock, because reading is what makes a series recently read: the key moves
+        to the end of `self.series`, and the order that move maintains is shared by every key.
+        """
+        with self.eviction:
+            held = self.series.get(key)
+            if held is None or not self.usable(held, stamp, reference):
+                return None
+            # Reinsert so the key moves to the end: `retain` drops from the front, which makes
+            # insertion order least-recently-read order and keeps a reread series out of the way.
+            del self.series[key]
+            self.series[key] = held
+            return held.series
+
+    def store(self, key: SeriesKey, built: TrendBundle) -> None:
+        """Hold one freshly cut series as the most recently read, and drop what no longer fits."""
+        with self.eviction:
             self.series.pop(key, None)
             self.series[key] = built
             self.retain()
-            return built.series
 
     def retain(self) -> None:
-        """Drop the least recently read series until no more than `MAXIMUM_HELD_SERIES` are held."""
+        """Drop the least recently read series until no more than `MAXIMUM_HELD_SERIES` are held.
+
+        Called with `self.eviction` held: the order it drops from is the order `reread` maintains,
+        and a trim reading it while a reinsertion moved a key would drop a series somebody is
+        reading now.
+        """
         while len(self.series) > MAXIMUM_HELD_SERIES:
             del self.series[next(iter(self.series))]
+
+
+def warm_spans(cache: WindowCache, spans: Iterable[int], margin: timedelta) -> None:
+    """Refresh every span that would be stale within the margin, and survive one that will not build.
+
+    A build that raises costs a log line rather than the warmer: a cache file that cannot be read
+    now is a repository state that may be readable at the next wake, and a thread that died on it
+    would take every later refresh with it — leaving a service that looks warm and is not.
+    """
+    for weeks in spans:
+        try:
+            refreshed = cache.warm(weeks, margin)
+        # Blind, and with the traceback logged: whatever reading a cache raises must cost this
+        # refresh rather than the thread, and a warm nobody asked for has no caller to re-raise to.
+        except Exception:
+            logging.warning("Could not warm the %s-week window", weeks, exc_info=True)
+        else:
+            if refreshed:
+                logging.info("Warmed the %s-week window", weeks)
+
+
+def keep_warm(cache: WindowCache, spans: Iterable[int], interval: timedelta, stopping: threading.Event) -> None:
+    """Build every offered span, then refresh them on the interval until the stopping event is set.
+
+    The interval is passed as the margin as well, so what is refreshed on each wake is whatever
+    would not have survived until the next one. Only the first pass ever builds a cold span: without
+    it, every span but the default is cold until somebody asks for it, and that reader pays for the
+    whole cohort's cached facts.
+
+    Waiting on the event rather than sleeping, so shutdown costs whatever is left of a build rather
+    than the rest of an interval.
+    """
+    offered = tuple(spans)
+    warm_spans(cache, offered, interval)
+    while not stopping.wait(interval.total_seconds()):
+        warm_spans(cache, offered, interval)
 
 
 @dataclass(frozen=True)
@@ -866,7 +1031,43 @@ def serve_team(team: str, bundle: Bundle) -> TeamDetail:
     return team_detail(bundle, team)
 
 
-def create_app(configuration: Configuration, cache: WindowCache) -> FastAPI:
+def window_warming(
+    state: ServiceState,
+    interval: timedelta,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
+    """Return a lifespan handler that keeps every offered span warm while the application serves.
+
+    Started and stopped with the application rather than at import or in `main`: a test that builds
+    an application and closes it must not leave a thread refreshing a cache nobody is reading, and
+    the stopping event is what makes closing enough. A daemon thread besides, so a process that
+    exits without the handler ever running does not hang waiting for one more refresh.
+    """
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        """Run the warmer for as long as the application is serving."""
+        _ = application
+        stopping = threading.Event()
+        warmer = threading.Thread(
+            target=keep_warm,
+            args=(state.cache, state.options, interval, stopping),
+            name="window-warmer",
+            daemon=True,
+        )
+        warmer.start()
+        try:
+            yield
+        finally:
+            stopping.set()
+            # Waited for on a worker thread rather than here: `join` is a blocking call, and made
+            # directly it would hold the event loop for as long as whatever build the warmer is in
+            # the middle of — leaving every other shutdown step behind it.
+            await asyncio.to_thread(warmer.join, WARMER_SHUTDOWN_SECONDS)
+
+    return lifespan
+
+
+def create_app(configuration: Configuration, cache: WindowCache, warm_interval: timedelta | None = None) -> FastAPI:
     """Build the application, serving every route from the given cache and nothing else.
 
     Every route is registered with `response_model_exclude_none`, so the JSON reads exactly as
@@ -875,15 +1076,24 @@ def create_app(configuration: Configuration, cache: WindowCache) -> FastAPI:
 
     No CORS and no middleware: the Next.js server fetches these routes server-side, so no browser
     ever calls the service directly and a permissive origin policy would be inviting one to.
+
+    The warmer runs only when an interval is given, which `main` gives it. An application built
+    without one still serves every route and still builds a span the first time something asks for
+    it; it simply starts no thread, which is what a caller that is not serving the estate wants.
     """
     options = window_options(configuration.lookback.maximum_days)
-    app = FastAPI(title="metrics evidence service", description=__doc__)
-    app.state.service = ServiceState(
+    state = ServiceState(
         configuration=configuration,
         cache=cache,
         options=options,
         default=default_window(options),
     )
+    app = FastAPI(
+        title="metrics evidence service",
+        description=__doc__,
+        lifespan=None if warm_interval is None else window_warming(state, warm_interval),
+    )
+    app.state.service = state
     for path, endpoint in (
         ("/healthz", serve_health),
         ("/windows", serve_windows),
@@ -927,19 +1137,30 @@ def parse_arguments() -> Namespace:
         default=DEFAULT_BUNDLE_AGE_SECONDS,
         help="rebuild a window's report after this many seconds, whatever the caches look like",
     )
+    parser.add_argument(
+        "--warm-interval",
+        type=positive_seconds,
+        default=DEFAULT_WARM_INTERVAL_SECONDS,
+        help=(
+            "refresh every span on offer this often, so a reader meets a bundle already built; "
+            "must be below --max-bundle-age"
+        ),
+    )
     return parser.parse_args()
 
 
 def positive_seconds(raw: str) -> int:
-    """Parse a whole number of seconds, refusing one that would make every bundle born stale.
+    """Parse a whole number of seconds, refusing one that would leave the cache rebuilding forever.
 
-    Bounded here rather than left to `int`: a zero or negative age makes `usable` false for
-    everything held, so every request rebuilds the whole cohort's report under the one build lock,
-    which reads as a service that has simply stopped rather than as a mistyped flag.
+    Bounded here rather than left to `int`, and for the same fault read from either side. A zero or
+    negative bundle age makes `usable` false for everything held, so every request rebuilds the
+    whole cohort's report under its span's build lock; a zero or negative warm interval is a thread
+    doing the same thing on its own, with the caches never quiet. Either reads as a service that has
+    simply stopped rather than as a mistyped flag.
     """
     seconds = int(raw)
     if seconds < 1:
-        message = f"a bundle age must be at least one second, not {seconds}"
+        message = f"a duration must be at least one second, not {seconds}"
         raise ArgumentTypeError(message)
     return seconds
 
@@ -961,6 +1182,20 @@ def main() -> int:
             "`teams:` section, or layer the team file in with a second --config",
         )
         return 1
+    # Refused as a pair, because neither flag is wrong on its own. The warmer's interval is also the
+    # margin it refreshes within, so an interval at or above the age asks for a span to be rebuilt on
+    # every wake however fresh it is: a bundle built a second ago is not usable an interval from now
+    # if the interval outlasts the age. That is a thread walking the whole cohort's cached facts for
+    # every span on offer, for ever, which is the fault `positive_seconds` refuses read from one side.
+    if options.warm_interval >= options.max_bundle_age:
+        logging.error(
+            "--warm-interval (%ss) must be below --max-bundle-age (%ss): the interval is also the "
+            "margin a span is refreshed within, so an interval at or above the age rebuilds every "
+            "span on every wake",
+            options.warm_interval,
+            options.max_bundle_age,
+        )
+        return 1
     spans = window_options(configuration.lookback.maximum_days)
     if not spans:
         logging.error(
@@ -971,16 +1206,19 @@ def main() -> int:
         )
         return 1
     cache = WindowCache(configuration, timedelta(seconds=options.max_bundle_age))
-    app = create_app(configuration, cache)
+    app = create_app(configuration, cache, warm_interval=timedelta(seconds=options.warm_interval))
     # Built before anything is listening, so the first reader waits on a request rather than on the
     # whole cohort's cached facts, and a cache the service cannot read fails while a human watches.
+    # Kept despite the warmer, which builds the same span moments later on a thread: a warmer logs a
+    # cache it cannot read and carries on, and this failure has to land while a human is watching.
     bundle = cache.bundle(default_window(spans))
     logging.info(
-        "Serving %s repositories over %s weeks, %s unavailable; spans on offer: %s",
+        "Serving %s repositories over %s weeks, %s unavailable; spans on offer: %s, refreshed every %ss",
         len(bundle.owners),
         bundle.weeks,
         len(bundle.unavailable),
         ", ".join(str(span) for span in spans),
+        options.warm_interval,
     )
     uvicorn.run(app, host=options.host, port=options.port, log_level=options.logging.lower())
     return 0

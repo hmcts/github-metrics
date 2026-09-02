@@ -8,12 +8,19 @@
  * `src/lib` instead — `filter.ts` for the search box, `sort.ts` for the headers, `chart.ts` for the
  * donut — because a click cannot be made in this renderer.
  *
+ * The one interactive state asserted here is the week selector's pending group, and only because
+ * `WeekSpanButtons` takes it as a prop: `useTransition` reports `false` under `react-dom/server`, so
+ * what a waiting reader sees is unreachable through the component that owns the router.
+ *
  * JSX is written as `createElement` calls so the tests stay `.ts` files alongside the library tests.
  */
 
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import LoadingContributors from '@/app/contributors/loading';
+import LoadingRepositories from '@/app/repositories/loading';
+import LoadingTeams from '@/app/teams/loading';
 import { ActorRepositoriesTable } from '@/components/ActorRepositoriesTable';
 import { ActorsTable } from '@/components/ActorsTable';
 import { AssessmentSection } from '@/components/AssessmentSection';
@@ -25,6 +32,8 @@ import { FindingsTable } from '@/components/FindingsTable';
 import { InfoTooltip } from '@/components/InfoTooltip';
 import { MetricCard } from '@/components/MetricCard';
 import { Navigation } from '@/components/Navigation';
+import { WeekSpanButtons } from '@/components/NavWeekSelector';
+import { OrganisationHeader } from '@/components/OrganisationHeader';
 import { RAGCard, RAGLabel, RAGRow } from '@/components/RAGCard';
 import { Section } from '@/components/Section';
 import { SortHeader } from '@/components/SortHeader';
@@ -33,7 +42,7 @@ import { TeamsList } from '@/components/TeamsList';
 import { RAG_BORDER } from '@/lib/rag';
 import { people } from '@/lib/team';
 import { TONES, TONE_BORDER, TONE_VALUE } from '@/lib/tone';
-import type { ReadinessAssessment } from '@/lib/types';
+import type { OverviewSummary, PracticeFinding, ReadinessAssessment } from '@/lib/types';
 
 describe('MetricCard', () => {
   it('states the figure, its name, and what it was measured over', () => {
@@ -337,6 +346,58 @@ describe('EntityHeader', () => {
   });
 });
 
+describe('OrganisationHeader', () => {
+  /** An overview with every repository reported, which is the header at its shortest. */
+  const OVERVIEW: OverviewSummary = {
+    organization: 'hmcts',
+    weeks: 4,
+    starts_at: '2026-08-03T00:00:00Z',
+    ends_at: '2026-08-31T00:00:00Z',
+    built_at: '2026-09-01T09:00:00Z',
+    collected_through: '2026-08-31T00:00:00Z',
+    repositories: 12,
+    unavailable: 0,
+    teams: 3,
+    actors: 9,
+    merged_pull_requests: 40,
+    direct_commits: 2,
+    labels: {},
+  };
+
+  function header(overview: OverviewSummary): string {
+    return renderToStaticMarkup(
+      createElement(OrganisationHeader, {
+        overview,
+        action: createElement('span', null, 'selector'),
+      }),
+    );
+  }
+
+  it('names the organisation and states what the span covers, with its own control', () => {
+    const markup = header(OVERVIEW);
+    expect(markup).toContain('organization');
+    expect(markup).toContain('font-mono');
+    expect(markup).toContain('hmcts');
+    expect(markup).toContain('4 weeks');
+    expect(markup).toContain('Report built');
+    expect(markup).toContain('selector');
+  });
+
+  // The three list routes render this one block, so what it claims about a span is one claim.
+  it('says how many repositories the span could not report, and nothing when all could', () => {
+    expect(header({ ...OVERVIEW, unavailable: 2 })).toContain(
+      '2 repositories not reported at this span',
+    );
+    expect(header(OVERVIEW)).not.toContain('not reported at this span');
+  });
+
+  it('names no collection where nothing has been collected', () => {
+    const markup = header({ ...OVERVIEW, collected_through: undefined });
+    expect(markup).not.toContain('Collected');
+    expect(markup).toContain('Report built');
+  });
+});
+
 describe('SortHeader', () => {
   it('states the column ordering on the header cell and puts the control in a button', () => {
     const markup = renderToStaticMarkup(
@@ -381,6 +442,118 @@ describe('InfoTooltip', () => {
   });
 });
 
+describe('WeekSpanButtons', () => {
+  /** The group at rest: 4 weeks is the span the page was rendered at, and nothing is in flight. */
+  function settled(): string {
+    return renderToStaticMarkup(
+      createElement(WeekSpanButtons, {
+        options: [4, 12],
+        current: 4,
+        pending: false,
+        onChoose: () => undefined,
+      }),
+    );
+  }
+
+  /** The same group after 12 weeks was pressed, with the server render still on its way. */
+  function waiting(): string {
+    return renderToStaticMarkup(
+      createElement(WeekSpanButtons, {
+        options: [4, 12],
+        current: 12,
+        pending: true,
+        onChoose: () => undefined,
+      }),
+    );
+  }
+
+  it('presses the span the page is at, and claims nothing is loading', () => {
+    const markup = settled();
+    expect(markup).toContain('aria-busy="false"');
+    expect(markup).not.toContain('opacity-50');
+    expect(markup).toContain(
+      'aria-label="4 week window" class="px-3 py-1.5 rounded text-sm transition-colors bg-indigo-600',
+    );
+  });
+
+  // The pressed highlight says which button was clicked; this says the page behind it has not
+  // arrived. On a cold span in the service that wait is seconds long, and a highlight on its own
+  // over the previous span's figures reads as a window switch that silently did nothing.
+  it('dims the group and reports itself busy while the new span is in flight', () => {
+    const markup = waiting();
+    expect(markup).toContain('aria-busy="true"');
+    expect(markup).toContain('opacity-50');
+    expect(markup).toContain('transition-opacity');
+  });
+
+  it('leaves the buttons live while waiting, so a reader can change their mind', () => {
+    expect(waiting()).not.toContain('disabled');
+  });
+
+  it('differs from the settled group in the busy state alone', () => {
+    const dimmed = waiting();
+    const restored = dimmed
+      .replace(' opacity-50', '')
+      .replace('aria-busy="true"', 'aria-busy="false"');
+    // Both render 12 as the pressed span, so what is left to differ is the dimming and nothing else.
+    expect(restored).toEqual(
+      renderToStaticMarkup(
+        createElement(WeekSpanButtons, {
+          options: [4, 12],
+          current: 12,
+          pending: false,
+          onChoose: () => undefined,
+        }),
+      ),
+    );
+  });
+});
+
+describe('the loading skeletons', () => {
+  /**
+   * The landing page's skeleton, which is the widest of the six: header, cards, chart and a table.
+   *
+   * A `loading.tsx` is handed no props by Next.js, so rendering it with none is the whole contract —
+   * a skeleton that needed a figure to draw itself could not be drawn before the figures arrive.
+   */
+  it('draws the page it is standing in for, on the same panel, from no props at all', () => {
+    const markup = renderToStaticMarkup(createElement(LoadingRepositories));
+    expect(markup).toContain('<section class="bg-slate-900/40 border border-slate-800 rounded-lg">');
+    expect(markup).toContain('border-b border-slate-800');
+    expect(markup).toContain('animate-pulse');
+  });
+
+  it('says it is loading in words, and hides the bars from a screen reader', () => {
+    const markup = renderToStaticMarkup(createElement(LoadingRepositories));
+    expect(markup).toContain('<p role="status" class="sr-only">Loading</p>');
+    expect(markup).toContain('aria-hidden="true"');
+  });
+
+  it('lays a card row out across the viewport rather than compiling its columns away', () => {
+    // Tailwind reads class names out of the source, so an interpolated `lg:grid-cols-${n}` would
+    // reach the browser as a class no stylesheet defines and every card would stack.
+    expect(renderToStaticMarkup(createElement(LoadingRepositories))).toContain('lg:grid-cols-4');
+  });
+
+  /**
+   * The list routes' skeleton, which the other two of the three lists share.
+   *
+   * Rendered here as well as the landing page's, because `SkeletonList` is a second shape and not a
+   * narrowing of the first: a page whose `loading.tsx` announced nothing would leave a screen reader
+   * with silence for the seconds a cold bundle takes, and the announcement is markup no type checks.
+   */
+  it('announces a list route as loading, and draws a bar per row it expects', () => {
+    const contributors = renderToStaticMarkup(createElement(LoadingContributors));
+    const teams = renderToStaticMarkup(createElement(LoadingTeams));
+
+    expect(contributors).toContain('<p role="status" class="sr-only">Loading</p>');
+    expect(teams).toContain('<p role="status" class="sr-only">Loading</p>');
+    // A row each, and the two pages ask for different counts: twelve people against six teams.
+    expect(contributors.match(/h-4 w-full/g)).toHaveLength(12);
+    expect(teams.match(/h-4 w-full/g)).toHaveLength(6);
+  });
+});
+
 describe('the shared vocabulary', () => {
   it('contains no emoji: a grade is a word and a colour, never a coloured square', () => {
     const markup = [
@@ -404,18 +577,54 @@ describe('the shared vocabulary', () => {
    *
    * Every component that names people at all is rendered here together, because the rename is only
    * true if it is true everywhere: one heading still reading "Actors" is the whole point of the
-   * change missed. Links are stripped before matching — `/actors/…`, `#actors` and the contract's
-   * own field names keep the old spelling deliberately, and renaming the routes is a separate
-   * change — so what is asserted is the prose, not the plumbing.
+   * change missed. The contract's own field names keep the old spelling deliberately, so what is
+   * asserted is the prose the reader meets rather than the JSON behind it.
    */
   it('calls a person a contributor everywhere the reader can see one', () => {
-    const rendered = [
+    const prose = naming().replace(/href="[^"]*"/g, '');
+
+    expect(prose).not.toMatch(/actor/i);
+    expect(prose).toContain('Contributor');
+  });
+
+  /**
+   * The routes followed the word later the same day: a person's page is `/contributors/[login]`.
+   *
+   * Rendered together for the same reason the prose is. A link left at `/actors/…` would 404 rather
+   * than misread, and it would do it from whichever one table nobody thought to change — the
+   * findings table, say, which is the one place a link to a person is not in a list of people.
+   */
+  it('links a person at the route their page is served from', () => {
+    const rendered = naming();
+
+    expect(rendered).not.toContain('/actors/');
+    expect(rendered).not.toContain('#actors');
+    expect(rendered).toContain('href="/contributors"');
+  });
+
+  /** Every component that names or links a person, rendered as one string. */
+  function naming(): string {
+    return [
       renderToStaticMarkup(createElement(Navigation)),
       renderToStaticMarkup(createElement(EntityHeader, { kind: 'contributor', name: 'octocat' })),
-      renderToStaticMarkup(createElement(FindingsTable, { findings: [], weeks: 4 })),
-      renderToStaticMarkup(createElement(ContributorsTable, { rows: [], weeks: 4 })),
-      renderToStaticMarkup(createElement(ActorsTable, { rows: [], weeks: 4 })),
-      renderToStaticMarkup(createElement(TeamActorsTable, { rows: [], weeks: 4 })),
+      renderToStaticMarkup(
+        createElement(FindingsTable, { findings: [FINDING], weeks: 4 }),
+      ),
+      renderToStaticMarkup(
+        createElement(ContributorsTable, {
+          rows: [{ login: 'octocat', contributions: 1, blocking: 0, metrics: [] }],
+          weeks: 4,
+        }),
+      ),
+      renderToStaticMarkup(
+        createElement(ActorsTable, { rows: [{ login: 'octocat', repositories: 1 }], weeks: 4 }),
+      ),
+      renderToStaticMarkup(
+        createElement(TeamActorsTable, {
+          rows: [{ login: 'octocat', repositories: 1, contributions: 1 }],
+          weeks: 4,
+        }),
+      ),
       renderToStaticMarkup(
         createElement(ActorRepositoriesTable, { rows: [], teams: {}, weeks: 4 }),
       ),
@@ -427,11 +636,18 @@ describe('the shared vocabulary', () => {
       ),
       people({ team: 'platform', repositories: [], actors: [], unavailable: 0, labels: {} }),
     ].join('');
-    const prose = rendered.replace(/href="[^"]*"/g, '');
-
-    expect(prose).not.toMatch(/actor/i);
-    expect(prose).toContain('Contributor');
-    // The links the prose was measured without are still spelled the service's way.
-    expect(rendered).toContain('href="/#actors"');
-  });
+  }
 });
+
+/** One finding, so the findings table renders the row that links the person a rule fired on. */
+const FINDING: PracticeFinding = {
+  rule: 'unreviewed-merge',
+  severity: 'high',
+  actor_login: 'octocat',
+  occurrences: 1,
+  authored_merges: 1,
+  percentage: 100,
+  message: 'merged without an independent review',
+  occurrences_by_size: {},
+  pull_requests: [],
+};

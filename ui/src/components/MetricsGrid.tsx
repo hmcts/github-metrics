@@ -17,7 +17,8 @@ import type { BehaviourMetricSummary, ReadinessAssessment } from '@/lib/types';
  * The assessment is OPTIONAL and only ever a source of colour. Given one, each card takes the tone
  * of the condition that graded that metric, so the figures agree with the readiness block above
  * them. An actor page passes none — the policy grades repositories, not people — and every card
- * there stays colourless rather than the grid inventing a threshold to grade a person by.
+ * there stays colourless rather than the grid inventing a threshold to grade a person by, bar the
+ * two completeness rates `metricTone` reads green at a true 100% with or without an assessment.
  */
 export function MetricsGrid({
   summaries,
@@ -41,7 +42,7 @@ export function MetricsGrid({
           label={summary.metric}
           value={metricValue(summary)}
           detail={metricDetail(summary)}
-          tone={metricTone(summary.metric, assessment)}
+          tone={metricTone(summary, assessment)}
         />
       ))}
     </div>

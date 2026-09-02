@@ -11,12 +11,12 @@
  * states its sample size, with p75 beside it — the second figure that says whether the median is the
  * whole story or the tail is somewhere else entirely.
  *
- * A card's TONE is also decided here, and unlike every other figure on the site it is not decided by
- * a threshold: the readiness policy grades these metrics itself, so `metricTone` reads the condition
- * that graded one and carries that verdict across. Seven of the nine are graded —
- * `description-quality` and `traceability-reference` are neutral aggregates the policy deliberately
- * never reads — so those two cards carry no colour, which is the policy showing through rather than
- * a threshold nobody wrote.
+ * A card's TONE is also decided here, and for seven of the nine it is not decided by a threshold:
+ * the readiness policy grades those metrics itself, so `metricTone` reads the condition that graded
+ * one and carries that verdict across. `description-quality` and `traceability-reference` are the
+ * exception, because the policy deliberately never reads them — which leaves no condition to borrow
+ * a verdict from, and makes this module the only place a judgement about them can live. It makes the
+ * narrowest one there is: complete reads green, and anything short of complete carries no colour.
  */
 
 import { figure, isRate, population, summarise } from '@/lib/format';
@@ -89,6 +89,36 @@ function graded(
 }
 
 /**
+ * The two rates the readiness policy reports without grading, and this module colours instead.
+ *
+ * Both are completeness counts — merges with a usable description, merges carrying a traceability
+ * reference — and the assessment configuration names no target for either, so `graded` finds nothing
+ * for them on any repository. That is the reason the rule is here rather than a threshold nobody
+ * wrote: there is no condition to read, and complete is the one verdict that needs no target to be
+ * worth stating.
+ */
+const COMPLETENESS_RATES: readonly string[] = ['description-quality', 'traceability-reference'];
+
+/**
+ * Whether one of those two rates is complete: every eligible merge counted, none missed.
+ *
+ * READ OFF THE OBSERVATION, never off the formatted percentage. `rate` states 99.96% as `100%`, at
+ * one decimal place and rounding up, so a card taking its colour from the string would read green on
+ * a window with an unreferenced merge in it — announcing the one thing the metric exists to find.
+ * The numerator against the denominator has no rounding to be wrong about.
+ *
+ * An empty denominator is NOT complete even where the service sends it as observed: nothing measured
+ * is not everything measured, and `0 === 0` would colour a card green for a window with no eligible
+ * merges at all.
+ */
+function complete(observation: Observation): boolean {
+  if (!isRate(observation) || observation.status !== 'observed') {
+    return false;
+  }
+  return observation.denominator > 0 && observation.numerator === observation.denominator;
+}
+
+/**
  * How one behaviour metric card reads, taken from the condition that graded it and never recomputed.
  *
  * NO METRIC THRESHOLD IS DUPLICATED IN THE UI. The other tone functions in `lib/tone.ts` state a
@@ -99,18 +129,29 @@ function graded(
  * on the same page. Raising a target in the assessment configuration is what turns a card amber;
  * nothing here needs editing for that.
  *
- * NEUTRAL WITHOUT AN ASSESSMENT, and neutral for a metric no condition names. An actor page renders
- * this same grid for one person's slice of one repository, where there is no assessment at all: the
+ * NEUTRAL WITHOUT AN ASSESSMENT, and neutral for a metric no condition names. A contributor page
+ * renders this same grid for one person's slice of one repository, where there is no assessment: the
  * readiness policy grades repositories and not people, so those cards carry no colour, which is the
  * scope boundary showing through rather than an omission. A repository the policy graded nothing for
  * reaches the same place by the same route.
+ *
+ * THE COMPLETENESS RULE IS CHECKED FIRST AND ASKS THE ASSESSMENT NOTHING. `COMPLETENESS_RATES`
+ * records why there is nothing to ask; the consequence is that the rule reads the same on a
+ * contributor page, where no assessment arrives and every other card on the grid is colourless.
  */
-export function metricTone(metric: string, assessment: ReadinessAssessment | undefined): Tone {
-  // `== null` per the missing-key rule: an older stored block sends no assessment at all.
+export function metricTone(
+  summary: BehaviourMetricSummary,
+  assessment: ReadinessAssessment | undefined,
+): Tone {
+  if (COMPLETENESS_RATES.includes(summary.metric)) {
+    return complete(summary.summary) ? 'good' : 'neutral';
+  }
+  // `== null` per the missing-key rule, for the two cases above: a contributor page passes none, and
+  // a repository the readiness policy graded nothing for is served without one.
   if (assessment == null) {
     return 'neutral';
   }
-  const found = graded(metric, assessment);
+  const found = graded(summary.metric, assessment);
   if (found === undefined) {
     return 'neutral';
   }

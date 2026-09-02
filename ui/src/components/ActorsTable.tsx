@@ -30,7 +30,7 @@ export function ActorsTable({ rows, weeks }: { rows: readonly ActorRow[]; weeks:
             <tr key={row.login} className="hover:bg-slate-800/30">
               <td className="py-2 pl-3 pr-3">
                 <Link
-                  href={withWeeks(`/actors/${encodeURIComponent(row.login)}`, weeks)}
+                  href={withWeeks(`/contributors/${encodeURIComponent(row.login)}`, weeks)}
                   className="font-mono text-indigo-400 hover:text-indigo-300 break-all"
                 >
                   {row.login}

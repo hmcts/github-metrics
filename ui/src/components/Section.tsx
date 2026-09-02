@@ -41,9 +41,27 @@ export function Section({
 }
 
 /**
+ * Two sections side by side, stacking to one column on a narrow viewport.
+ *
+ * For the pairs that are read together — the merge gate with the open pull requests it governs, the
+ * security alerts with the maintenance windows that would have patched them. Down a single column
+ * each of those is a screen apart, and the repository page's block of settings lists reads as one
+ * long scroll rather than as four things.
+ *
+ * NO `items-start`. A grid item stretches by default, so the shorter of the pair takes the taller
+ * one's height and the two panels' edges line up — which matters most on this estate, where an
+ * unreadable merge gate's one-line `EmptyState` sits beside a full open pull-request block. Pinning
+ * the pair to the top instead would leave a stub panel beside a tall one.
+ */
+export function SectionPair({ children }: { children: React.ReactNode }) {
+  return <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">{children}</div>;
+}
+
+/**
  * The surface a `Section` is drawn on, for the two card rows that carry no heading of their own.
  *
- * The overview's four estate figures and a repository's cohort row are headline figures rather than
+ * The estate's four figures on the repositories page and a repository's cohort row are headline
+ * figures rather than
  * sections: they answer the question the page is titled with. They still need the panel, because
  * `MetricCard` no longer draws one and four unbounded figures would float on the page background —
  * so the surface is one component and its classes are written once.

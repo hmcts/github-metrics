@@ -13,7 +13,9 @@
  *   3. the service's own default
  *
  * The cookie exists so that arriving at a page through a nav link, which carries no `?weeks=`, shows
- * the span the reader was last reading at rather than resetting to four weeks.
+ * the span the reader was last reading at rather than resetting to four weeks. Two things write it:
+ * the selector, before it navigates, and the middleware, for a reader who arrived on a link that
+ * named a span without ever pressing a button — see `rememberableWeeks`.
  */
 
 export const WEEKS_COOKIE = 'weeks';
@@ -65,7 +67,57 @@ export function resolveWeeks(
 
 /** Carry the current span onto a drill-through link, so no navigation silently changes the window. */
 export function withWeeks(path: string, weeks: number): string {
-  return `${path}?${new URLSearchParams({ weeks: String(weeks) }).toString()}`;
+  return carry(path, String(weeks));
+}
+
+/** One path with one raw span on it, encoded — the one place the query string is spelled out. */
+function carry(path: string, weeks: string): string {
+  return `${path}?${new URLSearchParams({ weeks }).toString()}`;
+}
+
+/** The route `/` redirects to, which is the repositories list. */
+export const LANDING_PATH = '/repositories';
+
+/**
+ * Where a request for `/` goes, carrying the span it named.
+ *
+ * `/` was the overview holding all three lists until 2026-09-02 and is a redirect now. The raw
+ * parameter is carried rather than a parsed span, so this needs no list of the spans on offer and the
+ * one that arrives is resolved by the landing page exactly as it would have been by the old overview.
+ * It is put back through `URLSearchParams`, so a value somebody typed reaches the redirect encoded
+ * rather than as whatever they typed.
+ */
+export function landingTarget(parameter: SearchValue): string {
+  const only = single(parameter);
+  if (only === undefined || only.trim() === '') {
+    return LANDING_PATH;
+  }
+  return carry(LANDING_PATH, only);
+}
+
+/**
+ * The span in a raw `?weeks=` value worth remembering as the reader's preference, or null.
+ *
+ * The three links in the navigation bar carry no parameter — the bar is rendered by the layout,
+ * which is handed no search parameters — so the span they land on comes from the cookie. A reader
+ * who followed a shared `?weeks=26` link and never touched the selector has no cookie, and the
+ * first nav click would drop them to the service's default with nothing saying the window moved.
+ * The middleware closes that by writing what the URL asked for, which is the same preference the
+ * selector would have written had they pressed the button themselves.
+ *
+ * The value is NOT checked against the spans on offer: the middleware would need a round trip to
+ * `/windows` on every request to know them, and `resolveWeeks` already drops a cookie holding a span
+ * off the list. A positive integer is the whole check, and it keeps what could not be a span out of
+ * a cookie that lives a year. A number is returned rather than the raw text so the cookie is written
+ * through `weeksCookie` like the selector's, and `04` reaches it as the `4` `parseWeeks` can match.
+ */
+export function rememberableWeeks(raw: SearchValue): number | null {
+  const only = single(raw);
+  if (only === undefined) {
+    return null;
+  }
+  const parsed = Number(only.trim());
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 /** Build the cookie the selector writes before it navigates. */

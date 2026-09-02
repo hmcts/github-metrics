@@ -63,7 +63,7 @@ export function FindingsTable({
               </td>
               <td className="py-2 pr-3 align-top">
                 <Link
-                  href={withWeeks(`/actors/${encodeURIComponent(finding.actor_login)}`, weeks)}
+                  href={withWeeks(`/contributors/${encodeURIComponent(finding.actor_login)}`, weeks)}
                   className="font-mono text-indigo-400 hover:text-indigo-300 break-all"
                 >
                   {finding.actor_login}

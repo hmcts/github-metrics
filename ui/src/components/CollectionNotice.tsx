@@ -4,9 +4,9 @@ import type { WindowOptions } from '@/lib/types';
 /**
  * The bar every page carries when its figures are anchored at an old collection.
  *
- * Above the content rather than below it, and on every page rather than on the overview alone: the
+ * Above the content rather than below it, and on every page rather than on the landing page alone: the
  * window a repository page states is the same anchored window, and a reader who arrives from a link
- * never passes through the overview to be told so.
+ * never passes through the landing page to be told so.
  *
  * NO EMOJI, as everywhere else on this site: an amber bar down the left edge and the sentence beside
  * it, with the sentence carrying all of the information (`rag.ts`). `role="status"` rather than

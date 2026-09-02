@@ -50,18 +50,51 @@ and `check` is the one to run wherever the build works, because a page that will
 
 | Route | What it answers |
 | --- | --- |
-| `/` | the estate at one span: counts, the label distribution, and the three lists to drill into |
-| `/repositories/[repository]` | one repository's whole evidence block, in the block's own order, and its periods since enablement |
-| `/actors/[login]` | which repositories one person worked in, and what was measured in each of them |
+| `/` | nothing of its own: it redirects to `/repositories`, carrying `?weeks=` through where one was given |
+| `/repositories` | the estate at one span: counts, the label distribution, and the repositories to drill into |
+| `/contributors` | everyone who contributed to a reported repository at that span, alphabetically |
+| `/teams` | every configured team at that span, with the labels its repositories carry |
+| `/repositories/[repository]` | one repository's whole evidence block and its periods since enablement |
+| `/contributors/[login]` | which repositories one person worked in, and what was measured in each of them |
 | `/teams/[team]` | what a team owns, how those repositories are labelled, and who worked in them |
+
+**The three lists were one page until 2026-09-02**, with the nav pointing at `#repositories`, `#actors` and `#teams`
+anchors down it. They are routes now, so a link names what it lands on and a reader loads the third of the estate they
+asked about rather than all of it: each list page fetches `/windows`, `/overview` and its own list — three requests
+where the overview made five, all against the one bundle the service already holds for that span. `OrganisationHeader`
+is that shared head, one component rather than a copy per page, because three headers stating the same window could
+claim three different things about it. The Home button went with the split: repositories is the landing page, so a
+button back to a page that redirects there would be a second name for where the logo already goes.
+
+`/actors/[login]` became `/contributors/[login]` at the same time, which breaks bookmarked actor URLs deliberately —
+a `/contributors` list above an `/actors` detail is a split personality, and this was the change that already touched
+routing. The service's `/actors` endpoints and the `actors` field names are untouched: they are what the JSON contract
+and `metrics evidence` call them.
 
 Every page is `dynamic = 'force-dynamic'`, reads the span with `resolveWeeks`, and carries the span onto every link
 with `withWeeks`, so no navigation quietly changes the window. The span resolves from `?weeks=` first, then the
-`weeks` cookie the selector writes, then the service's own default — the cookie exists so that a nav link, which
-carries no parameter, lands on the span the reader was last reading at.
+`weeks` cookie, then the service's own default — the cookie exists so that a nav link, which carries no parameter,
+lands on the span the reader was last reading at.
 
-Drill-through is a graph rather than a tree: a repository leads to its actors and its team, an actor back to other
-repositories, a team to both. There are no breadcrumbs for that reason — a trail would claim a hierarchy that does
+The three links in the nav bar are the one place a link cannot carry the span: the bar is rendered by the layout, and
+Next.js hands a layout no search parameters. The cookie is what covers them, so `src/middleware.ts` writes it for any
+request that named a span — not just for a press of the selector, which is the only writer a reader who arrived on
+somebody else's `?weeks=26` link never triggers. Without it, their first nav click dropped the whole page to four
+weeks with nothing saying the window had moved. The value is not checked against the spans on offer there, because
+the middleware would need a `/windows` round trip per request to know them and `resolveWeeks` already drops a cookie
+holding a span off the list; a positive integer is the whole check.
+
+Every segment carries a `loading.tsx` drawn from `Skeleton.tsx`, and the week selector wraps its `router.replace` in
+`useTransition` — dimming the button group and marking it `aria-busy` while the page is on its way. The service keeps
+every span warm (see the [root README](../README.md#dashboard)), so a cold bundle is the exception rather than the
+usual path; but a first visit and the rebuild after a collection lands can still take seconds, and Next.js holds the
+old page on screen until the new one is ready. Without both halves, a reader who pressed 26 weeks sees the 4-week
+figures with nothing saying they are stale. The skeletons are the same panels and rows with no numbers in them, so the
+page does not jump when it arrives; one `role="status"` says "Loading" in words and the bars are `aria-hidden`, because
+a screen reader wants the sentence and not thirty empty boxes.
+
+Drill-through is a graph rather than a tree: a repository leads to its contributors and its team, a contributor back to
+other repositories, a team to both. There are no breadcrumbs for that reason — a trail would claim a hierarchy that does
 not exist and would read differently depending on which link was followed — and each page's `EntityHeader` says only
 where you are now.
 
@@ -78,6 +111,9 @@ The visual language is class-string idioms rather than a theme config, ported fr
 | table | `text-xs`, head `text-slate-400 border-b border-slate-800`, body `divide-y divide-slate-800/50` |
 | row hover | `hover:bg-slate-800/30` |
 | metric value / label | `text-2xl font-semibold tabular-nums` / `text-xs text-slate-400 uppercase tracking-wide` |
+| paired sections — `SectionPair` | `grid grid-cols-1 lg:grid-cols-2 gap-4` |
+| card row | `grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4`, or `sm:grid-cols-2` inside a pair |
+| loading bone — `SkeletonBar` | `animate-pulse rounded bg-slate-800`, sized by the caller and nothing else |
 | links and buttons | `text-indigo-400`, `bg-indigo-600 hover:bg-indigo-500` |
 | nav | `h-14 bg-slate-900 border-b border-slate-800`, sticky |
 
@@ -88,6 +124,18 @@ heading, for the two headline card rows that answer the question their page is t
 children renders its heading and no empty padded body, and a `DefinitionList` with no rows renders nothing at all:
 blank space under a divider reads as content that failed to load, and the page says what is missing with an
 `EmptyState` carrying the reason.
+
+**Two short sections share a row.** `SectionPair` puts Merge gate beside Open pull requests and Security alerts beside
+Maintenance on the repository page, stacking again below `lg`. Each of those four is a settings list or four counts,
+so at full width each was a wide band with its answers at one end, and the four bands ran the length of a scroll.
+The open pull-request cards go two across inside their half rather than the four across the full width allowed — four
+counts squeezed into half a row read as one cramped line where two tidy rows read as a block. On this estate the
+common case is an unreadable gate beside a full open pull-request block, so the pair is a grid rather than a flex row:
+an `EmptyState` next to a full section leaves its half short and does not stretch to match it.
+
+**The repository page is no longer in the evidence block's own order.** Behaviour sits directly under the cohort row,
+above the blocking, caution and clear groups, because a reader wants the measurements before the verdict drawn from
+them. That is the only departure, and the page's own doc comment records it.
 
 **A settings block is a list, not a grid of cards.** The twelve merge-gate fields, the three maintenance windows and
 the three alert families go through `DefinitionList`, where the labels line up and the block is read down. Twelve
@@ -125,6 +173,12 @@ place:
 - **Where the policy already graded a figure, the page carries its verdict.** A behaviour metric card takes its tone
   from the assessment condition that graded the metric, so a card can never contradict the CLEAR list above it, and a
   blocking assessment row keeps the readiness label it imposed rather than a second opinion in the same colour.
+- **Where the policy grades nothing, the threshold is the narrowest one that says anything.**
+  `description-quality` and `traceability-reference` are the two rates the readiness policy never reads, so there is no
+  condition to borrow a verdict from and `metricTone` is the only place a judgement about them can live. Complete reads
+  green — numerator equal to denominator, read off the observation and never off the formatted string, because a rate
+  that rounds to 100% is not 100% and colouring it green would say the last unreferenced merge does not exist.
+  Everything else stays neutral, and the rule is independent of the assessment so it holds on the contributor page too.
 - **An unreadable figure stays uncoloured**, and so do the three merge-gate rules the policy reports without judging.
   A gate field GitHub withheld, an alert family it refused and a Sonar measure a project never reported are absences —
   green there would report a missing permission as a check that passed — and `ReadinessCondition.informational` is how
@@ -159,7 +213,7 @@ These come from `docs/architecture.md`, "Scope boundaries", and they bind the UI
   compare people on. `Blocking occurrences` was dropped from that table the same day as a second copy of the findings
   table above it.
 - **No cross-repository averaging.** A person's behaviour metrics are measured per repository and stay in their own
-  section on the actor page. Merges add up across repositories because a sum of merges is still a number of merges;
+  section on the contributor page. Merges add up across repositories because a sum of merges is still a number of merges;
   a rate, a median or a label never does.
 - **No combined team verdict and no ordering of teams.** Per-team label *counts* are permitted (2026-09-01) and are
   what the team page's donut shows. There is no team label, no team score, and the team list keeps the

@@ -5,7 +5,7 @@ import { withWeeks } from '@/lib/weeks';
 /**
  * Everyone who authored a reported merge in one team's repositories, alphabetically.
  *
- * ALPHABETICAL AND NOTHING ELSE, as the overview's actor list is: there are no sortable headers, and
+ * ALPHABETICAL AND NOTHING ELSE, as the `/contributors` list is: there are no sortable headers, and
  * the two figures are counts of things somebody did inside this team — how many of its repositories
  * they worked in, and how many merges they authored across them. A sum of merges is still a number of
  * merges, so it is reported; nothing is averaged, and nobody is placed above anybody else by it.
@@ -37,7 +37,7 @@ export function TeamActorsTable({ rows, weeks }: { rows: readonly TeamActorRow[]
             <tr key={row.login} className="hover:bg-slate-800/30">
               <td className="py-2 pl-3 pr-3">
                 <Link
-                  href={withWeeks(`/actors/${encodeURIComponent(row.login)}`, weeks)}
+                  href={withWeeks(`/contributors/${encodeURIComponent(row.login)}`, weeks)}
                   className="font-mono text-indigo-400 hover:text-indigo-300 break-all"
                 >
                   {row.login}

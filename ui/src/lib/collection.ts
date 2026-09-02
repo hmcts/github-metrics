@@ -6,7 +6,7 @@
  * ones the collection actually supports — but it is only honest if the page SAYS so, otherwise a
  * reader takes a fortnight-old window for this morning's.
  *
- * Two statements, deliberately separate. The label goes in the overview header beside the window and
+ * Two statements, deliberately separate. The label goes in the organisation header beside the window and
  * is printed whenever there is a collection to name; the notice is a warning and appears only when
  * the last collection is older than the configured cadence, which is the service's decision
  * (`collection_stale`) rather than one taken again here against a threshold this side would have to

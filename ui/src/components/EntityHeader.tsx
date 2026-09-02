@@ -14,7 +14,9 @@ import type { ReadinessLabel } from '@/lib/types';
  *
  * The kind is RENDERED, as the word above the entity name, which is why its members are the reader's
  * words rather than the contract's: `contributor` from 2026-09-02, where the service still calls the
- * author of a merge an actor and the route is still `/actors/…`.
+ * author of a merge an actor. The page's route followed the word later the same day —
+ * `/contributors/[login]`, where it was `/actors/[login]` — and the service's own `/actors` endpoints
+ * and field names did not move.
  */
 export type EntityKind = 'repository' | 'contributor' | 'team';
 

@@ -27,7 +27,7 @@ describe('filterTarget', () => {
   });
 
   it('returns a bare path when clearing the only parameter', () => {
-    expect(filterTarget('/actors', '?repository=api', 'repository', '')).toBe('/actors');
+    expect(filterTarget('/contributors', '?repository=api', 'repository', '')).toBe('/contributors');
   });
 
   it('encodes a term that would otherwise break the query', () => {

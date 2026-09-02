@@ -48,9 +48,10 @@ export interface BehaviourMetricSummary {
 
 /**
  * `informational` marks a condition the policy reported without judging — the three neutral
- * merge-gate rules and a sufficient cohort. It arrives as `false` for a graded condition rather than
- * being omitted, since the service sends the boolean it holds, but is ABSENT from a block stored
- * before the field existed; every read of it guards on `== null` for that reason.
+ * merge-gate rules and a sufficient cohort. The assessment is recomputed on every build rather than
+ * stored, so a service of this version always sends the boolean it holds, `false` for a graded
+ * condition rather than omitted. It is optional because the field only exists from 2026-09-02: a
+ * service deployed before the UI sends no key at all, which every read guards on `== null`.
  */
 export interface ReadinessCondition {
   condition: string;

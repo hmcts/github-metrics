@@ -1,5 +1,5 @@
 /**
- * Markup checks for the overview page's two server-rendered lists.
+ * Markup checks for the two server-rendered estate lists, `/contributors` and `/teams`.
  *
  * `RepositoriesTable` is not here: it reads its filters from the router, which this renderer has no
  * context for, so its decidable part is tested as pure functions in `lib/__tests__/rows.test.ts`
@@ -27,8 +27,8 @@ describe('ActorsTable', () => {
 
   it('links each login in mono, carrying the span onto the drill-through', () => {
     expect(markup).toContain('font-mono');
-    expect(markup).toContain('/actors/alice?weeks=8');
-    expect(markup).toContain('/actors/bob?weeks=8');
+    expect(markup).toContain('/contributors/alice?weeks=8');
+    expect(markup).toContain('/contributors/bob?weeks=8');
   });
 
   it('offers no way to order people: no sortable header, no metric column', () => {
@@ -55,8 +55,8 @@ describe('TeamActorsTable', () => {
 
   it('links each login in mono, carrying the span onto the drill-through', () => {
     expect(markup).toContain('font-mono');
-    expect(markup).toContain('/actors/alice?weeks=12');
-    expect(markup).toContain('/actors/bob?weeks=12');
+    expect(markup).toContain('/contributors/alice?weeks=12');
+    expect(markup).toContain('/contributors/bob?weeks=12');
   });
 
   it('states both figures as counts scoped to this team', () => {

@@ -1389,13 +1389,30 @@ FastAPI and uvicorn are an optional extra, so a collection host that will never 
 starts and stops on an import error naming `uvicorn`, the first of the two it imports.
 
 `metrics-serve` takes `--config` (repeatable, as every command's does), `--host` (default `127.0.0.1`), `--port`
-(default `8000`), `--logging`, and `--max-bundle-age` (default `3600` seconds, and at least `1` — a zero or negative
-age would make every bundle born stale and rebuild the whole cohort on every request). It refuses a configuration with
+(default `8000`), `--logging`, `--max-bundle-age` (default `3600` seconds, and at least `1` — a zero or negative
+age would make every bundle born stale and rebuild the whole cohort on every request) and `--warm-interval` (default
+`300` seconds, bounded the same way and for the same fault read from the other side: a zero or negative interval is a
+background thread rebuilding the whole cohort with the caches never quiet). The two are also refused as a **pair**: an
+interval at or above the bundle age is rejected by name, because the interval is the margin a span is refreshed within
+and one that outlasts the age asks for every span to be rebuilt on every wake however fresh it is — so a short age
+asked for on its own must be matched by a shorter interval. It refuses a configuration with
 no `teams:` section, as every cohort command does, and refuses one whose `lookback.maximum_days` is shorter than the
 shortest span it offers, rather than starting with nothing to serve. It builds one whole report per window span — 1, 4,
 8, 12 and 26 weeks, filtered against the configuration's `lookback.maximum_days` — and holds it until either the age
 limit passes or one of the cache files changes size or mtime, which is how a collection landing at lunchtime reaches a
-page somebody is already reading. The endpoints are `/healthz`, `/windows`, `/overview`, `/repositories`,
+page somebody is already reading.
+
+`--warm-interval` is what keeps that rebuild off the reader. A background thread builds every span on offer at start
+and then, on each wake, rebuilds any whose bundle has expired, whose caches have moved, or that would go stale before
+the next wake — so a reader flicking the week selector usually meets a report already built rather than a cold span
+that walks every configured repository's cached facts while they wait. The interval is deliberately well below the
+bundle age, because it is also that margin. A span that will not build costs a warning in the log and the thread
+carries on: a cache file unreadable now may be readable at the next wake, and a warmer that died on it would leave a
+service that looks warm and is not. Each span holds a build lock of its own, so a cold 26-week build no longer delays
+a request for a span already built, and the default span is still built synchronously before anything listens — a
+cache the service cannot read must fail while somebody is watching the terminal.
+
+The endpoints are `/healthz`, `/windows`, `/overview`, `/repositories`,
 `/repositories/{repository}`, `/repositories/{repository}/trend`, `/actors`, `/actors/{login}`, `/teams` and
 `/teams/{team}`; every data endpoint takes `?weeks=` and refuses a span off the list rather than clamping it. A request
 naming no span gets four weeks, or the longest span the configuration allows below that.
@@ -1406,9 +1423,9 @@ as not reported from Tuesday onwards. So a span served the day after a collectio
 supports, and a repository off that edge is reported as unavailable at that window rather than pulling everyone else's
 window back to meet it or dragging it forward. The instant a window is anchored to is published as `collected_through` on
 `/windows` and on `/overview`, and `/windows` also carries `collection_stale`, set when the last collection is older
-than `lookback.stale_collection_days`. The UI prints `Collected through 2026-09-01` in the overview header beside the
-span, and shows an amber warning bar on every page — overview, repository, team and actor — while the collection is
-stale, because a page that quietly reports a fortnight-old window reads as this morning's.
+than `lookback.stale_collection_days`. The UI prints `Collected through 2026-09-01` in each estate list's header beside
+the span, and shows an amber warning bar on every page — the three lists, repository, team and contributor — while the
+collection is stale, because a page that quietly reports a fortnight-old window reads as this morning's.
 
 The trend endpoint is the one exception to `?weeks=`: a series is cut into periods from the repository's own
 enablement instant and has no reporting window to select, so it takes `period_days` (default `28`) and an optional
@@ -1444,7 +1461,10 @@ Collection stays on the host, because it is the step that needs a credential and
 `./.metrics` is mounted read-write, so the configuration's `database` must resolve inside `.metrics` or the service
 starts with nothing to serve.
 
-Only the UI is published, on `http://localhost` — port 80 on the host, mapped to the container's 3000; the API
+Only the UI is published, on `http://localhost` — port 80 on the host, mapped to the container's 3000; it was
+`3000:3000` until 2026-09-02, so a bookmark on `http://localhost:3000` no longer answers. Port 80 is privileged on
+Linux and is what a host's own web server usually already holds, so where `up` fails to bind, change the host half of
+`80:3000` in `docker-compose.yml`: the container listens on 3000 whatever is in front of it. The API
 answers at `http://api:8000` on the compose network
 alone, which is the same server-side-only arrangement the local loop has. The UI waits for the API's `/healthz` to
 answer, and the API's healthcheck allows a minute before it starts failing, so the first `up` is slower than the ones

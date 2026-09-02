@@ -60,6 +60,11 @@ In `ui/`, the same rules in TypeScript, plus:
   `field: T | null`, and guard it with `== null` rather than `=== null`.
 - A figure must read the same on a page as in the text report the same window prints. `ui/src/lib/format.ts` mirrors
   `metrics.render` function for function, down to Python's half-to-even rounding.
+- A figure's colour is decided in `ui/src/lib/tone.ts` and nowhere else: no component holds a threshold and none holds
+  a hex literal. Where `assessment.py` already grades a figure the page carries that condition's verdict rather than
+  restating the target, so raising a target in the assessment configuration is what changes a colour.
+- Every route segment carries a `loading.tsx` drawn from `ui/src/components/Skeleton.tsx`, so a cold bundle shows the
+  page's bones rather than a blank screen. A new segment without one is unfinished.
 - See `ui/README.md` for the design tokens and the guardrails the pages keep.
 
 ## Git

@@ -100,8 +100,8 @@ export function conditionTone(outcome: ConditionOutcome, condition: ReadinessCon
   if (outcome === 'blocking') {
     return undefined;
   }
-  // Absent from a block stored before the flag existed, which reads as a graded condition: the
-  // three that carry it say so in their detail too, so an old block loses a colour, not a fact.
+  // Absent from a service older than the flag, which reads as a graded condition: the three that
+  // carry it say so in their detail too, so an old service loses a colour, not a fact.
   if (condition.informational ?? false) {
     return 'neutral';
   }
@@ -242,7 +242,14 @@ const GATE_TONE: Record<GateField, (value: GateValue) => Tone> = {
   blocks_force_pushes: () => 'neutral',
 };
 
-export function gateFieldTone(field: GateField, value: GateValue): Tone {
+/**
+ * The tone one merge-gate field reads in, from the field and the value the report sent for it.
+ *
+ * `value` is optional because two of the twelve fields have none a tone could be read off — the
+ * branch a gate was read on, and the rules this build did not interpret — and passing them an
+ * explicit `undefined` read as a value that had gone missing rather than one that never existed.
+ */
+export function gateFieldTone(field: GateField, value?: GateValue): Tone {
   return GATE_TONE[field](value);
 }
 

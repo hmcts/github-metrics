@@ -68,6 +68,11 @@ describe('percentile', () => {
 });
 
 describe('metricTone', () => {
+  /** One card to take a tone for. The observation only matters to the two completeness rates. */
+  function card(metric: string, observation: Observation = RATE): BehaviourMetricSummary {
+    return { metric, summary: observation, classifications: {} };
+  }
+
   function assessment(
     blocking: ReadinessCondition[],
     caution: ReadinessCondition[],
@@ -92,32 +97,32 @@ describe('metricTone', () => {
   );
 
   it('reads a metric the policy cleared as reading well', () => {
-    expect(metricTone('checks-passing-at-merge', GRADED)).toBe('good');
+    expect(metricTone(card('checks-passing-at-merge'), GRADED)).toBe('good');
   });
 
   it('takes the ceiling a blocking condition imposed, red and amber alike', () => {
     // The card can never contradict the block above it: red there is red here, and a distribution
     // capped at amber by `assessment.distribution` is amber here rather than the worse colour.
-    expect(metricTone('independent-review-coverage', GRADED)).toBe('bad');
-    expect(metricTone('merge-cycle-time', GRADED)).toBe('warn');
+    expect(metricTone(card('independent-review-coverage'), GRADED)).toBe('bad');
+    expect(metricTone(card('merge-cycle-time'), GRADED)).toBe('warn');
   });
 
   it('reads a caution as worth weighing — `review-depth` imposes nothing and never reads badly', () => {
-    expect(metricTone('review-depth', GRADED)).toBe('warn');
+    expect(metricTone(card('review-depth'), GRADED)).toBe('warn');
   });
 
   it('reads a metric with nothing to grade as the caution the policy raised for it', () => {
-    expect(metricTone('time-to-first-review', GRADED)).toBe('warn');
+    expect(metricTone(card('time-to-first-review'), GRADED)).toBe('warn');
   });
 
   it('leaves a metric no condition names uncoloured rather than guessing at one', () => {
-    expect(metricTone('pull-request-size', GRADED)).toBe('neutral');
+    expect(metricTone(card('pull-request-size'), GRADED)).toBe('neutral');
   });
 
   it('colours nothing without an assessment, which is what an actor page renders with', () => {
     // The policy grades repositories and not people, so one person's slice of one repository
     // arrives with no assessment at all — and must render rather than throw.
-    expect(metricTone('independent-review-coverage', undefined)).toBe('neutral');
+    expect(metricTone(card('independent-review-coverage'), undefined)).toBe('neutral');
   });
 
   it('grades nothing off a condition whose ceiling could not be read', () => {
@@ -126,7 +131,7 @@ describe('metricTone', () => {
       [],
       [],
     );
-    expect(metricTone('approval-coverage', unreadable)).toBe('neutral');
+    expect(metricTone(card('approval-coverage'), unreadable)).toBe('neutral');
   });
 
   it('carries an informational condition without colour, as the assessment block does', () => {
@@ -135,13 +140,56 @@ describe('metricTone', () => {
       [],
       [{ condition: 'approval-coverage-at-target', detail: 'reported, not judged', informational: true }],
     );
-    expect(metricTone('approval-coverage', reported)).toBe('neutral');
+    expect(metricTone(card('approval-coverage'), reported)).toBe('neutral');
   });
 
   it('matches the whole metric name, not a metric whose name it starts with', () => {
     // `approval-coverage` is not `independent-review-coverage`, and a suffix match on the wrong
     // side of the hyphen would hand one metric the other's grade.
-    expect(metricTone('coverage', GRADED)).toBe('neutral');
-    expect(metricTone('independent-review-coverage-below', GRADED)).toBe('neutral');
+    expect(metricTone(card('coverage'), GRADED)).toBe('neutral');
+    expect(metricTone(card('independent-review-coverage-below'), GRADED)).toBe('neutral');
+  });
+
+  const COMPLETENESS = ['description-quality', 'traceability-reference'] as const;
+
+  it.each(COMPLETENESS)('reads %s green when every eligible merge is counted', (metric) => {
+    const whole: Observation = { status: 'observed', numerator: 96, denominator: 96 };
+    expect(metricTone(card(metric, whole), GRADED)).toBe('good');
+  });
+
+  it.each(COMPLETENESS)('leaves %s uncoloured one merge short of complete', (metric) => {
+    const short: Observation = { status: 'observed', numerator: 95, denominator: 96 };
+    expect(metricTone(card(metric, short), GRADED)).toBe('neutral');
+  });
+
+  it.each(COMPLETENESS)('leaves %s uncoloured at a rate that only rounds to 100%%', (metric) => {
+    // 2499 of 2500 is 99.96%, which `rate` prints as `100%` at one decimal place. Colouring the
+    // card off that string would say the one unreferenced merge does not exist.
+    const nearly: Observation = { status: 'observed', numerator: 2499, denominator: 2500 };
+    expect(metricValue(card(metric, nearly))).toBe('100%');
+    expect(metricTone(card(metric, nearly), GRADED)).toBe('neutral');
+  });
+
+  it.each(COMPLETENESS)('leaves %s uncoloured where there was nothing to count', (metric) => {
+    const none: Observation = { status: 'not_applicable', numerator: 0, denominator: 0 };
+    expect(metricTone(card(metric, none), GRADED)).toBe('neutral');
+    // And an empty denominator the service did send as observed: nothing measured is not
+    // everything measured, however the two zeroes compare.
+    const empty: Observation = { status: 'observed', numerator: 0, denominator: 0 };
+    expect(metricTone(card(metric, empty), GRADED)).toBe('neutral');
+  });
+
+  it.each(COMPLETENESS)('reads %s green on a contributor page, where no assessment arrives', (metric) => {
+    // The rule asks the assessment nothing, which is what lets it be the one card with colour on a
+    // grid the policy graded no part of.
+    const whole: Observation = { status: 'observed', numerator: 7, denominator: 7 };
+    expect(metricTone(card(metric, whole), undefined)).toBe('good');
+    expect(metricTone(card(metric, { ...whole, numerator: 6 }), undefined)).toBe('neutral');
+  });
+
+  it.each(COMPLETENESS)('leaves %s uncoloured for a distribution, which has no denominator', (metric) => {
+    // Neither is a distribution today; if one were reshaped into one, the rule has no completeness
+    // to read and must stay silent rather than colouring a median green.
+    expect(metricTone(card(metric, DISTRIBUTION), GRADED)).toBe('neutral');
   });
 });

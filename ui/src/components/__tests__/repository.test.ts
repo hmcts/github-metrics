@@ -160,7 +160,7 @@ describe('FindingsTable', () => {
   const markup = renderToStaticMarkup(createElement(FindingsTable, { findings, weeks: 8 }));
 
   it('links the actor a rule fired on, carrying the span onto the drill-through', () => {
-    expect(markup).toContain('/actors/alice?weeks=8');
+    expect(markup).toContain('/contributors/alice?weeks=8');
     expect(markup).toContain('font-mono');
   });
 
@@ -240,7 +240,7 @@ describe('ContributorsTable', () => {
   });
 
   it('links each login and states what that person did rather than what a rule found', () => {
-    expect(markup).toContain('/actors/carol?weeks=4');
+    expect(markup).toContain('/contributors/carol?weeks=4');
     expect(markup).toContain('Merged PRs');
     expect(markup).toContain('Direct pushes');
     expect(markup).toContain('Unreviewed merges');

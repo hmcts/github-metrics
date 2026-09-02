@@ -2,9 +2,12 @@
 
 import logging
 import threading
-from collections.abc import Iterator
+import time
+from collections import Counter
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -47,6 +50,7 @@ from metrics.domain import (
 from metrics.service import (
     DEFAULT_BUNDLE_AGE_SECONDS,
     DEFAULT_PERIOD_DAYS,
+    DEFAULT_WARM_INTERVAL_SECONDS,
     MAXIMUM_HELD_SERIES,
     MAXIMUM_PERIODS,
     NOT_ASSESSED,
@@ -58,9 +62,11 @@ from metrics.service import (
     create_app,
     default_window,
     file_stamp,
+    keep_warm,
     main,
     reporting_window,
     source_stamp,
+    warm_spans,
     window_options,
 )
 from metrics.storage import StorageError, cache_direct_commit_facts, cache_pull_request_facts
@@ -69,6 +75,23 @@ from metrics.window import midnight
 
 MAXIMUM_AGE = timedelta(seconds=DEFAULT_BUNDLE_AGE_SECONDS)
 """The bundle lifetime every test uses unless it is testing the lifetime itself."""
+
+WARM_INTERVAL = timedelta(seconds=DEFAULT_WARM_INTERVAL_SECONDS)
+"""How often the warmer wakes in a test, which is also the margin it refreshes within."""
+
+
+def waited_for(condition: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Spin until another thread has made the progress a condition names, or give up and say so.
+
+    Polled rather than signalled because what the concurrency tests wait on is a thread reaching a
+    lock, which the thread itself cannot announce: the registry's holder count is the announcement.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def starts_at() -> datetime:
@@ -414,16 +437,19 @@ def test_two_requests_for_a_cold_span_assemble_it_once_between_them(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Build once under the lock, so a cold span does not walk every repository twice at once.
+    """Build once under the span's own lock, so a cold span is not walked twice at once.
 
     The class promises this and every other test is single-threaded, so a lock dropped or narrowed to
     the dictionary write alone would let a thundering herd on a cold span run one whole cohort load
-    per waiting request with nothing failing.
+    per waiting request with nothing failing. The second reader must also come away with what the
+    builder produced, which is what the check inside the lock is for.
     """
+    entered = threading.Event()
     released = threading.Event()
     loader = Loader()
 
     def blocking(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        entered.set()
         released.wait(timeout=5)
         return loader(settings, window)
 
@@ -432,8 +458,13 @@ def test_two_requests_for_a_cold_span_assemble_it_once_between_them(
     built: list[ReportBundle] = []
     threads = [threading.Thread(target=lambda: built.append(cache.bundle(4))) for _ in range(2)]
 
-    for thread in threads:
-        thread.start()
+    threads[0].start()
+    assert entered.wait(timeout=5)
+    threads[1].start()
+    # Both waited for in turn rather than started together: the second request must reach the span's
+    # lock while the first is still inside it, or it would answer off the check outside the lock and
+    # the contention this test is about would never happen.
+    assert waited_for(lambda: cache.builds.holders[4] == 2)
     released.set()
     for thread in threads:
         thread.join(timeout=5)
@@ -442,13 +473,156 @@ def test_two_requests_for_a_cold_span_assemble_it_once_between_them(
     assert built[0] is built[1]
 
 
+def test_a_cold_span_builds_beside_another_span_rather_than_behind_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hold one lock per span, so a cold 26-week build is not every other request's wait.
+
+    The 26-week build is released BY the 1-week build, so one lock for every span cannot pass this
+    test by merely being slower: the short span would be stuck behind the long one, the long one
+    would come out of its wait on the timeout instead, and `waited` would say so.
+    """
+    entered = threading.Event()
+    released = threading.Event()
+    waited: list[bool] = []
+    loader = Loader()
+
+    def paired(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        if window.ends_at - window.starts_at == timedelta(weeks=26):
+            entered.set()
+            waited.append(released.wait(timeout=5))
+        else:
+            released.set()
+        return loader(settings, window)
+
+    monkeypatch.setattr("metrics.service.offline_practice_report", paired)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    long_span = threading.Thread(target=lambda: cache.bundle(26))
+    long_span.start()
+    assert entered.wait(timeout=5)
+
+    short = cache.bundle(1)
+    long_span.join(timeout=5)
+
+    assert waited == [True]
+    assert short.weeks == 1
+    assert cache.bundles[26].weeks == 26
+
+
+def test_two_requests_for_a_cold_cut_of_one_series_make_it_once_between_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cut once under that cut's own lock, for the reason a span is built once under its own."""
+    entered = threading.Event()
+    released = threading.Event()
+    replacement = Series()
+
+    def blocking(
+        settings: Configuration,
+        request: SeriesRequest,
+        repository: str,
+        enablement: datetime | None,
+    ) -> RepositoryTrend:
+        entered.set()
+        released.wait(timeout=5)
+        return replacement(settings, request, repository, enablement)
+
+    monkeypatch.setattr("metrics.service.repository_trend", blocking)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    cut: list[RepositoryTrend] = []
+    threads = [threading.Thread(target=lambda: cut.append(cache.trend("cath-service", 28, None))) for _ in range(2)]
+
+    threads[0].start()
+    assert entered.wait(timeout=5)
+    threads[1].start()
+    assert waited_for(lambda: cache.cuts.holders["cath-service", 28, None] == 2)
+    released.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert replacement.cuts == [("cath-service", 28, None)]
+    assert cut[0] is cut[1]
+
+
+@pytest.mark.usefixtures("series")
+def test_the_series_bound_holds_when_every_cut_is_made_at_once(tmp_path: Path) -> None:
+    """Keep the eviction order under one lock, which is the state no single cut's lock covers.
+
+    Every other eviction test is single-threaded, so a bound maintained under the per-cut locks
+    alone would hold there and let concurrent readers trim against an order another thread was
+    reordering — dropping a series somebody had just read, or holding more than the bound.
+    """
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    spans = range(1, MAXIMUM_HELD_SERIES * 2 + 1)
+    threads = [threading.Thread(target=partial(cache.trend, "cath-service", days, 5)) for days in spans]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(cache.series) == MAXIMUM_HELD_SERIES
+
+
+def test_no_lock_is_held_for_a_span_or_a_cut_nobody_is_reading(
+    tmp_path: Path,
+    loader: Loader,
+    series: Series,
+) -> None:
+    """Drop each lock once nobody holds or waits for it, so the registries do not grow.
+
+    A series key carries the cut a request named, so the keys are effectively unbounded — the reason
+    `MAXIMUM_HELD_SERIES` bounds the series themselves, and a registry that only ever inserted would
+    keep a lock per cut anybody ever asked for.
+    """
+    _ = loader, series
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    cache.bundle(4)
+    cache.trend("cath-service", 28, None)
+
+    assert cache.builds.locks == {}
+    assert cache.builds.holders == Counter()
+    assert cache.cuts.locks == {}
+    assert cache.cuts.holders == Counter()
+
+
+def test_no_lock_is_held_for_a_span_whose_build_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the lock on the way out of a build that failed, not only one that finished.
+
+    The failure path is the one that matters for the registries: an unreadable cache is exactly what
+    a repeated request retries, and a count left standing per failed build would keep a lock for
+    every span and every cut anybody ever asked for — the accumulation the reference counting exists
+    to prevent, and one no successful build would ever show.
+    """
+
+    def failing(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        _ = settings, window
+        message = "the cache is not a database"
+        raise StorageError(message)
+
+    monkeypatch.setattr("metrics.service.offline_practice_report", failing)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    with pytest.raises(StorageError):
+        cache.bundle(4)
+    # Swallowed by the warmer, which is the other caller that can leave a build part-way.
+    warm_spans(cache, (4,), WARM_INTERVAL)
+
+    assert cache.bundles == {}
+    assert cache.builds.locks == {}
+    assert cache.builds.holders == Counter()
+
+
 def test_reading_the_caches_to_build_a_bundle_does_not_invalidate_it(tmp_path: Path) -> None:
     """Hold a bundle built from a REAL cache, not a stubbed loader, across the next request.
 
     The build reads every configured repository's coverage, and a read that stamped `accessed_at`
     would write to the cache file — moving the modification time and size the held bundle is compared
     against, so its own build would invalidate it and every request would rebuild the whole cohort
-    under the lock. `test_one_span_is_assembled_once_and_then_reused` cannot see that: its loader
+    for itself. `test_one_span_is_assembled_once_and_then_reused` cannot see that: its loader
     never opens the cache at all.
     """
     settings = configuration(tmp_path)
@@ -496,6 +670,231 @@ def test_a_bundle_older_than_the_configured_maximum_age_is_rebuilt(tmp_path: Pat
 
     assert second is not first
     assert len(loader.windows) == 2
+
+
+def test_a_warm_builds_a_span_nothing_is_holding(tmp_path: Path, loader: Loader) -> None:
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    assert cache.warm(4, WARM_INTERVAL) is True
+    assert cache.bundles[4].weeks == 4
+    assert len(loader.windows) == 1
+
+
+def test_a_warm_leaves_a_bundle_that_will_outlive_the_next_wake_alone(tmp_path: Path, loader: Loader) -> None:
+    """Return without building, so a warmer that wakes every five minutes is not a rebuild loop."""
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    first = cache.bundle(4)
+
+    assert cache.warm(4, WARM_INTERVAL) is False
+    assert cache.bundles[4] is first
+    assert len(loader.windows) == 1
+
+
+def test_a_warm_rebuilds_a_bundle_that_would_go_stale_before_the_next_wake(tmp_path: Path, loader: Loader) -> None:
+    """Refresh inside the margin, which `bundle` cannot: it serves what is still usable.
+
+    The bundle aged here is one a reader would be handed as it stands, and that is the point — by
+    the warmer's next wake it would have expired, and whoever asked for it then would have waited
+    for the whole cohort's cached facts. A warmer written on top of `bundle` would refresh nothing
+    until exactly that had happened.
+    """
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    first = cache.bundle(4)
+    # A second inside the margin rather than outside it: still usable, and not usable for long.
+    aged = replace(first, built_at=first.built_at - MAXIMUM_AGE + WARM_INTERVAL - timedelta(seconds=1))
+    cache.bundles[4] = aged
+
+    assert cache.bundle(4) is aged
+    assert cache.warm(4, WARM_INTERVAL) is True
+    assert cache.bundles[4] is not aged
+    assert len(loader.windows) == 2
+
+
+def test_a_warm_leaves_a_bundle_alone_a_second_outside_the_margin(tmp_path: Path, loader: Loader) -> None:
+    """Refresh INSIDE the margin and no further, so the margin is a horizon rather than a direction.
+
+    The mirror of the test above, one second the other side of the same edge: this bundle expires
+    just after the next wake rather than just before it, so the wake that finds it leaves it and the
+    one after rebuilds it. Without this the margin could be widened — to twice the interval, or to
+    the age itself — with every other warm test still green and the warmer rebuilding every span on
+    every wake, which is the fault `main` refuses when the interval is at or above the age.
+    """
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    first = cache.bundle(4)
+    aged = replace(first, built_at=first.built_at - MAXIMUM_AGE + WARM_INTERVAL + timedelta(seconds=1))
+    cache.bundles[4] = aged
+
+    assert cache.warm(4, WARM_INTERVAL) is False
+    assert cache.bundles[4] is aged
+    assert len(loader.windows) == 1
+
+
+def test_a_collection_landing_after_a_span_was_warmed_is_warmed_in(tmp_path: Path, loader: Loader) -> None:
+    """Refresh on a moved stamp as a request does, so a wake after a collection lands rebuilds."""
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    cache.warm(4, WARM_INTERVAL)
+
+    settings.database.write_bytes(b"collected")
+
+    assert cache.warm(4, WARM_INTERVAL) is True
+    assert len(loader.windows) == 2
+
+
+def test_two_warms_of_a_cold_span_build_it_once_between_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check inside the span's build lock as `bundle` does, so a warm beside a build waits for it.
+
+    Two warms is not the shape this arrives in — a reader's build and the wake that lands on it is —
+    but both reach the same lock, and whichever gets there second must come away with what the first
+    produced rather than walking the whole cohort's cached facts again.
+    """
+    entered = threading.Event()
+    released = threading.Event()
+    loader = Loader()
+
+    def blocking(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        entered.set()
+        released.wait(timeout=5)
+        return loader(settings, window)
+
+    monkeypatch.setattr("metrics.service.offline_practice_report", blocking)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    warmed: list[bool] = []
+    threads = [threading.Thread(target=lambda: warmed.append(cache.warm(4, WARM_INTERVAL))) for _ in range(2)]
+
+    threads[0].start()
+    assert entered.wait(timeout=5)
+    threads[1].start()
+    assert waited_for(lambda: cache.builds.holders[4] == 2)
+    released.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(loader.windows) == 1
+    assert sorted(warmed) == [False, True]
+
+
+def test_the_warmer_builds_every_span_on_offer_and_leaves_a_built_one_alone(
+    tmp_path: Path,
+    loader: Loader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Build the four cold spans, and skip the one `main` built before anything was listening.
+
+    Only the default span was ever built ahead of a reader, so the other four were cold until
+    somebody asked for one — and that reader paid for the whole cohort. This is the pass that
+    removes the wait.
+    """
+    caplog.set_level(logging.INFO)
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    default = cache.bundle(4)
+    stopping = threading.Event()
+    stopping.set()
+
+    keep_warm(cache, WEEKS_OPTIONS, WARM_INTERVAL, stopping)
+
+    assert sorted(cache.bundles) == sorted(WEEKS_OPTIONS)
+    assert cache.bundles[4] is default
+    assert len(loader.windows) == len(WEEKS_OPTIONS)
+    assert "Warmed the 26-week window" in caplog.text
+    assert "Warmed the 4-week window" not in caplog.text
+
+
+def test_a_span_that_cannot_be_built_costs_a_log_line_rather_than_the_warmer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Carry on to the next span: a cache unreadable now may be readable at the next wake.
+
+    A thread that died on one unreadable file would take every later refresh with it, leaving a
+    service that looks warm, serves whatever it happened to hold, and never says why.
+    """
+    caplog.set_level(logging.INFO)
+    loader = Loader()
+
+    def failing(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        if window.ends_at - window.starts_at == timedelta(weeks=1):
+            message = "the cache is not a database"
+            raise StorageError(message)
+        return loader(settings, window)
+
+    monkeypatch.setattr("metrics.service.offline_practice_report", failing)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    stopping = threading.Event()
+    stopping.set()
+
+    keep_warm(cache, (1, 4), WARM_INTERVAL, stopping)
+
+    assert sorted(cache.bundles) == [4]
+    assert "Could not warm the 1-week window" in caplog.text
+    assert "Warmed the 4-week window" in caplog.text
+
+
+def test_the_warmer_refreshes_on_the_interval_until_it_is_stopped(tmp_path: Path, loader: Loader) -> None:
+    """Keep waking after the first pass, and come out of the wait the moment the event is set.
+
+    The loop is what keeps a span warm once a collection has landed on it; the event is what keeps a
+    closed application from leaving a thread behind. A sleep in place of the wait would pass the
+    first half of this and hold every shutdown for the rest of an interval.
+    """
+    settings = configuration(tmp_path)
+    # An age no bundle outlives, so every pass rebuilds and the passes can be counted.
+    cache = WindowCache(settings, timedelta(microseconds=1))
+    stopping = threading.Event()
+    warmer = threading.Thread(target=keep_warm, args=(cache, (4,), timedelta(milliseconds=10), stopping))
+
+    warmer.start()
+    assert waited_for(lambda: len(loader.windows) >= 2)
+    stopping.set()
+    warmer.join(timeout=5)
+
+    assert not warmer.is_alive()
+
+
+def test_the_application_warms_every_span_while_it_serves_and_stops_when_it_closes(
+    tmp_path: Path,
+    loader: Loader,
+) -> None:
+    """Start the warmer with the application and stop it with the application.
+
+    A test that builds an application and closes it must not leave a thread refreshing a cache
+    nobody is reading, which is what the lifespan handler and the stopping event are between them.
+    """
+    _ = loader
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    with TestClient(create_app(settings, cache, warm_interval=WARM_INTERVAL)) as connected:
+        assert connected.get("/healthz").status_code == 200
+        assert waited_for(lambda: sorted(cache.bundles) == sorted(WEEKS_OPTIONS))
+
+    assert [thread for thread in threading.enumerate() if thread.name == "window-warmer"] == []
+
+
+def test_an_application_given_no_interval_starts_no_warmer(tmp_path: Path, loader: Loader) -> None:
+    """Serve every route and build a span when something asks for one, without a thread of its own."""
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    with TestClient(create_app(settings, cache)) as connected:
+        assert connected.get("/healthz").status_code == 200
+
+    assert cache.bundles == {}
+    assert loader.windows == []
+
+
+def test_the_default_warm_interval_refreshes_a_span_before_it_can_go_stale() -> None:
+    """The interval is the margin, so an interval at or above the age refreshes only after a wait."""
+    assert DEFAULT_WARM_INTERVAL_SECONDS < DEFAULT_BUNDLE_AGE_SECONDS
 
 
 def test_every_span_ends_where_the_collection_ends(tmp_path: Path) -> None:
@@ -904,8 +1303,8 @@ def test_a_series_resolving_to_more_periods_than_one_request_may_ask_for_is_refu
     """Bound the series a request RESOLVES to, not only the count it names.
 
     `periods` is optional, and left out it asks for every whole period since enablement: at a
-    one-day period that is a cache load per day since the repository was enabled, all of them under
-    the one build lock. Refused rather than truncated, as `MAXIMUM_PERIODS` says.
+    one-day period that is a cache load per day since the repository was enabled, all of them inside
+    one request. Refused rather than truncated, as `MAXIMUM_PERIODS` says.
     """
     response = client.get("/repositories/cath-service/trend", params={"period_days": 1})
 
@@ -1144,7 +1543,7 @@ def test_a_bundle_age_that_would_make_every_bundle_born_stale_is_refused(
     """Refuse the flag rather than serve a cache nothing can ever hit.
 
     A zero or negative age makes `usable` false for everything held, so every request rebuilds the
-    whole cohort's report under the one build lock — which reads as a service that has stopped
+    whole cohort's report under its span's build lock — which reads as a service that has stopped
     rather than as a mistyped flag.
     """
     path = tmp_path / "metrics.yml"
@@ -1175,10 +1574,89 @@ def test_a_bundle_age_of_a_whole_number_of_seconds_is_taken_as_given(
     monkeypatch.setattr("metrics.service.WindowCache", record)
     path = tmp_path / "metrics.yml"
     path.write_text(configuration_text(tmp_path), encoding="utf-8")
-    monkeypatch.setattr("sys.argv", ["metrics-serve", "--config", str(path), "--max-bundle-age", "45"])
+    # The warm interval comes down with the age: it is also the margin a span is refreshed within,
+    # and `main` refuses one at or above the age rather than warming every span on every wake.
+    monkeypatch.setattr(
+        "sys.argv",
+        ["metrics-serve", "--config", str(path), "--max-bundle-age", "45", "--warm-interval", "15"],
+    )
 
     assert main() == 0
     assert held == [timedelta(seconds=45)]
+
+
+@pytest.mark.parametrize("interval", ["0", "-1"])
+def test_a_warm_interval_that_would_never_rest_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interval: str,
+) -> None:
+    """Refuse the flag rather than run a thread rebuilding every span in a loop.
+
+    The same fault as a bundle age of zero, read from the other side: the caches would never be
+    quiet, and every reader would be competing with the warmer for the span they asked for.
+    """
+    path = tmp_path / "metrics.yml"
+    path.write_text(configuration_text(tmp_path), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["metrics-serve", "--config", str(path), "--warm-interval", interval])
+
+    with pytest.raises(SystemExit) as refused:
+        main()
+
+    assert refused.value.code == 2
+
+
+@pytest.mark.parametrize("interval", ["60", "90"])
+def test_a_warm_interval_at_or_above_the_bundle_age_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    interval: str,
+) -> None:
+    """Refuse the pair, because neither flag is out of range on its own.
+
+    The interval is the margin a span is refreshed within, so an interval that outlasts the age asks
+    whether a bundle will still be usable further ahead than a bundle can live: the answer is no for
+    a bundle built a second ago, and the warmer rebuilds every span on every wake for ever. A short
+    age is the natural way to ask for fresher figures, which is how the pair is reached without
+    either number looking wrong — so it is named here rather than left to be inferred from load.
+    """
+    path = tmp_path / "metrics.yml"
+    path.write_text(configuration_text(tmp_path), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["metrics-serve", "--config", str(path), "--max-bundle-age", "60", "--warm-interval", interval],
+    )
+
+    assert main() == 1
+    assert "--warm-interval" in caplog.text
+    assert "--max-bundle-age" in caplog.text
+
+
+def test_the_warm_interval_reaches_the_application_as_given(
+    tmp_path: Path,
+    loader: Loader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The service warms on the configured interval rather than on the one it defaults to."""
+    _ = loader
+    given: list[timedelta | None] = []
+    build = create_app
+
+    def record(settings: Configuration, cache: WindowCache, warm_interval: timedelta | None = None) -> FastAPI:
+        """Build the application the service will serve, recording the interval it was given."""
+        given.append(warm_interval)
+        # Built without the interval: nothing here ever serves a request, so nothing needs a warmer.
+        return build(settings, cache)
+
+    monkeypatch.setattr("metrics.service.uvicorn.run", lambda *_, **__: None)
+    monkeypatch.setattr("metrics.service.create_app", record)
+    path = tmp_path / "metrics.yml"
+    path.write_text(configuration_text(tmp_path), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["metrics-serve", "--config", str(path), "--warm-interval", "30"])
+
+    assert main() == 0
+    assert given == [timedelta(seconds=30)]
 
 
 def configuration_text(tmp_path: Path) -> str:

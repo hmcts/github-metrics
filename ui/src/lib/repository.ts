@@ -155,11 +155,11 @@ export function mergeGateRows(gate: MergeGateEvidence): LabelledValue[] {
   // is untouched and stays what `render.py` prints, so a page and the text report still state one
   // thing; it is the colour that would have blamed a missing permission on the team.
   const withheld = !gate.rules_observed;
-  // The branch a gate was read on and the rules this build did not interpret are passed no value
-  // either: `GateValue` is the flag or the count a tone could be read off, and neither of those two
+  // The branch a gate was read on and the rules this build did not interpret are passed no value at
+  // all: `GateValue` is the flag or the count a tone could be read off, and neither of those two
   // fields is one. `gateFieldTone` answers neutral for both, which is where that stays decided.
   return [
-    { label: 'Branch', value: gate.branch, tone: gateFieldTone('branch', undefined) },
+    { label: 'Branch', value: gate.branch, tone: gateFieldTone('branch') },
     { label: 'Protected', value: yesOrNo(gate.protected), tone: gateFieldTone('protected', gate.protected) },
     {
       label: 'Rules observed',
@@ -209,7 +209,7 @@ export function mergeGateRows(gate: MergeGateEvidence): LabelledValue[] {
     {
       label: 'Rules not interpreted',
       value: gate.unmodelled_rules.join(', ') || 'none',
-      tone: gateFieldTone('unmodelled_rules', undefined),
+      tone: gateFieldTone('unmodelled_rules'),
     },
   ];
 }

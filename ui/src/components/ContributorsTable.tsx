@@ -19,7 +19,7 @@ import { withWeeks } from '@/lib/weeks';
  * merges that carried no independent review, and the median size of a change — never a score and
  * never a rate to compare people on. A sortable header would turn the block into a league table by
  * offering to order people by the numbers, which the scope boundaries exclude. Alphabetical is the
- * order for a list ABOUT people, which is what `/actors` is; this list is about one repository.
+ * order for a list ABOUT people, which is what `/contributors` is; this list is about one repository.
  *
  * `Blocking occurrences` was dropped here on 2026-09-02: it counted the same occurrences the
  * findings table above already lists per rule and per person, and the space reads better spent on
@@ -71,7 +71,7 @@ export function ContributorsTable({
               <tr key={row.login} className="hover:bg-slate-800/30">
                 <td className="py-2 pl-3 pr-3">
                   <Link
-                    href={withWeeks(`/actors/${encodeURIComponent(row.login)}`, weeks)}
+                    href={withWeeks(`/contributors/${encodeURIComponent(row.login)}`, weeks)}
                     className="font-mono text-indigo-400 hover:text-indigo-300 break-all"
                   >
                     {row.login}
