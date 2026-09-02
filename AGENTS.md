@@ -8,6 +8,9 @@
 - The dashboard UI lives in `ui/`, a Next.js app with its own npm dependencies and its own
   `package-lock.json`. Neither toolchain sees the other's directory: uv does not lint `ui/`, and the UI gate does not
   run pytest. FastAPI and uvicorn are an optional `service` extra, so the Python side installs neither by default.
+- Both are packaged by `docker-compose.yml`. The root `.dockerignore` is deny-by-default, so a new runtime file
+  outside `src/` needs an explicit `!` entry or it will be missing from the API image, and `ui/next.config.mjs`'s
+  `output: 'standalone'` exists for `ui/Dockerfile` alone.
 
 ## Shell and Credentials
 

@@ -1,5 +1,6 @@
 import { cookies } from 'next/headers';
 import { ActorsTable } from '@/components/ActorsTable';
+import { CollectionNotice } from '@/components/CollectionNotice';
 import { EmptyState } from '@/components/EmptyState';
 import { FilterSearchBox } from '@/components/FilterSearchBox';
 import { MetricCard } from '@/components/MetricCard';
@@ -10,6 +11,7 @@ import { SummaryPieChart } from '@/components/charts/SummaryPieChart';
 import { TeamsList } from '@/components/TeamsList';
 import { getActors, getOverview, getRepositories, getTeams, getWindows } from '@/lib/api';
 import { distributionSlices } from '@/lib/chart';
+import { collectedLabel } from '@/lib/collection';
 import { count, instant, span } from '@/lib/format';
 import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
 
@@ -44,9 +46,12 @@ export default async function OverviewPage({
     getTeams(weeks),
   ]);
   const window = span(overview.starts_at, overview.ends_at);
+  const collected = collectedLabel(overview.collected_through);
 
   return (
     <div className="space-y-8">
+      <CollectionNotice windows={windows} />
+
       <header className="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-2">
         <div className="flex flex-wrap items-center gap-3">
           <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
@@ -60,6 +65,10 @@ export default async function OverviewPage({
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-400">
           <span>{window}</span>
           <span>{count(overview.weeks, 'week', 'weeks')}</span>
+          {/* Beside the window rather than in place of the build stamp: the window ends where the
+              caches end, and the two instants answer different questions — what the figures cover,
+              and when this bundle was assembled from them. */}
+          {collected ? <span>{collected}</span> : null}
           <span className="text-slate-500">Report built {instant(overview.built_at)}</span>
           {overview.unavailable > 0 ? (
             <span className="text-slate-500">

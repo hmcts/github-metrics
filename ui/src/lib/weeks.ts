@@ -3,8 +3,9 @@
  *
  * The service is the authority on which spans exist — it filters its own list against the
  * configuration's maximum lookback, so a span the caches can never cover is not on offer — and
- * `GET /windows` is where a page learns them. The constants here are only what a page falls back to
- * before that answer arrives, or when a URL carries a span the service has since stopped offering.
+ * `GET /windows` is where a page learns them. Nothing here holds a list of its own: every page
+ * awaits that answer before it resolves a span, and a copy kept beside it could only ever drift out
+ * of step with the spans actually served.
  *
  * Resolution priority, highest first:
  *   1. an explicit `?weeks=` in the URL — the link the reader followed said so
@@ -16,10 +17,6 @@
  */
 
 export const WEEKS_COOKIE = 'weeks';
-
-export const FALLBACK_WEEKS = 4;
-
-export const FALLBACK_OPTIONS: readonly number[] = [1, 4, 8, 12, 26];
 
 /** A year, so the choice survives closing the browser: it is a reading preference, not a session. */
 export const WEEKS_COOKIE_MAXIMUM_AGE = 365 * 24 * 3600;

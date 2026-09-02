@@ -552,8 +552,8 @@ class AlertObservation(EvidenceModel):
 class SecurityAlertReport(EvidenceModel):
     """Report one repository's stored security alerts, or why there are none to show.
 
-    Stored current state read at `fetched_at`, exactly like the merge gate beside it, so `--offline`
-    serves the last collection's answer rather than refusing. A repository whose state was never
+    Stored current state read at `fetched_at`, exactly like the merge gate beside it, so a cached
+    `evidence` run serves the last collection's answer rather than refusing. A repository whose state was never
     collected carries the reason instead: an absent block would read as a repository with no alerts.
     """
 
@@ -901,7 +901,7 @@ class SonarProjectResolution(EvidenceModel):
 
     Stored beside the measures rather than recomputed when the report is assembled, because HOW a
     project was chosen is not recoverable later: the configured override that answered may have been
-    edited since, the stored map may have moved the project, and an `--offline` report may contact
+    edited since, the stored map may have moved the project, and a cached report may contact
     neither. The method is the thing that makes a wrong mapping diagnosable, so it is stored with the
     evidence it produced.
 

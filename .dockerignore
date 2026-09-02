@@ -1,0 +1,8 @@
+# The API build needs pyproject.toml, uv.lock, README.md and src/ only. Everything else in this
+# directory — the caches, the virtualenvs, the collected JSON left at the root — is context the
+# daemon would have to copy and the build would never read.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src

@@ -163,7 +163,14 @@ describe('endpoints', () => {
   });
 
   it('returns the parsed body to the caller', async () => {
-    respond({ options: [1, 4], default: 4, trend_periods: 26 });
-    await expect(getWindows()).resolves.toEqual({ options: [1, 4], default: 4, trend_periods: 26 });
+    const body = {
+      options: [1, 4],
+      default: 4,
+      trend_periods: 26,
+      collected_through: '2026-09-01T00:00:00+00:00',
+      collection_stale: false,
+    };
+    respond(body);
+    await expect(getWindows()).resolves.toEqual(body);
   });
 });

@@ -66,6 +66,10 @@ class LookbackConfiguration(ConfigurationModel):
     mutable_hours: PositiveInt = 6
     # Measured from an open pull request's last update, not from when it was opened.
     stale_open_days: PositiveInt = 14
+    # How old the last collection may be before reporting says so. Collection runs weekly, so eight
+    # days is one missed run rather than one missed day: a warning raised the morning after every
+    # run would say nothing about whether the figures can still be trusted.
+    stale_collection_days: PositiveInt = 8
 
 
 class TeamConfiguration(ConfigurationModel):

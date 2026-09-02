@@ -2,6 +2,7 @@ import { cookies } from 'next/headers';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { AssessmentSection } from '@/components/AssessmentSection';
+import { CollectionNotice } from '@/components/CollectionNotice';
 import { ContributorsTable } from '@/components/ContributorsTable';
 import { EmptyState } from '@/components/EmptyState';
 import { EntityHeader } from '@/components/EntityHeader';
@@ -89,6 +90,7 @@ export default async function RepositoryPage({
   if (evidence === undefined) {
     return (
       <div className="space-y-8">
+        <CollectionNotice windows={windows} />
         {header}
         <EmptyState
           message={`This span holds no evidence for ${detail.repository}.`}
@@ -116,6 +118,7 @@ export default async function RepositoryPage({
 
   return (
     <div className="space-y-8">
+      <CollectionNotice windows={windows} />
       {header}
 
       <ValueCards

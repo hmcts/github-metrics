@@ -56,6 +56,7 @@ from metrics.storage import (
     load_repository_state,
     load_sonar_mapping,
     observation_database,
+    prevailing_cached_coverage,
     prune_cache,
     record_alert_observations,
     record_repository_state,
@@ -838,7 +839,7 @@ def test_fact_cache_operations_translate_sqlite_failures(tmp_path: Path) -> None
         patch("metrics.storage.connect", side_effect=Error("unavailable")),
         pytest.raises(StorageError, match="could not read collection cache"),
     ):
-        find_missing_cached_coverage(path, coverage)
+        find_missing_cached_coverage(path, coverage, record_use=True)
     with (
         patch("metrics.storage.connect", side_effect=Error("unavailable")),
         pytest.raises(StorageError, match="could not update collection cache"),
@@ -893,10 +894,238 @@ def test_a_widened_query_refetches_rather_than_reading_facts_cached_under_the_ol
     cache_pull_request_facts(path, stored, (fact,), complete=True)
     widened = stored.model_copy(update={"query_hash": "after-the-field-was-added"})
 
-    assert find_missing_cached_coverage(path, stored) == ()
-    assert find_missing_cached_coverage(path, widened) == (widened,)
+    assert find_missing_cached_coverage(path, stored, record_use=True) == ()
+    assert find_missing_cached_coverage(path, widened, record_use=True) == (widened,)
     assert load_cached_pull_request_facts(path, widened) == ()
     assert load_cached_pull_request_facts(path, stored) == (fact,)
+
+
+def test_only_a_collecting_read_of_the_coverage_stamps_it_as_used(tmp_path: Path) -> None:
+    """Write on the collecting read and not on the reporting one, and answer the same either way.
+
+    The reporting read must leave the file alone: the service decides a held bundle still describes
+    the caches by their modification time and size, so a report that stamped `accessed_at` would move
+    the stamp its own build was compared against and rebuild the whole cohort on every request. The
+    interval loses nothing by it — a collection records `accessed_at` on every interval it writes,
+    which is what keeps a live signature out of `prune_cache`'s reach.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    coverage = SourceCoverage(
+        organization="hmcts",
+        repository="cath-service",
+        source=EvidenceSource.PULL_REQUEST,
+        query_hash="testhash",
+        starts_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    cache_pull_request_facts(path, coverage, (), complete=True)
+    with closing(connect(path)) as connection:
+        connection.execute(
+            "UPDATE source_coverage SET accessed_at = ?", (datetime(2026, 1, 1, tzinfo=UTC).isoformat(),)
+        )
+        connection.commit()
+    stamped = (path.stat().st_mtime, path.stat().st_size)
+
+    assert find_missing_cached_coverage(path, coverage, record_use=False) == ()
+    assert (path.stat().st_mtime, path.stat().st_size) == stamped
+    assert prune_cache(path, datetime(2026, 6, 1, tzinfo=UTC)) == 1
+
+    cache_pull_request_facts(path, coverage, (), complete=True)
+    with closing(connect(path)) as connection:
+        connection.execute(
+            "UPDATE source_coverage SET accessed_at = ?", (datetime(2026, 1, 1, tzinfo=UTC).isoformat(),)
+        )
+        connection.commit()
+
+    assert find_missing_cached_coverage(path, coverage, record_use=True) == ()
+    assert prune_cache(path, datetime(2026, 6, 1, tzinfo=UTC)) == 0
+
+
+def test_a_cache_holding_no_coverage_reports_nothing_collected(tmp_path: Path) -> None:
+    """Report `None` rather than an invented instant when nothing has ever been collected.
+
+    A cache that is not there is left where it was, unwritten: the service compares both cache files
+    against the stamp it built a report from, and a read that created one would move that stamp.
+    """
+    path = tmp_path / "metrics.sqlite3"
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") is None
+    assert not path.exists()
+
+    with closing(connect(path)) as connection:
+        initialize(connection)
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") is None
+
+
+def collected_to(path: Path, repository: str, ends_at: datetime) -> None:
+    """Record one repository's cached pull-request coverage as reaching an instant."""
+    cache_pull_request_facts(
+        path,
+        SourceCoverage(
+            organization="hmcts",
+            repository=repository,
+            source=EvidenceSource.PULL_REQUEST,
+            query_hash="testhash",
+            starts_at=datetime(2026, 6, 1, tzinfo=UTC),
+            ends_at=ends_at,
+        ),
+        (),
+        complete=True,
+    )
+
+
+def test_the_collected_edge_is_not_dragged_back_by_a_repository_the_last_run_missed(tmp_path: Path) -> None:
+    """Answer with the edge most of the estate is at, not the edge every repository shares.
+
+    A repository the last run missed reports as unavailable at the window; it must not drag every
+    other repository's window back to whenever it was last collected. A repository's own edge is the
+    latest of its intervals, which `cath-service` has two of.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 7, 1, tzinfo=UTC))
+    for repository in ("cath-service", "pcs-frontend", "sscs-api"):
+        collected_to(path, repository, datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "missed-by-the-last-run", datetime(2026, 7, 1, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_collected_edge_is_not_pushed_forward_by_one_repository_collected_alone(tmp_path: Path) -> None:
+    """Ignore a repository that ran on its own and is covered further than the rest of the estate.
+
+    `evidence --refresh --repository x`, a collecting `trend`, and a `collect` that died part-way all
+    record coverage to today's midnight for the repositories they touched. Anchoring there would
+    leave every repository the run did not reach short of coverage by that day alone — the
+    whole-estate `unavailable` this anchor exists to stop.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    for repository in ("cath-service", "pcs-frontend", "sscs-api"):
+        collected_to(path, repository, datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "refreshed-on-its-own", datetime(2026, 9, 2, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_collected_edge_takes_the_later_of_two_equally_common_edges(tmp_path: Path) -> None:
+    """With no edge in the majority, answer as the unweighted latest edge always did.
+
+    Half the estate at one edge and half at another says nothing about which is the cohort and which
+    is the exception, so the tie leaves the answer where it was before the mode was counted.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "pcs-frontend", datetime(2026, 8, 1, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_reading_the_collected_edge_does_not_keep_an_interval_alive_against_the_prune(tmp_path: Path) -> None:
+    """Leave `accessed_at` where it was: reading the edge is not a use of any interval.
+
+    Stamping it here would make every superseded signature look freshly used and keep it in the cache
+    for ever, which is exactly what `prune_cache` exists to stop.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    coverage = SourceCoverage(
+        organization="hmcts",
+        repository="cath-service",
+        source=EvidenceSource.PULL_REQUEST,
+        query_hash="testhash",
+        starts_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    cache_pull_request_facts(path, coverage, (), complete=True)
+    with closing(connect(path)) as connection:
+        connection.execute(
+            "UPDATE source_coverage SET accessed_at = ?",
+            (datetime(2026, 1, 1, tzinfo=UTC).isoformat(),),
+        )
+        connection.commit()
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") is not None
+    assert prune_cache(path, datetime(2026, 6, 1, tzinfo=UTC)) == 1
+
+
+def test_the_collected_edge_ignores_another_organisation_source_or_signature(tmp_path: Path) -> None:
+    """Answer for exactly one organisation, source and query signature.
+
+    The signature matters most: `source_coverage` accumulates the signatures of older builds, whose
+    rows are not coverage this build can report from. One of them reaching further ahead would
+    otherwise anchor a report at an instant nothing current covers.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    asked = SourceCoverage(
+        organization="hmcts",
+        repository="cath-service",
+        source=EvidenceSource.PULL_REQUEST,
+        query_hash="current-signature",
+        starts_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    later = {"starts_at": datetime(2026, 8, 1, tzinfo=UTC), "ends_at": datetime(2026, 9, 1, tzinfo=UTC)}
+    cache_pull_request_facts(path, asked, (), complete=True)
+    cache_pull_request_facts(path, asked.model_copy(update={"organization": "moj", **later}), (), complete=True)
+    cache_pull_request_facts(path, asked.model_copy(update={"query_hash": "superseded", **later}), (), complete=True)
+    commits = asked.model_copy(update={"source": EvidenceSource.COMMIT, **later})
+    cache_direct_commit_facts(path, commits, (), complete=True)
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "current-signature") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+    # The commit row is not the pull-request answer above, and is the commit answer here.
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.COMMIT, "current-signature") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "not-a-signature-here") is None
+
+
+def test_reading_the_collected_edge_translates_sqlite_failures(tmp_path: Path) -> None:
+    """Expose a cache that cannot be read through the storage boundary."""
+    path = tmp_path / "metrics.sqlite3"
+    path.write_bytes(b"not a database")
+    with (
+        patch("metrics.storage.connect", side_effect=Error("unavailable")),
+        pytest.raises(StorageError, match="could not read collection cache"),
+    ):
+        prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash")
+
+
+def test_reading_the_collected_edge_translates_an_unparseable_instant(tmp_path: Path) -> None:
+    """Treat an edge this build cannot parse as a cache it cannot read.
+
+    Every caller degrades a `StorageError` to "nothing collected"; a bare `ValueError` escaping from
+    here would fail the service's warm-up and every offline command instead.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    with closing(connect(path)) as connection:
+        connection.execute("UPDATE source_coverage SET ends_at = ?", ("not-an-instant",))
+        connection.commit()
+
+    with pytest.raises(StorageError, match="could not read collection cache"):
+        prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash")
 
 
 def test_prune_cache_removes_unused_intervals_and_orphaned_facts(tmp_path: Path) -> None:

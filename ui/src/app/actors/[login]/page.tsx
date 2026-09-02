@@ -1,6 +1,7 @@
 import { cookies } from 'next/headers';
 import { notFound } from 'next/navigation';
 import { ActorRepositoriesTable } from '@/components/ActorRepositoriesTable';
+import { CollectionNotice } from '@/components/CollectionNotice';
 import { EmptyState } from '@/components/EmptyState';
 import { EntityHeader } from '@/components/EntityHeader';
 import { MetricsGrid } from '@/components/MetricsGrid';
@@ -44,6 +45,8 @@ export default async function ActorPage({
 
   return (
     <div className="space-y-8">
+      <CollectionNotice windows={windows} />
+
       <EntityHeader
         kind="actor"
         name={actor.actor_login}

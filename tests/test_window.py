@@ -4,7 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metrics.window import baseline_window, midnight, parse_instant, period_windows, resolve_window
+from metrics.window import (
+    baseline_window,
+    collected_anchor,
+    collection_is_stale,
+    midnight,
+    parse_instant,
+    period_windows,
+    resolve_window,
+)
 
 
 def reference() -> datetime:
@@ -128,6 +136,45 @@ def test_resolve_window_rejects_an_unusable_request(
         resolve_window(starts_at, ends_at, days, 90, reference())
 
 
+def test_collected_anchor_falls_back_to_the_reference_when_nothing_is_collected() -> None:
+    """Resolve a window from a cold cache rather than refusing to report at all."""
+    assert collected_anchor(None, reference()) == datetime(2026, 8, 8, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("collected_through", "expected"),
+    [
+        (datetime(2026, 8, 8, 6, 0, tzinfo=UTC), datetime(2026, 8, 8, tzinfo=UTC)),
+        (datetime(2026, 8, 7, 9, 15, tzinfo=UTC), datetime(2026, 8, 7, tzinfo=UTC)),
+        (datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 8, 1, tzinfo=UTC)),
+        (datetime(2026, 8, 12, tzinfo=UTC), datetime(2026, 8, 8, tzinfo=UTC)),
+    ],
+)
+def test_collected_anchor_floors_the_collected_edge(
+    collected_through: datetime,
+    expected: datetime,
+) -> None:
+    """Anchor at the collected edge's own midnight, never later than today's."""
+    assert collected_anchor(collected_through, reference()) == expected
+
+
+@pytest.mark.parametrize(
+    ("collected_through", "expected"),
+    [
+        (None, True),
+        (datetime(2026, 7, 31, 14, 58, 46, tzinfo=UTC), False),
+        (datetime(2026, 7, 31, 14, 58, 45, tzinfo=UTC), True),
+        (datetime(2026, 8, 7, tzinfo=UTC), False),
+    ],
+)
+def test_collection_is_stale_measures_the_gap_against_the_cadence(
+    collected_through: datetime | None,
+    expected: bool,  # noqa: FBT001 - parametrised expectation
+) -> None:
+    """Call a collection stale only once it is further behind than the cadence allows."""
+    assert collection_is_stale(collected_through, reference(), timedelta(days=8)) is expected
+
+
 def enablement() -> datetime:
     """Return an enablement instant sitting a whole number of periods before the reference."""
     return datetime(2026, 5, 3, tzinfo=UTC)
@@ -176,7 +223,7 @@ def test_period_windows_keep_the_enablement_time_of_day() -> None:
 
 
 def test_period_windows_cap_the_series_at_the_requested_count() -> None:
-    """Report the periods nearest the anchor when a shorter series is asked for."""
+    """Report the periods nearest enablement when a shorter series is asked for."""
     windows = period_windows(enablement(), timedelta(days=28), 2, reference())
 
     assert tuple(window.starts_at for window in windows) == (

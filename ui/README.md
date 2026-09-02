@@ -14,6 +14,10 @@ API_URL=http://localhost:8000 npm --prefix ui run dev
 The full loop — collecting, then serving, then this — is in the [root README](../README.md#dashboard). Without a
 service to read, every page is an error: this app holds no data of its own and no fixtures.
 
+`docker compose up --build` from the repository root runs this app and the service together; `next.config.mjs` sets
+`output: 'standalone'` for that image alone, so `ui/Dockerfile` can copy a server and its dependencies rather than the
+whole `node_modules`.
+
 `API_URL` defaults to `http://localhost:8000` and is read per request rather than baked in at build time, so a
 deployment can be pointed elsewhere without rebuilding. Every fetch happens on the Next.js server, which is why the
 service publishes no CORS headers, and every one is `cache: 'no-store'`: the service already holds one built report

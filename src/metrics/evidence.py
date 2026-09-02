@@ -1,5 +1,6 @@
 """Project cached behaviour facts into auditable evidence."""
 
+import logging
 from collections import Counter
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
@@ -7,7 +8,12 @@ from datetime import datetime, timedelta
 
 from metrics.analysis import Merge, excluded_authors, in_cohort, is_human_account
 from metrics.assessment import ReadinessPolicy, readiness_policy
-from metrics.behaviour import collect_open_pull_request_state, requested_coverage, synchronize_merges
+from metrics.behaviour import (
+    collect_open_pull_request_state,
+    requested_coverage,
+    source_signature,
+    synchronize_merges,
+)
 from metrics.behaviour_metrics import behaviour_metrics
 from metrics.behaviour_metrics.base import BehaviourMetric
 from metrics.config import Configuration, configured_repositories, repository_owners
@@ -46,6 +52,7 @@ from metrics.storage import (
     load_cached_direct_commit_facts,
     load_cached_pull_request_facts,
     load_repository_state,
+    prevailing_cached_coverage,
 )
 
 
@@ -558,6 +565,40 @@ def open_pull_request_report(
     )
 
 
+def collected_through(configuration: Configuration) -> datetime | None:
+    """Return the instant the caches can report a whole window up to for most of the estate.
+
+    The one place the two independently cached sources are reduced to a single instant, so that
+    everything anchoring a window offline — the service, `metrics evidence` without `--refresh`, and
+    `metrics trend --offline` — anchors at the same place.
+
+    THE EARLIER OF THE TWO EDGES: a window needs merged pull requests and direct commits both, so an
+    instant only one source reaches is not an instant a window can end at. `None` when either source
+    has no coverage at all under the current signature, which is what a cold cache looks like.
+
+    An unreadable cache reports as nothing collected rather than raising: the service is offline
+    always, and a page saying nothing has been collected is a better answer than a failed request.
+    """
+
+    def edge(source: EvidenceSource) -> datetime | None:
+        return prevailing_cached_coverage(
+            configuration.database,
+            configuration.organization,
+            source,
+            source_signature(source),
+        )
+
+    try:
+        pull_requests = edge(EvidenceSource.PULL_REQUEST)
+        commits = edge(EvidenceSource.COMMIT)
+    except StorageError as exception:
+        logging.warning("Could not read the collection cache's coverage: %s", exception)
+        return None
+    if pull_requests is None or commits is None:
+        return None
+    return min(pull_requests, commits)
+
+
 def uncovered_interval(missing: SourceCoverage) -> str:
     """Explain which source the cache could not answer for, and over what interval."""
     return (
@@ -580,7 +621,10 @@ def cached_repository_evidence(
         missing = tuple(
             interval
             for requested in coverage.values()
-            for interval in find_missing_cached_coverage(configuration.database, requested)
+            # `record_use=False`: reporting from the cache is not what keeps an interval alive — the
+            # collection that records it is — and a write here would move the cache file's stamp,
+            # which is what the service decides a held bundle is still current against.
+            for interval in find_missing_cached_coverage(configuration.database, requested, record_use=False)
         )
         if missing:
             return EvidenceUnavailable(repository=repository, detail=uncovered_interval(missing[0]))

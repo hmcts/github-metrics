@@ -1100,6 +1100,16 @@ settles it and the org-level design question it poses.
 - Coverage is keyed on a hash of the GraphQL documents (whitespace-normalised). Widen a query and
   the hash changes, so stale coverage no longer matches and is refetched automatically.
 - `accessed_at` supports `metrics prune --days N`. Cache size is not a real concern; keep it simple.
+- ONLY A COLLECTING RUN STAMPS `accessed_at` (decided 2026-09-02). `find_missing_cached_coverage`
+  takes `record_use`, true from `fill_cached_source` and false from `cached_repository_evidence`.
+  Reporting from the cache is not what keeps an interval alive — the collection that records it is,
+  and a collection stamps every interval it writes — while a report that stamped it would write to
+  the cache file on every read. The service decides whether a held bundle still describes the caches
+  by their mtime and size, so that write moved the stamp its own build had just been compared
+  against: every request rebuilt the whole cohort's report, and with the collected anchor in place
+  that rebuild is a full walk of every repository's facts rather than a short-circuit to
+  `unavailable`. `prevailing_cached_coverage` was written this way from the start, for the same
+  reason.
 - Never let "what is already cached" decide what gets built. Decide the signal, then fetch what it
   needs.
 - Typed Pydantic models remain the ANALYSIS contract, parsed from stored JSON. Strict typing where
@@ -1124,6 +1134,62 @@ The mutable interval is cached without recording source coverage, so a cached re
 with no `--refresh`, `trend --offline` — refuses any window overlapping it. That is deliberate
 (decided 2026-08-11): reporting from the caches means "cached, settled evidence or nothing".
 Document the behaviour; do not soften it.
+
+### Offline reporting anchors at the last collection's edge (decided 2026-09-02)
+
+THE EDGE IS WHERE THE CACHES END, NOT WHERE TODAY DOES. Every reporting window used to end at
+`midnight(now)`, and the ruling above is what made that unservable: a collection records coverage up
+to its own stable edge, so the morning after a run every repository is short of coverage by the
+right-hand edge alone and the entire estate reports `unavailable` at every span. Measured against the
+working cache on 2026-09-02: 1697 repositories covered to 2026-09-01, zero reportable at any span.
+Anchored at the collected edge instead, 1593 of them report at 1w, 4w, 8w and 12w. The offline
+paths — the HTTP service, `metrics evidence` without `--refresh`, `metrics trend --offline` — now end
+their windows at `min(midnight(now), midnight(collected_through))`. The clamp is not decoration: a
+window recorded by a `--to` in the future must not anchor a report ahead of today.
+
+THE EDGE MOST REPOSITORIES ARE AT. The anchor is the modal per-repository edge — `MAX(ends_at)` per
+repository, then the commonest of those, the later on a tie — which is the edge the last WHOLE run
+left behind. Both extremes were considered and rejected, because each hands the whole estate's window
+to a single repository:
+
+- The edge EVERY repository shares hands it to the worst straggler. One repository missed for a month
+  would drag the window back a month, and a thousand repositories would report a stale window to hide
+  one gap.
+- The GREATEST edge — what this was first built as — hands it to whichever repository ran last on its
+  own. `evidence --refresh --repository x`, a collecting `metrics trend`, and a `collect` that dies
+  part-way all record coverage to TODAY'S midnight for the repositories they touch, so any one of
+  them moves the estate's anchor a day forward and leaves all 1697 others short of coverage by that
+  day alone. One single-repository refresh would blank the dashboard and fail `metrics evidence`
+  outright until the next full collection — the failure this whole ruling exists to stop.
+
+The mode is moved by neither a straggler nor a MINORITY of repositories running ahead, and preserves
+the measured behaviour above: 1697 repositories at 2026-09-01 against 103 at 2026-08-25 still anchors
+at 2026-09-01. What it does not survive is a `collect` that dies past HALFWAY: 1000 repositories
+recorded at a new edge against 850 at the old one carries the mode forward, and those 850 then report
+`unavailable` at every span until the next run reaches them. That is the residual case, accepted
+knowingly — the mode narrows the exposure from "any one repository blanks the estate" to "a run that
+died past halfway blanks the part it never reached", and inferring completeness from a row count
+cannot do better. A run's own completion marker could, and is where to look if this ever bites.
+
+A repository BEHIND the anchor stays `unavailable` there, which is the existing meaning of that field
+and the honest answer. One AHEAD of it still reports: `record_source_coverage` coalesces the newer
+interval into the interval already stored, so its coverage spans the anchor and
+`find_missing_cached_coverage` finds no gap. The edge is read for the CURRENT query
+signature only — the working cache still holds seven superseded pull-request signatures and two
+commit ones, and a dead signature reaching further ahead would set an anchor nothing current can
+report from. Both sources are then reduced to ONE instant by taking the EARLIER of the pull-request
+and commit edges, since a window needs both and an instant only one of them reaches is not covered.
+
+`collect` AND `--refresh` STILL ANCHOR AT NOW. They are the runs that reach GitHub, and an anchor
+behind now would ask them to collect less than they can — the anchor would then ratchet backwards,
+each run collecting to the edge the run before it set.
+
+THE ANCHOR IS SAID OUT LOUD. A window that silently means "as at the last collection" is read as "as
+at today", so the collected instant is published on `/windows` (which every page already fetches for
+the span selector) and on the overview header, and the CLI logs it once per run at INFO whenever the
+anchor is behind today's midnight. `lookback.stale_collection_days` (default 8 — one missed WEEKLY
+run, not one missed day) is the threshold above which the service marks the collection stale and
+every page shows a warning bar, and the CLI logs a WARNING naming the last collection.
 
 ## Two-layer evidence model
 

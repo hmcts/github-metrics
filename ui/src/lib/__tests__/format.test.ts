@@ -92,6 +92,15 @@ describe('percentageOf', () => {
   it('prints a measured zero as a zero', () => {
     expect(percentageOf(0, 20)).toBe('0%');
   });
+
+  it('breaks an exact tie the way Python does, so the page and the report agree', () => {
+    // 78 of 96 is exactly 81.25: `round(value, 1)` gives 81.2 and half-up gives 81.3, which would
+    // put two figures for one observation on the same page. 3 of 16 is exactly 18.75, the tie whose
+    // even neighbour is upwards, and both ways of rounding agree on 18.8.
+    expect(percentageOf(78, 96)).toBe('81.2%');
+    expect(rate(observedRate(78, 96))).toBe('81.2%');
+    expect(percentageOf(3, 16)).toBe('18.8%');
+  });
 });
 
 describe('isRate', () => {

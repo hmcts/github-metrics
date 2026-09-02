@@ -18,6 +18,7 @@ from metrics.domain import (
     AlertFamily,
     AlertObservation,
     DirectCommitFact,
+    EvidenceSource,
     PullRequestFact,
     ReportingWindow,
     RepositoryInventory,
@@ -269,27 +270,123 @@ def replace_direct_commit_facts(
         record_source_coverage(connection, coverage)
 
 
-def find_missing_cached_coverage(path: Path, requested: SourceCoverage) -> tuple[SourceCoverage, ...]:
-    """Return missing source coverage from the configured SQLite cache."""
+def find_missing_cached_coverage(
+    path: Path,
+    requested: SourceCoverage,
+    *,
+    record_use: bool,
+) -> tuple[SourceCoverage, ...]:
+    """Return missing source coverage from the configured SQLite cache.
+
+    `record_use` STAMPS `accessed_at`, AND ONLY A COLLECTING RUN MAY. The stamp is what keeps an
+    interval the current queries still ask for out of `prune_cache`'s reach, and a collection sets it
+    on every interval it records anyway — so the collecting path asks for it and the reporting path
+    does not. A report that stamped it would write to the cache file on every read, moving the
+    modification time the service compares a built bundle against, and every request would rebuild
+    the whole cohort's report because its own last build had touched the caches it was built from.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(connect(path)) as connection, connection:
             prepare(connection)
-            connection.execute(
-                """
-                UPDATE source_coverage SET accessed_at = ?
-                WHERE organization = ? AND repository = ? AND source = ? AND query_hash = ?
-                """,
-                (
-                    datetime.now(UTC).isoformat(),
-                    requested.organization,
-                    requested.repository,
-                    requested.source.value,
-                    requested.query_hash,
-                ),
-            )
+            if record_use:
+                connection.execute(
+                    """
+                    UPDATE source_coverage SET accessed_at = ?
+                    WHERE organization = ? AND repository = ? AND source = ? AND query_hash = ?
+                    """,
+                    (
+                        datetime.now(UTC).isoformat(),
+                        requested.organization,
+                        requested.repository,
+                        requested.source.value,
+                        requested.query_hash,
+                    ),
+                )
             return find_missing_coverage(connection, requested)
     except (Error, OSError) as exception:
+        message = f"could not read collection cache: {exception}"
+        raise StorageError(message) from exception
+
+
+def prevailing_cached_coverage(
+    path: Path,
+    organization: str,
+    source: EvidenceSource,
+    query_hash: str,
+) -> datetime | None:
+    """Return the instant most of one organisation's cached coverage reaches, or `None` for none.
+
+    The anchor an offline report ends its windows at. `fill_cached_source` records coverage up to the
+    stable edge of the run that wrote it, so a repository's own edge is the edge of the last run that
+    reached it, and `None` here means nothing has been collected under this signature at all.
+
+    THE EDGE MOST REPOSITORIES ARE AT, NOT THE GREATEST ONE ANY OF THEM REACHED, and not the edge
+    every one of them shares. Both extremes blank the estate from one repository:
+      - The edge every repository shares hands the window to the worst straggler — one repository
+        missed for a month would drag a thousand others' window back a month to hide one gap.
+      - The greatest edge hands it to whichever repository ran last on its own. `evidence --refresh
+        --repository x`, a collecting `metrics trend`, or a `collect` that died part-way records
+        coverage to TODAY'S midnight for the repositories it touched, and an anchor there leaves
+        every repository the run did not reach short of coverage by that day alone — the whole-estate
+        `unavailable` this anchor exists to stop.
+    The modal edge is the one the last WHOLE run left behind, so neither a straggler nor a MINORITY
+    of repositories collected ahead of the rest moves it. A `collect` that dies past HALFWAY does
+    move it, and the repositories it never reached then report as unavailable — the residual case,
+    accepted knowingly, because a row count cannot tell a finished run from a majority of one. A
+    repository BEHIND the edge reports as unavailable at the window, which is the existing meaning of
+    that field and the honest answer; one AHEAD of it still reports, because
+    `record_source_coverage` coalesces its newer interval into the stored one, so its coverage spans
+    the anchor and no gap is found there.
+
+    The count is over whatever rows the cache holds, INCLUDING repositories no longer configured,
+    whose coverage survives until `prune_cache` removes it. A de-configured cohort larger than the
+    configured one would therefore win the mode with its older edge.
+
+    TIES GO TO THE LATER EDGE: with no edge in the majority there is nothing to tell a cohort moving
+    forward from one lagging behind, so the answer stays what it was before the mode was counted.
+
+    `query_hash` IS PART OF THE FILTER because `source_coverage` accumulates superseded signatures —
+    the working cache holds seven pull-request signatures and two commit ones from older builds.
+    Their rows are not coverage this build can report from, and one of them reaching further ahead
+    would set an anchor nothing current covers.
+
+    `accessed_at` is left alone: reading the edge is not a use of any interval, and stamping it here
+    would keep dead signatures alive against `prune_cache` for ever. A cache that is not there yet is
+    not created either, for a sharper reason: the service stamps both cache files to decide whether a
+    built report still describes them, and a read that brought one into being would move the stamp it
+    was just compared against and rebuild the whole cohort's report on the next request.
+    """
+    if not path.exists():
+        return None
+    try:
+        with closing(connect(path)) as connection, connection:
+            prepare(connection)
+            # Comparing stored text rather than parsed instants: `record_source_coverage` normalises
+            # every instant to a UTC `isoformat()`, so the text is fixed-width through the seconds
+            # and both MAX and the ORDER BY sort chronologically.
+            row = connection.execute(
+                """
+                SELECT edge
+                FROM (
+                    SELECT MAX(ends_at) AS edge
+                    FROM source_coverage
+                    WHERE organization = ? AND source = ? AND query_hash = ?
+                    GROUP BY repository
+                )
+                GROUP BY edge
+                ORDER BY COUNT(*) DESC, edge DESC
+                LIMIT 1
+                """,
+                (organization, source.value, query_hash),
+            ).fetchone()
+            # Grouped, so no matching row is no row at all rather than one row holding NULL. The
+            # parse sits inside the guard with the query: a row this build cannot READ and a row it
+            # cannot PARSE are the same failure to every caller, each of which degrades a
+            # `StorageError` to "nothing collected", while a bare `ValueError` escaping from here
+            # would take down the service's warm-up and every offline command with it.
+            return None if row is None else datetime.fromisoformat(row[0])
+    except (Error, OSError, ValueError) as exception:
         message = f"could not read collection cache: {exception}"
         raise StorageError(message) from exception
 

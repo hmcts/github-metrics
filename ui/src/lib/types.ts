@@ -363,11 +363,21 @@ export interface ServiceHealth {
   organization: string;
 }
 
+/**
+ * The spans on offer, and the collection every one of them is anchored to.
+ *
+ * The collection state rides on this route because every page already fetches it for the span
+ * selector, and the notice that the figures sit at an old collection belongs on every page rather
+ * than on the overview alone. `collected_through` is ABSENT when nothing has been collected under
+ * the current query signature — the one stale case with no instant to name.
+ */
 export interface WindowOptions {
   options: number[];
   default: number;
   /** The most periods one trend request may ask for, which a series must be cut to. */
   trend_periods: number;
+  collected_through?: string;
+  collection_stale: boolean;
 }
 
 export interface OverviewSummary {
@@ -376,6 +386,8 @@ export interface OverviewSummary {
   starts_at: string;
   ends_at: string;
   built_at: string;
+  /** The instant the caches cover to, which the window is anchored at; absent when nothing was collected. */
+  collected_through?: string;
   repositories: number;
   unavailable: number;
   teams: number;

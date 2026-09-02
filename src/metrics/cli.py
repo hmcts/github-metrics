@@ -41,6 +41,7 @@ from metrics.evidence import (
     StoredReports,
     cached_repository_evidence,
     collected_repository_evidence,
+    collected_through,
     metric_summaries,
     open_pull_request_report,
     practice_report,
@@ -70,7 +71,7 @@ from metrics.storage import (
     record_sonar_mapping,
 )
 from metrics.trend import SeriesRequest, series_status, trend_report
-from metrics.window import parse_instant, resolve_window
+from metrics.window import collected_anchor, collection_is_stale, midnight, parse_instant, resolve_window
 
 INCOMPLETE_RUN = 3
 """Exit status for a run that produced some of the evidence it was asked for, but not all of it.
@@ -267,6 +268,45 @@ def requested_window(configuration: Configuration, options: Namespace, reference
     return window
 
 
+def offline_anchor(configuration: Configuration, reference: datetime) -> datetime:
+    """Resolve the midnight a run reporting from the caches ends its window at, and say where it is.
+
+    THE LAST COLLECTION'S EDGE RATHER THAN TODAY'S MIDNIGHT: a collection records coverage only up to
+    the stable edge of the run that wrote it, so the day after one, every repository is short of
+    coverage by the right-hand edge alone and a window ending at today's midnight reports the whole
+    cohort as unavailable. Ending where the caches end means the same command run the day after a
+    collection prints the same figures it printed the day the collection landed.
+
+    `collect` and `evidence --refresh` do not come through here: they are the runs that reach GitHub,
+    and an anchor behind now would ask them to collect less than they can.
+
+    The staleness warning is logged here, once per run and whatever the run then does with the
+    anchor: an uncollected estate is worth saying out loud even on a run that names its own window.
+    Whether the anchor actually became the window's end is `report_anchored_at`'s to say.
+    """
+    collected = collected_through(configuration)
+    stale_after = timedelta(days=configuration.lookback.stale_collection_days)
+    if collection_is_stale(collected, reference, stale_after):
+        logging.warning(
+            "The last collection %s, further behind than the configured %s-day cadence: run metrics collect",
+            "has not happened" if collected is None else f"reaches {collected:%Y-%m-%dT%H:%MZ}",
+            configuration.lookback.stale_collection_days,
+        )
+    return collected_anchor(collected, reference)
+
+
+def report_anchored_at(anchor: datetime, reference: datetime) -> None:
+    """Say a report ends where the caches end rather than at today's midnight.
+
+    Called only where the anchor IS the end of what was reported: `--to` names its own end, and
+    saying the caches decided it would be a plain untruth. Said at all because the window a report
+    carries is otherwise the only clue that its figures are as at a collection rather than as at
+    today — and on a run redirected to a file, not even that is on the terminal.
+    """
+    if anchor < midnight(reference):
+        logging.info("Reporting to %s, the midnight the caches cover to, rather than to today's", f"{anchor:%Y-%m-%d}")
+
+
 def unusable_request(configured: tuple[str, ...], options: Namespace) -> str | None:
     """Return why the requested evidence options cannot be satisfied."""
     if options.repository is not None and options.repository not in configured:
@@ -430,17 +470,29 @@ def emit_evidence(configuration: Configuration, options: Namespace) -> int:
     numbers, whether the run refreshed or not: the two modes fail the same way, so a repository
     GitHub refused during a refresh does not also make every cached repository beside it
     unreportable. Only a run where NOTHING could be reported refuses outright.
+
+    A relative window ends where the caches end unless the run refreshed — see `offline_anchor` —
+    so a repository reported yesterday is still reported today rather than becoming unavailable
+    because the hours since the last collection were never collected.
     """
     unusable = unusable_request(configured_repositories(configuration), options)
     if unusable is not None:
         logging.error(unusable)
         return 1
     reference = datetime.now(UTC)
+    # The stamp on a fresh observation is always now; only the window's anchor moves. A refresh can
+    # go and fetch today, so it asks for today; a run reading the caches alone asks for what they
+    # cover, which is where the last collection stopped.
+    anchor = reference if options.refresh else offline_anchor(configuration, reference)
     try:
-        window = requested_window(configuration, options, reference)
+        window = requested_window(configuration, options, anchor)
     except ValueError as exception:
         logging.error("Unusable reporting window: %s", exception)
         return 1
+    # Only where the anchor is what the window ended at: `--to`, and `--from` with `--days`, name
+    # their own end, and `resolve_window` honours it verbatim.
+    if window.ends_at == anchor:
+        report_anchored_at(anchor, reference)
 
     # One session and one client for both phases of a refresh, so the second does not discard the
     # rate-limit budget the first learned. Neither phase contacts GitHub without `--refresh`.
@@ -506,8 +558,18 @@ def emit_trend(configuration: Configuration, options: Namespace) -> int:
     Collects what the cache lacks exactly as `evidence` does, so a cold cache costs one fetch per
     uncovered period and a warm one costs nothing; `--offline` refuses any period the cache does not
     fully cover rather than reporting a short one.
+
+    An offline series is cut against the collected anchor rather than against now, so its trailing
+    whole period is one the caches cover rather than one that would be refused the moment it was
+    read. A collecting run is cut against now, because it can fetch whatever the cut asks for.
     """
     reference = datetime.now(UTC)
+    anchor = reference
+    if options.offline:
+        anchor = offline_anchor(configuration, reference)
+        # Unconditional, unlike `emit_evidence`: a series has no `--to`, so the anchor is always
+        # where its last whole period was cut.
+        report_anchored_at(anchor, reference)
     # ExitStack rather than `with Session()`, as `emit_evidence` does: an offline run must construct
     # no session at all, so the trend of a cached series never needs credentials.
     with ExitStack() as stack:
@@ -520,7 +582,7 @@ def emit_trend(configuration: Configuration, options: Namespace) -> int:
             request = SeriesRequest(
                 period_days=options.period_days,
                 periods=options.periods,
-                reference=reference,
+                reference=anchor,
                 client=client,
             )
         except ValueError as exception:

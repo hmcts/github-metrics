@@ -1,15 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import {
-  FALLBACK_OPTIONS,
-  FALLBACK_WEEKS,
-  WEEKS_COOKIE,
-  parseWeeks,
-  resolveWeeks,
-  weeksCookie,
-  withWeeks,
-} from '@/lib/weeks';
+import { WEEKS_COOKIE, parseWeeks, resolveWeeks, weeksCookie, withWeeks } from '@/lib/weeks';
 
-const OPTIONS = FALLBACK_OPTIONS;
+/** The spans a service serving the default configuration offers, as `GET /windows` reports them. */
+const OPTIONS: readonly number[] = [1, 4, 8, 12, 26];
+const FALLBACK_WEEKS = 4;
 
 describe('parseWeeks', () => {
   it('accepts a span the service offers', () => {

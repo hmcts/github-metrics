@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from requests import ConnectionError as RequestsConnectionError
 from requests import Response
 
+from metrics.behaviour import source_signature
 from metrics.cli import INCOMPLETE_RUN, log_call_summary, main
 from metrics.config import load_configuration
 from metrics.credentials import CredentialsError
@@ -25,6 +26,7 @@ from metrics.domain import (
     CohortSummary,
     CollectionStatus,
     DirectCommitFact,
+    EvidenceSource,
     EvidenceUnavailable,
     MaintenanceEvidence,
     MergeGateEvidence,
@@ -44,17 +46,21 @@ from metrics.domain import (
     SecurityAlertEvidence,
     SonarProjectMapping,
     SonarResolution,
+    SourceCoverage,
     StoredSonarMapping,
     WindowProvenance,
 )
 from metrics.evidence import RepositoryEvidence
 from metrics.storage import (
     StorageError,
+    cache_direct_commit_facts,
+    cache_pull_request_facts,
     load_sonar_mapping,
     observation_database,
     record_repository_state,
     record_sonar_mapping,
 )
+from metrics.window import midnight
 
 
 @pytest.fixture
@@ -75,6 +81,34 @@ teams:
         encoding="utf-8",
     )
     return path
+
+
+def record_collection(configuration_path: Path, edge: datetime, *repositories: str) -> None:
+    """Leave behind the coverage a collection reaching one instant would have recorded.
+
+    What `collected_through` reads, and therefore what an offline run anchors its window at. The
+    interval reaches far enough back to cover any window these tests ask for, and carries no fact:
+    what is under test is where the window ends, not what is in it.
+    """
+    database = configuration_path.parent / "metrics.sqlite3"
+    for repository in repositories:
+        for source, write in (
+            (EvidenceSource.PULL_REQUEST, cache_pull_request_facts),
+            (EvidenceSource.COMMIT, cache_direct_commit_facts),
+        ):
+            write(
+                database,
+                SourceCoverage(
+                    organization="hmcts",
+                    repository=repository,
+                    source=source,
+                    query_hash=source_signature(source),
+                    starts_at=edge - timedelta(days=400),
+                    ends_at=edge,
+                ),
+                (),
+                complete=True,
+            )
 
 
 def open_pull_request_payload(
@@ -693,6 +727,31 @@ def test_collect_measures_open_pull_requests_against_the_run_s_window_and_instan
     stale_cutoff = datetime.fromisoformat(str(queries["staleOpenQuery"]).split("updated:<")[1])
     assert stale_cutoff > datetime.fromisoformat(output["ends_at"])
     assert stale_cutoff <= datetime.now(UTC) - timedelta(days=14)
+
+
+def test_collect_still_collects_up_to_today(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Collect to today's midnight whatever the caches already reach.
+
+    The reporting commands anchor at the last collection's edge; `collect` is what MOVES that edge,
+    and anchoring it there too would freeze the caches at whatever they reached first.
+    """
+    record_collection(configuration_path, midnight(datetime.now(UTC)) - timedelta(days=5), "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert json.loads(capsys.readouterr().out)["ends_at"] == f"{midnight(datetime.now(UTC)):%Y-%m-%dT00:00:00Z}"
 
 
 def test_collect_exits_incomplete_when_one_repository_of_three_could_not_be_read(
@@ -2388,14 +2447,24 @@ def test_evidence_omits_a_failed_repository_from_the_numbers_rather_than_zeroing
 
 
 def test_evidence_metric_drill_down_never_fetches_open_pull_requests(configuration_path: Path) -> None:
-    """Skip the extra GitHub round trip entirely for a raw metric drill-down."""
+    """Skip the extra GitHub round trip entirely for a raw metric drill-down.
+
+    Run WITH `--refresh` and a credential, so there is a client to make the call with: a run without
+    one skips the fetch because it has nothing to fetch through, which would prove nothing about the
+    drill-down. The one bundled call per repository is a real charge against the rate-limit budget,
+    for counts a metric drill-down does not print.
+    """
     with (
         patch(
             "sys.argv",
-            ["metrics", "evidence", "--config", str(configuration_path), "--metric", "approval-coverage"],
+            ["metrics", "evidence", "--config", str(configuration_path), "--refresh", "--metric", "approval-coverage"],
         ),
-        patch.dict("os.environ", {}, clear=True),
-        cached_evidence(),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session"),
+        patch(
+            "metrics.cli.collected_repository_evidence",
+            side_effect=lambda *arguments: evidence_for(arguments[3]),
+        ),
         patch("metrics.cli.gather_open_pull_requests") as gather,
     ):
         assert main() == 0
@@ -2875,6 +2944,162 @@ def test_evidence_narrows_the_reporting_window(
     assert ends_at - starts_at == timedelta(days=7)
     assert ends_at.hour == 0
     assert ends_at.minute == 0
+
+
+def test_evidence_ends_its_window_where_the_caches_end(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Report to the last collection's edge, so the day after a run still reports the repository.
+
+    Read through the real cache rather than a patched loader, because what the anchor buys is the
+    coverage check passing: a window ending at today's midnight asks for the hours since the last
+    collection, which nothing has recorded, and every repository comes back unavailable.
+    """
+    edge = midnight(datetime.now(UTC)) - timedelta(days=1)
+    record_collection(configuration_path, edge, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--days", "7"]),
+        patch.dict("os.environ", {}, clear=True),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert [item["repository"] for item in report["repositories"]] == ["nfdiv-case-api"]
+    assert report["unavailable"] == []
+    assert report["repositories"][0]["starts_at"] == f"{edge - timedelta(days=7):%Y-%m-%dT00:00:00Z}"
+    assert report["repositories"][0]["ends_at"] == f"{edge:%Y-%m-%dT00:00:00Z}"
+
+
+def test_evidence_refresh_still_ends_its_window_at_today(
+    configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ask GitHub for everything up to today, whatever the caches happen to reach.
+
+    A refresh is one of the two runs that can collect what is missing, so anchoring it behind now
+    would ask it to fetch less than it can and leave the newest days permanently uncollected.
+    """
+    record_collection(configuration_path, midnight(datetime.now(UTC)) - timedelta(days=5), "nfdiv-case-api")
+
+    with (
+        patch(
+            "sys.argv",
+            ["metrics", "evidence", "--config", str(configuration_path), "--refresh", "--days", "7"],
+        ),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session"),
+        patch("metrics.cli.collected_repository_evidence", side_effect=lambda *arguments: evidence_for(arguments[3])),
+        patch("metrics.cli.open_pull_request_report", return_value=refused_open_pull_requests()),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["repositories"][0]["ends_at"] == f"{midnight(datetime.now(UTC)):%Y-%m-%dT00:00:00Z}"
+
+
+def test_evidence_says_which_collection_its_figures_are_as_at(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name the collection a report is anchored at, and warn when it is older than the cadence.
+
+    The window inside the report is otherwise the only sign that the figures are as at a collection
+    rather than as at today, and a run redirected to a file shows none of it on the terminal.
+    """
+    caplog.set_level(logging.INFO)
+    edge = midnight(datetime.now(UTC)) - timedelta(days=30)
+    record_collection(configuration_path, edge, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    assert f"The last collection reaches {edge:%Y-%m-%dT00:00Z}" in caplog.text
+    assert "further behind than the configured 8-day cadence" in caplog.text
+    assert f"Reporting to {edge:%Y-%m-%d}, the midnight the caches cover to" in caplog.text
+
+
+def test_a_window_given_an_explicit_end_is_not_reported_as_the_collections(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Say the caches decided the end only where they did: `--to` is honoured verbatim.
+
+    The staleness warning still fires — an uncollected estate is worth saying whatever window was
+    asked for — but the line naming the collected midnight would be attributing the reader's own
+    `--to` to the collection.
+    """
+    caplog.set_level(logging.INFO)
+    record_collection(configuration_path, midnight(datetime.now(UTC)) - timedelta(days=30), "nfdiv-case-api")
+
+    with (
+        patch(
+            "sys.argv",
+            ["metrics", "evidence", "--config", str(configuration_path), "--to", "2026-06-01", "--days", "7"],
+        ),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    assert json.loads(capsys.readouterr().out)["repositories"][0]["ends_at"] == "2026-06-01T00:00:00Z"
+    assert "further behind than the configured 8-day cadence" in caplog.text
+    assert "the midnight the caches cover to" not in caplog.text
+
+
+def test_the_configured_cadence_is_what_the_stale_collection_warning_measures(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn against `lookback.stale_collection_days`, not against the eight days it defaults to.
+
+    A three-day-old collection is current for a weekly estate and stale for a daily one. Every other
+    test leaves this key at its default, so a hardcoded eight would pass them all.
+    """
+    caplog.set_level(logging.INFO)
+    record_collection(configuration_path, midnight(datetime.now(UTC)) - timedelta(days=3), "nfdiv-case-api")
+    daily = configuration_path.parent / "daily.yaml"
+    daily.write_text(f"{configuration_path.read_text()}lookback:\n  stale_collection_days: 2\n")
+
+    for path, warned in ((configuration_path, False), (daily, True)):
+        caplog.clear()
+        with (
+            patch("sys.argv", ["metrics", "evidence", "--config", str(path)]),
+            patch.dict("os.environ", {}, clear=True),
+            cached_evidence(),
+        ):
+            assert main() == 0
+        assert ("The last collection reaches" in caplog.text) is warned
+
+
+def test_evidence_reports_from_today_and_says_nothing_was_collected(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fall back to today's midnight for a cache nobody has collected into, and say why.
+
+    Nothing collected is stale too — there is no run to be current — and the anchor has not moved,
+    so the line naming the collected midnight would be saying only that today is today.
+    """
+    caplog.set_level(logging.INFO)
+    with (
+        patch("sys.argv", ["metrics", "evidence", "--config", str(configuration_path), "--days", "7"]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_evidence(),
+    ):
+        assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["repositories"][0]["ends_at"] == f"{midnight(datetime.now(UTC)):%Y-%m-%dT00:00:00Z}"
+    assert "The last collection has not happened" in caplog.text
+    assert "the midnight the caches cover to" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -3362,6 +3587,34 @@ def test_trend_collects_the_periods_the_cache_lacks(
 
     assert collect.call_count == 3
     assert len(json.loads(capsys.readouterr().out)["repositories"][0]["periods"]) == 2
+
+
+def test_trend_offline_cuts_its_periods_against_the_collection(
+    trend_configuration_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cut the whole periods the caches cover rather than the ones today would allow.
+
+    A trailing period reaching past the last collection is one an offline run would refuse the
+    moment it read it, so it is never cut in the first place.
+    """
+    edge = midnight(datetime.now(UTC)) - timedelta(days=30)
+    record_collection(trend_configuration_path, edge, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "trend", "--config", str(trend_configuration_path), "--offline"]),
+        patch.dict("os.environ", {}, clear=True),
+        cached_periods(),
+    ):
+        assert main() == 0
+
+    periods = json.loads(capsys.readouterr().out)["repositories"][0]["periods"]
+    span = timedelta(days=28)
+    last = datetime.fromisoformat(periods[-1]["ends_at"])
+    assert len(periods) == (edge - datetime(2024, 1, 1, tzinfo=UTC)) // span
+    assert last <= edge
+    # The very next period would reach past the collection, which is what makes this the last one.
+    assert last + span > edge
 
 
 def test_trend_requires_credentials_before_collecting(

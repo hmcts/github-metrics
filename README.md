@@ -14,6 +14,7 @@ database: .metrics/metrics.sqlite3
 lookback:
   operational_days: 90
   maximum_days: 365
+  stale_collection_days: 8
 triviality:
   maximum_lines: 10
   maximum_files: 1
@@ -47,6 +48,11 @@ but only at tens of minutes of rate-limited calls — so both are kept out of th
 delete. `metrics prune` never touches it. Unknown keys and unsupported
 configuration versions are rejected before any collection starts. `github_team_slugs` may optionally list GitHub teams
 when the token can access that data; repository ownership remains authoritative.
+
+`lookback.stale_collection_days` is **how old the last collection may be before the service and the CLI say so** — eight
+days by default, because collection runs weekly and one missed run, not one missed day, is what the warning is for.
+Past it, every page carries a notice naming the day the caches were collected through, and an offline `metrics evidence`
+or `metrics trend --offline` run logs the same at WARNING.
 
 `enablement` records **when agentic tooling was turned on for each repository**. It is configuration because it cannot be
 observed: GitHub cannot be asked when a team was enabled. Each date parses exactly as a reporting window edge does — a
@@ -386,7 +392,9 @@ The cache exists only to avoid repeating GitHub calls; it is not a separate data
 stored as JSON payloads beside the few columns needed to query them, so recording an additional field needs no schema
 change. Coverage is keyed on a hash of the GraphQL documents, so widening a query automatically invalidates the affected
 intervals and they are collected again rather than served incomplete. `metrics prune --config ... --days N` deletes
-intervals that have not been used for N days, together with any facts they leave behind.
+intervals no collection has touched for N days, together with any facts they leave behind. Collection is what counts as
+touching one: reporting from the cache deliberately leaves the interval's timestamp alone, so an interval the current
+queries no longer ask for ages out even while the service is serving reports from its neighbours.
 
 This release widened the pull-request query three times — a review's comment count and its summary body, for
 `review-depth`, and the pull-request body, for `description-quality` and `traceability-reference` — so **every
@@ -870,8 +878,21 @@ than emitting a short one — for **either** source, naming the one it could not
 are cached but whose direct commits were never collected would understate every governance denominator by exactly the
 bypasses it could not see — a silently truncated window is more dangerous than no answer. Because the mutable edge is
 cached without recording coverage, a cached report also refuses any window overlapping the last `mutable_hours`. That is
-intended: it means settled, cached evidence or nothing. Ask for a window ending at the most recent UTC midnight
-and it is served from cache.
+intended: it means settled, cached evidence or nothing.
+
+Which is why a cached report anchors its window where the caches end rather than where today does. A collection records
+coverage only up to the stable edge of the run that wrote it, so the morning after a run a window ending at today's
+midnight is short of coverage by that edge alone and every repository reports as not reported. Wherever the end is not
+named outright — no options at all, `--days` on its own, `--from` on its own — `evidence` without `--refresh` and
+`trend --offline` therefore end at the most recent midnight the caches actually cover to: the last whole run's edge,
+taking the earlier of the two sources, and never later than today's midnight. The same command run the day after a
+collection prints the figures that collection supports, rather than nothing. An explicit `--to` is still honoured
+exactly as given. A repository off that edge is still reported as unavailable at that window: the anchor is the instant
+most of the estate is covered to, so neither one repository missed for a month nor one repository refreshed on its own
+this morning moves the whole estate's window. The run says where it landed — an INFO line naming the collected
+instant whenever the anchor is behind today's midnight, and a WARNING when the last collection is older than
+`lookback.stale_collection_days`. `collect` and `evidence --refresh` are unaffected and still anchor at now: they are
+the runs that reach GitHub, and an anchor behind now would ask them to collect less than they can.
 
 Merge-gate collection first uses effective repository rulesets. If none apply, it requests detailed classic branch
 protection and normalises pull-request reviews, status checks, deletion restrictions, force-push restrictions, and the
@@ -1358,7 +1379,7 @@ call — that is why `collect` has to run before the service, not merely at some
 
 FastAPI and uvicorn are an optional extra, so a collection host that will never serve anything installs neither.
 `uv sync --extra service` adds them. The `metrics-serve` script itself is installed either way; without the extra it
-starts and stops on an import error naming `fastapi`.
+starts and stops on an import error naming `uvicorn`, the first of the two it imports.
 
 `metrics-serve` takes `--config` (repeatable, as every command's does), `--host` (default `127.0.0.1`), `--port`
 (default `8000`), `--logging`, and `--max-bundle-age` (default `3600` seconds, and at least `1` — a zero or negative
@@ -1371,6 +1392,16 @@ page somebody is already reading. The endpoints are `/healthz`, `/windows`, `/ov
 `/repositories/{repository}`, `/repositories/{repository}/trend`, `/actors`, `/actors/{login}`, `/teams` and
 `/teams/{team}`; every data endpoint takes `?weeks=` and refuses a span off the list rather than clamping it. A request
 naming no span gets four weeks, or the longest span the configuration allows below that.
+
+Every one of those spans ends where the caches end, not at today's midnight — the same anchor `metrics evidence` uses
+offline, and for the same reason: a service reading a cache written on Monday would otherwise report the whole estate
+as not reported from Tuesday onwards. So a span served the day after a collection shows the figures that collection
+supports, and a repository off that edge is reported as unavailable at that window rather than pulling everyone else's
+window back to meet it or dragging it forward. The instant a window is anchored to is published as `collected_through` on
+`/windows` and on `/overview`, and `/windows` also carries `collection_stale`, set when the last collection is older
+than `lookback.stale_collection_days`. The UI prints `Collected through 2026-09-01` in the overview header beside the
+span, and shows an amber warning bar on every page — overview, repository, team and actor — while the collection is
+stale, because a page that quietly reports a fortnight-old window reads as this morning's.
 
 The trend endpoint is the one exception to `?weeks=`: a series is cut into periods from the repository's own
 enablement instant and has no reporting window to select, so it takes `period_days` (default `28`) and an optional
@@ -1390,3 +1421,25 @@ tells the Next.js server where it is, defaulting to `http://localhost:8000`. `np
 `npm --prefix ui start` serves it for real; `npm --prefix ui run check` is the whole UI gate — lint, types, tests,
 build — in one step, as `uv run poe check` is for the Python. See [`ui/README.md`](ui/README.md) for the pages, the
 design tokens, and the guardrails the UI keeps.
+
+### In containers
+
+`docker-compose.yml` runs the same two processes, and only those two:
+
+```bash
+uv run metrics collect --config config.yml --from 2026-05-01 --to 2026-09-01
+CONFIG=config.yml docker compose up --build
+```
+
+Collection stays on the host, because it is the step that needs a credential and the one that has to be scheduled.
+`CONFIG` names a file in this directory — `config.yml` by default — mounted read-only at `/app/config.yml`, and
+`./.metrics` is mounted read-write, so the configuration's `database` must resolve inside `.metrics` or the service
+starts with nothing to serve.
+
+Only the UI is published, on `http://localhost:3000`; the API answers at `http://api:8000` on the compose network
+alone, which is the same server-side-only arrangement the local loop has. The UI waits for the API's `/healthz` to
+answer, and the API's healthcheck allows a minute before it starts failing, so the first `up` is slower than the ones
+after it. The API image installs the `service` extra and nothing else, and its build context is an allowlist
+(`.dockerignore`): `pyproject.toml`, `uv.lock`, `README.md` and `src/`, so a new runtime file outside `src/` has to be
+added there or it will be missing from the image. The UI image is built from `ui/`, which is why `ui/next.config.mjs`
+sets `output: 'standalone'`.

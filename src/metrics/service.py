@@ -46,10 +46,10 @@ from metrics.domain import (
     RepositoryPracticeEvidence,
     RepositoryTrend,
 )
-from metrics.evidence import offline_practice_report
+from metrics.evidence import collected_through, offline_practice_report
 from metrics.storage import StorageError, observation_database
 from metrics.trend import SeriesRequest, repository_trend
-from metrics.window import midnight, period_windows
+from metrics.window import collected_anchor, collection_is_stale, period_windows
 
 WEEKS_OPTIONS: tuple[int, ...] = (1, 4, 8, 12, 26)
 """Every window span a reader may ask for, in weeks, shortest first.
@@ -126,11 +126,19 @@ class WindowOptions(EvidenceModel):
     every whole period since enablement, which `MAXIMUM_PERIODS` refuses rather than truncates. A
     client that restated the cut as a constant of its own would keep asking for a series this
     service has since stopped cutting, so the cut is published beside the spans and read from here.
+
+    THE COLLECTION STATE IS PUBLISHED HERE for the same reason: every page already fetches this
+    route for the span selector, and the notice that the figures are anchored at an old collection
+    belongs on every page rather than on the overview alone. `collected_through` is absent when
+    nothing has been collected under the current query signature, which is when `collection_stale`
+    is true without an instant to name.
     """
 
     options: tuple[PositiveInt, ...]
     default: PositiveInt
     trend_periods: PositiveInt
+    collected_through: datetime | None = None
+    collection_stale: bool
 
 
 class OverviewSummary(EvidenceModel):
@@ -141,6 +149,10 @@ class OverviewSummary(EvidenceModel):
     own `Repository Summary` block stands on. Nothing here is a score, a combined label, or a figure
     per team, and `merged_pull_requests` and `direct_commits` are sums of changes rather than
     averages of anything (architecture.md, "Scope boundaries").
+
+    `collected_through` sits beside the window rather than in place of `built_at`: the header prints
+    the window the figures cover and the collection that window is anchored to, which are different
+    instants from the moment this bundle was assembled. It is absent when nothing was collected.
     """
 
     organization: str
@@ -148,6 +160,7 @@ class OverviewSummary(EvidenceModel):
     starts_at: datetime
     ends_at: datetime
     built_at: datetime
+    collected_through: datetime | None = None
     repositories: NonNegativeInt
     unavailable: NonNegativeInt
     teams: NonNegativeInt
@@ -290,13 +303,14 @@ def default_window(options: Collection[int]) -> int:
     return DEFAULT_WEEKS if DEFAULT_WEEKS in options else max(options)
 
 
-def reporting_window(weeks: int, reference: datetime) -> ReportingWindow:
-    """Return the half-open window one span covers, anchored where every other window is anchored.
+def reporting_window(weeks: int, anchor: datetime) -> ReportingWindow:
+    """Return the half-open window one span covers, ending at the midnight it is anchored to.
 
-    The most recent UTC midnight, through `window.midnight`, so a span served twice in one day is the
-    same window both times and the cached facts behind it are the ones `metrics evidence` reports.
+    The RESOLVED anchor rather than a reference instant, because the anchor this service reports
+    from is where the caches end and not where today does: `collected_anchor` floors the last
+    collection's edge, so a span served the day after a collection reports the same figures it did
+    the day the collection landed instead of asking for hours nobody has collected.
     """
-    anchor = midnight(reference)
     return ReportingWindow(starts_at=anchor - timedelta(weeks=weeks), ends_at=anchor)
 
 
@@ -347,10 +361,14 @@ class ReportBundle(CachedBuild):
     `stamp` and `built_at` are what `WindowCache` decides to rebuild on. They are properties of THIS
     bundle rather than of the cache, so a span nobody has asked for since a collection cannot be
     served from a bundle that predates it.
+
+    `collected_through` is the instant `window` was anchored at, carried so that a response can name
+    the collection its figures cover without reading the cache a second time.
     """
 
     weeks: int
     window: ReportingWindow
+    collected_through: datetime | None
     report: PracticeEvidenceReport
     owners: Mapping[str, str]
     teams: Mapping[str, tuple[str, ...]]
@@ -421,14 +439,19 @@ def report_bundle(configuration: Configuration, weeks: int, reference: datetime)
     """Assemble one span's report from the caches and index it.
 
     The stamp is taken BEFORE the report is loaded, so a collection landing while this runs
-    invalidates the bundle it did not get into rather than being missed until the next one.
+    invalidates the bundle it did not get into rather than being missed until the next one. The
+    collected edge is read AFTER the stamp, for the same ordering reason read the other way round: a
+    bundle may be anchored at a collection older than the caches it was built from, but never at one
+    newer than the stamp that will invalidate it.
     """
     stamp = source_stamp(configuration)
-    window = reporting_window(weeks, reference)
+    collected = collected_through(configuration)
+    window = reporting_window(weeks, collected_anchor(collected, reference))
     report = offline_practice_report(configuration, window)
     return ReportBundle(
         weeks=weeks,
         window=window,
+        collected_through=collected,
         report=report,
         built_at=reference,
         stamp=stamp,
@@ -455,8 +478,13 @@ def repository_series(
     `client=None` is what makes the run offline in `metrics.trend`, exactly as `metrics trend
     --offline` does it: a period the caches do not fully cover is refused there and reported as the
     window's own reason, rather than being collected behind a reader's back.
+
+    The series is cut against the collected anchor rather than against `reference`, so the trailing
+    period a reader sees is one the caches cover whole. `reference` is still what the bundle holding
+    this series ages against, which is why it is passed in rather than read here.
     """
-    request = SeriesRequest(period_days=period_days, periods=periods, reference=reference, client=None)
+    anchor = collected_anchor(collected_through(configuration), reference)
+    request = SeriesRequest(period_days=period_days, periods=periods, reference=anchor, client=None)
     return repository_trend(configuration, request, repository, enablement_instants(configuration)[repository])
 
 
@@ -678,6 +706,7 @@ def overview_summary(bundle: ReportBundle) -> OverviewSummary:
         starts_at=bundle.window.starts_at,
         ends_at=bundle.window.ends_at,
         built_at=bundle.built_at,
+        collected_through=bundle.collected_through,
         repositories=len(bundle.owners),
         unavailable=len(bundle.unavailable),
         teams=len(bundle.teams),
@@ -694,8 +723,23 @@ def serve_health(state: State) -> ServiceHealth:
 
 
 def serve_windows(state: State) -> WindowOptions:
-    """List the spans this service reports, the one it serves by default, and the trend cut."""
-    return WindowOptions(options=state.options, default=state.default, trend_periods=MAXIMUM_PERIODS)
+    """List the spans this service reports, the one it serves by default, the trend cut, and the collection.
+
+    The collection state is read fresh rather than off a held bundle, so a page fetching this route
+    says how old the last collection is now and not how old it was when a span was last assembled.
+    """
+    collected = collected_through(state.configuration)
+    return WindowOptions(
+        options=state.options,
+        default=state.default,
+        trend_periods=MAXIMUM_PERIODS,
+        collected_through=collected,
+        collection_stale=collection_is_stale(
+            collected,
+            datetime.now(UTC),
+            timedelta(days=state.configuration.lookback.stale_collection_days),
+        ),
+    )
 
 
 def serve_overview(bundle: Bundle) -> OverviewSummary:
@@ -738,7 +782,8 @@ def serve_trend(
     if repository not in instants:
         detail = f"repository is not configured: {repository}"
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=detail)
-    resolve_periods(period_days, periods, instants[repository])
+    anchor = collected_anchor(collected_through(state.configuration), datetime.now(UTC))
+    resolve_periods(period_days, periods, instants[repository], anchor)
     try:
         return state.cache.trend(repository, period_days, periods)
     except StorageError as exception:
@@ -752,17 +797,21 @@ def serve_trend(
         raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=detail) from exception
 
 
-def resolve_periods(period_days: int, periods: int | None, enablement: datetime | None) -> None:
+def resolve_periods(period_days: int, periods: int | None, enablement: datetime | None, anchor: datetime) -> None:
     """Refuse a cut that resolves to more whole periods than one request may ask for.
 
     Through `period_windows`, so the count refused here is the count that would have been built
     rather than a second piece of arithmetic that could drift from it. A repository with no
     enablement instant resolves to no period at all and is reported, not refused: the reason belongs
     in the series the contract carries, not in a status code.
+
+    Counted against the collected anchor, the instant `repository_series` cuts against, so the count
+    a request is refused for is the count that would have been built rather than one whole period
+    more than the caches can answer for.
     """
     if enablement is None:
         return
-    resolved = len(period_windows(enablement, timedelta(days=period_days), periods, datetime.now(UTC)))
+    resolved = len(period_windows(enablement, timedelta(days=period_days), periods, anchor))
     if resolved > MAXIMUM_PERIODS:
         detail = (
             f"a series of {resolved} periods of {period_days} days exceeds the {MAXIMUM_PERIODS} "

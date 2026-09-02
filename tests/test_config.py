@@ -53,6 +53,7 @@ def test_load_configuration(configuration_path: Path) -> None:
     assert configuration.lookback.operational_days == 60
     assert configuration.lookback.maximum_days == 180
     assert configuration.lookback.stale_open_days == 21
+    assert configuration.lookback.stale_collection_days == 8
     assert configuration.excluded_repositories == ("retired-service",)
     assert configuration.teams[0].identifier == "civil"
     assert configuration.teams[0].github_team_slugs == ("civil-developers",)
@@ -73,7 +74,19 @@ def test_load_configuration_uses_default_lookbacks(configuration_path: Path) -> 
     assert configuration.lookback.maximum_days == 365
     assert configuration.lookback.mutable_hours == 6
     assert configuration.lookback.stale_open_days == 14
+    assert configuration.lookback.stale_collection_days == 8
     assert configuration.cohort.excluded_authors == ("renovate", "dependabot")
+
+
+def test_load_configuration_customizes_the_collection_cadence(configuration_path: Path) -> None:
+    """Load a collection cadence for an estate collected more often than weekly."""
+    content = configuration_path.read_text(encoding="utf-8")
+    configuration_path.write_text(
+        content.replace("  stale_open_days: 21\n", "  stale_open_days: 21\n  stale_collection_days: 2\n"),
+        encoding="utf-8",
+    )
+
+    assert load_configuration(configuration_path).lookback.stale_collection_days == 2
 
 
 def test_load_configuration_uses_default_traceability(configuration_path: Path) -> None:
@@ -172,6 +185,11 @@ def test_load_configuration_allows_missing_github_teams(configuration_path: Path
     [
         (("version: 1", "version: 2"), "Input should be 1"),
         (("  operational_days: 60", "  operational_days: 0"), "Input should be greater than 0"),
+        (
+            ("  stale_open_days: 21", "  stale_collection_days: 0"),
+            "lookback.stale_collection_days: Input should be greater than 0",
+        ),
+        (("  stale_open_days: 21", "  stale_collection_day: 8"), "Extra inputs are not permitted"),
         (("organization: hmcts", "organisation: hmcts"), "Extra inputs are not permitted"),
     ],
 )

@@ -1,6 +1,7 @@
 """Test the read-only evidence service."""
 
 import logging
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from metrics.behaviour import source_signature
 from metrics.config import Configuration, LookbackConfiguration
 from metrics.domain import (
     ActorReadiness,
@@ -18,6 +20,7 @@ from metrics.domain import (
     BehaviourMetricSummary,
     CodeownersReport,
     CohortSummary,
+    EvidenceSource,
     EvidenceUnavailable,
     FindingSeverity,
     MaintenanceReport,
@@ -36,6 +39,7 @@ from metrics.domain import (
     RepositoryTrend,
     SecurityAlertReport,
     SonarReport,
+    SourceCoverage,
     TrendPeriod,
     TrendThroughput,
     WindowProvenance,
@@ -47,6 +51,7 @@ from metrics.service import (
     MAXIMUM_PERIODS,
     NOT_ASSESSED,
     WEEKS_OPTIONS,
+    ReportBundle,
     RepositoryDetail,
     WindowCache,
     contributor_rows,
@@ -58,8 +63,9 @@ from metrics.service import (
     source_stamp,
     window_options,
 )
-from metrics.storage import StorageError
+from metrics.storage import StorageError, cache_direct_commit_facts, cache_pull_request_facts
 from metrics.trend import NO_ENABLEMENT_DATE, SeriesRequest
+from metrics.window import midnight
 
 MAXIMUM_AGE = timedelta(seconds=DEFAULT_BUNDLE_AGE_SECONDS)
 """The bundle lifetime every test uses unless it is testing the lifetime itself."""
@@ -96,6 +102,33 @@ def configuration(tmp_path: Path, **overrides: object) -> Configuration:
         },
     )
     return loaded.model_copy(update=overrides)
+
+
+def record_collection(settings: Configuration, edge: datetime) -> None:
+    """Record both sources as covering every configured repository up to one instant.
+
+    A collection is what `collected_through` reads, so a service test that wants an anchor has to
+    leave one behind: the interval reaches far enough back that the longest span on offer is covered
+    whole, and it carries no fact, because what is under test is the window rather than the figures.
+    """
+    for repository in ("cath-service", "other-service", "civil-service"):
+        for source, write in (
+            (EvidenceSource.PULL_REQUEST, cache_pull_request_facts),
+            (EvidenceSource.COMMIT, cache_direct_commit_facts),
+        ):
+            write(
+                settings.database,
+                SourceCoverage(
+                    organization=settings.organization,
+                    repository=repository,
+                    source=source,
+                    query_hash=source_signature(source),
+                    starts_at=edge - timedelta(days=400),
+                    ends_at=edge,
+                ),
+                (),
+                complete=True,
+            )
 
 
 def assessment() -> ReadinessAssessment:
@@ -329,8 +362,9 @@ def test_the_default_span_falls_back_to_the_longest_one_still_on_offer() -> None
     assert default_window((1,)) == 1
 
 
-def test_a_window_is_anchored_at_the_most_recent_utc_midnight() -> None:
-    window = reporting_window(4, datetime(2026, 8, 29, 14, 30, tzinfo=UTC))
+def test_a_window_ends_at_the_anchor_it_was_resolved_for() -> None:
+    """Take the resolved anchor as given: where the caches end is the caller's decision to make."""
+    window = reporting_window(4, datetime(2026, 8, 29, tzinfo=UTC))
 
     assert window.starts_at == datetime(2026, 8, 1, tzinfo=UTC)
     assert window.ends_at == datetime(2026, 8, 29, tzinfo=UTC)
@@ -360,6 +394,58 @@ def test_one_span_is_assembled_once_and_then_reused(tmp_path: Path, loader: Load
 
     assert first is second
     assert len(loader.windows) == 1
+
+
+def test_two_requests_for_a_cold_span_assemble_it_once_between_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build once under the lock, so a cold span does not walk every repository twice at once.
+
+    The class promises this and every other test is single-threaded, so a lock dropped or narrowed to
+    the dictionary write alone would let a thundering herd on a cold span run one whole cohort load
+    per waiting request with nothing failing.
+    """
+    released = threading.Event()
+    loader = Loader()
+
+    def blocking(settings: Configuration, window: ReportingWindow) -> PracticeEvidenceReport:
+        released.wait(timeout=5)
+        return loader(settings, window)
+
+    monkeypatch.setattr("metrics.service.offline_practice_report", blocking)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    built: list[ReportBundle] = []
+    threads = [threading.Thread(target=lambda: built.append(cache.bundle(4))) for _ in range(2)]
+
+    for thread in threads:
+        thread.start()
+    released.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(loader.windows) == 1
+    assert built[0] is built[1]
+
+
+def test_reading_the_caches_to_build_a_bundle_does_not_invalidate_it(tmp_path: Path) -> None:
+    """Hold a bundle built from a REAL cache, not a stubbed loader, across the next request.
+
+    The build reads every configured repository's coverage, and a read that stamped `accessed_at`
+    would write to the cache file — moving the modification time and size the held bundle is compared
+    against, so its own build would invalidate it and every request would rebuild the whole cohort
+    under the lock. `test_one_span_is_assembled_once_and_then_reused` cannot see that: its loader
+    never opens the cache at all.
+    """
+    settings = configuration(tmp_path)
+    record_collection(settings, midnight(datetime.now(UTC)) - timedelta(days=1))
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    first = cache.bundle(4)
+    second = cache.bundle(4)
+
+    assert first is second
+    assert sorted(first.repositories) == ["cath-service", "civil-service", "other-service"]
 
 
 def test_each_span_is_assembled_over_its_own_window(tmp_path: Path, loader: Loader) -> None:
@@ -398,6 +484,117 @@ def test_a_bundle_older_than_the_configured_maximum_age_is_rebuilt(tmp_path: Pat
     assert len(loader.windows) == 2
 
 
+def test_every_span_ends_where_the_collection_ends(tmp_path: Path) -> None:
+    """Anchor every span at the collection's edge, and report the repositories it covers.
+
+    The whole point of the anchor: with the window ending at today's midnight, the last hours of
+    yesterday are uncovered and every repository reports as unavailable the day after a run. Built
+    from the real offline report rather than the fixture one, because what the anchor buys is the
+    coverage check passing, which the fixture loader cannot show.
+    """
+    settings = configuration(tmp_path)
+    edge = midnight(datetime.now(UTC)) - timedelta(days=1)
+    record_collection(settings, edge)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    bundles = [cache.bundle(weeks) for weeks in WEEKS_OPTIONS]
+
+    assert [bundle.window.ends_at for bundle in bundles] == [edge] * len(WEEKS_OPTIONS)
+    assert [bundle.collected_through for bundle in bundles] == [edge] * len(WEEKS_OPTIONS)
+    assert [sorted(bundle.repositories) for bundle in bundles] == [
+        ["cath-service", "civil-service", "other-service"],
+    ] * len(WEEKS_OPTIONS)
+    assert [dict(bundle.unavailable) for bundle in bundles] == [{}] * len(WEEKS_OPTIONS)
+
+
+def test_a_cache_nobody_has_collected_into_still_resolves_a_window(tmp_path: Path) -> None:
+    """Fall back to today's midnight when there is no collection, and report the honest answer.
+
+    A cold cache covers nothing, so every repository is unavailable — which is what it was before
+    the anchor existed, and the state the notice on every page exists to explain.
+    """
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    bundle = cache.bundle(4)
+
+    assert bundle.window.ends_at == midnight(datetime.now(UTC))
+    assert bundle.collected_through is None
+    assert sorted(bundle.unavailable) == ["cath-service", "civil-service", "other-service"]
+    assert bundle.repositories == {}
+
+
+def test_the_overview_names_the_collection_its_window_is_anchored_to(tmp_path: Path, loader: Loader) -> None:
+    _ = loader
+    settings = configuration(tmp_path)
+    edge = midnight(datetime.now(UTC)) - timedelta(days=1)
+    record_collection(settings, edge)
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+        body = connected.get("/overview").json()
+
+    assert body["collected_through"].startswith(f"{edge:%Y-%m-%dT00:00:00}")
+    assert body["ends_at"].startswith(f"{edge:%Y-%m-%dT00:00:00}")
+
+
+def test_the_overview_omits_the_collection_when_there_has_been_none(client: TestClient) -> None:
+    """Absent rather than null, as every other unobserved figure is."""
+    assert "collected_through" not in client.get("/overview").json()
+
+
+@pytest.mark.parametrize(("age", "stale"), [(timedelta(days=7), False), (timedelta(days=9), True)])
+def test_the_published_collection_state_says_when_the_last_run_is_too_old(
+    tmp_path: Path,
+    loader: Loader,
+    age: timedelta,
+    *,
+    stale: bool,
+) -> None:
+    """Measure staleness against the configured cadence, which defaults to one missed weekly run."""
+    _ = loader
+    settings = configuration(tmp_path)
+    edge = midnight(datetime.now(UTC) - age)
+    record_collection(settings, edge)
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+        body = connected.get("/windows").json()
+
+    assert body["collection_stale"] is stale
+    assert body["collected_through"].startswith(f"{edge:%Y-%m-%dT00:00:00}")
+
+
+def test_the_configured_cadence_is_what_staleness_is_measured_against(tmp_path: Path, loader: Loader) -> None:
+    """Answer against `lookback.stale_collection_days`, not against the eight days it defaults to.
+
+    A three-day-old collection is current at the default and stale for an estate collecting daily.
+    Nothing else in the suite moves this key off its default, so a hardcoded eight would pass every
+    other test and quietly disconnect the knob from the decision it configures.
+    """
+    _ = loader
+    settings = configuration(tmp_path)
+    daily = settings.model_copy(
+        update={"lookback": settings.lookback.model_copy(update={"stale_collection_days": 2})},
+    )
+    record_collection(daily, midnight(datetime.now(UTC) - timedelta(days=3)))
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as weekly:
+        assert weekly.get("/windows").json()["collection_stale"] is False
+    with TestClient(create_app(daily, WindowCache(daily, MAXIMUM_AGE))) as connected:
+        assert connected.get("/windows").json()["collection_stale"] is True
+
+
+def test_a_series_is_cut_against_the_collection_rather_than_against_now(tmp_path: Path, series: Series) -> None:
+    """Cut the periods the caches cover, so a trailing period is never one nobody collected."""
+    settings = configuration(tmp_path)
+    edge = midnight(datetime.now(UTC)) - timedelta(days=3)
+    record_collection(settings, edge)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+
+    cache.trend("cath-service", 28, None)
+
+    assert [request.reference for _, request in series.calls] == [edge]
+
+
 def test_the_service_reports_that_it_is_up_and_what_it_was_configured_for(client: TestClient) -> None:
     response = client.get("/healthz")
 
@@ -412,6 +609,9 @@ def test_the_spans_on_offer_are_published_with_the_default(client: TestClient) -
         "options": list(WEEKS_OPTIONS),
         "default": 4,
         "trend_periods": MAXIMUM_PERIODS,
+        # Nothing has been collected into the fixture cache, so there is no instant to name and the
+        # collection is stale: there is no run to be current.
+        "collection_stale": True,
     }
 
 
@@ -436,7 +636,12 @@ def test_a_configuration_refusing_long_windows_offers_fewer_spans(tmp_path: Path
     with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
         response = connected.get("/windows")
 
-    assert response.json() == {"options": [1], "default": 1, "trend_periods": MAXIMUM_PERIODS}
+    assert response.json() == {
+        "options": [1],
+        "default": 1,
+        "trend_periods": MAXIMUM_PERIODS,
+        "collection_stale": True,
+    }
 
 
 def test_the_overview_counts_the_population_the_window_covers(client: TestClient) -> None:
@@ -461,7 +666,7 @@ def test_the_overview_distributes_labels_without_combining_them(client: TestClie
 def test_the_overview_names_the_window_the_figures_were_measured_over(client: TestClient) -> None:
     body = client.get("/overview").json()
 
-    assert body["starts_at"].startswith(f"{reporting_window(4, datetime.now(UTC)).starts_at:%Y-%m-%d}")
+    assert body["starts_at"].startswith(f"{reporting_window(4, midnight(datetime.now(UTC))).starts_at:%Y-%m-%d}")
 
 
 def test_every_configured_repository_is_listed_in_the_reporting_order(client: TestClient) -> None:

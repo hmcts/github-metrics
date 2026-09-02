@@ -554,7 +554,12 @@ def collect_open_pull_request_state(
     stale_open_days: int,
     reference: datetime,
 ) -> OpenPullRequestSummary:
-    """Fetch open pull-request counts in one call, fresh every time. Never cached — see architecture.md.
+    """Fetch open pull-request counts in one call, fresh every time — the `--refresh` path only.
+
+    What a collection stores is a snapshot of this state on the repository's row, which every other
+    run reports from; this function is the observation itself, and its answer is never read back out
+    of the windowed fact cache — see architecture.md.
+
 
     `stale_open` is measured from each pull request's LAST UPDATE, not from when it was opened, per
     `lookback.stale_open_days`.
@@ -578,6 +583,17 @@ def commit_query_signature() -> str:
     """
     documents = " ".join(commit_history_query().split())
     return sha256(documents.encode()).hexdigest()[:16]
+
+
+def source_signature(source: EvidenceSource) -> str:
+    """Return the signature one independently cached source's rows are written under.
+
+    Named once so that a reader of the cache and a writer of it cannot use different signatures:
+    `requested_coverage` requests coverage through this, and `collected_through` reads the anchor
+    through it, so the anchor is always the edge of coverage this build can actually report from.
+    """
+    signatures = {EvidenceSource.PULL_REQUEST: query_signature, EvidenceSource.COMMIT: commit_query_signature}
+    return signatures[source]()
 
 
 def date_shards(starts_at: datetime, ends_at: datetime) -> Iterator[tuple[datetime, datetime]]:
@@ -927,13 +943,16 @@ def fill_cached_source[FactT](
 ) -> tuple[SourceCoverage, ...]:
     """Fill one source's missing stable history, refresh its mutable edge, and report what was fetched.
 
-    Only the stable side records coverage, which is what makes `--offline` refuse a window reaching
+    Only the stable side records coverage, which is what makes a report read from the caches —
+    `evidence` without `--refresh`, `trend --offline`, and the service — refuse a window reaching
     into the mutable edge rather than serving a remembered answer for it.
     """
     missing_intervals: tuple[SourceCoverage, ...] = ()
     if requested.starts_at < mutable_starts_at:
         stable = requested.model_copy(update={"ends_at": mutable_starts_at})
-        missing_intervals = find_missing_cached_coverage(database, stable)
+        # `record_use=True`: this is the collecting run, and the intervals it reads here are the ones
+        # the current queries still ask for, so they must not age out of the cache under `prune`.
+        missing_intervals = find_missing_cached_coverage(database, stable, record_use=True)
         for missing in missing_intervals:
             cache(database, missing, collect(missing.starts_at, missing.ends_at), complete=True)
     if mutable_starts_at < requested.ends_at:
@@ -949,12 +968,11 @@ def requested_coverage(
     source: EvidenceSource,
 ) -> SourceCoverage:
     """Describe the coverage one window requires from one independently cached source."""
-    signatures = {EvidenceSource.PULL_REQUEST: query_signature, EvidenceSource.COMMIT: commit_query_signature}
     return SourceCoverage(
         organization=configuration.organization,
         repository=repository,
         source=source,
-        query_hash=signatures[source](),
+        query_hash=source_signature(source),
         starts_at=window.starts_at,
         ends_at=window.ends_at,
     )

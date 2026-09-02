@@ -89,6 +89,7 @@ from metrics.evidence import (
     cached_repository_evidence,
     cohort_summary,
     collected_repository_evidence,
+    collected_through,
     maintenance_windows,
     metric_summaries,
     offline_practice_report,
@@ -1527,6 +1528,77 @@ def test_cached_repository_evidence_preserves_storage_failure(tmp_path: Path) ->
         unavailable = cached_repository_evidence(configuration(tmp_path), "cath-service", window(7))
 
     assert unavailable == EvidenceUnavailable(repository="cath-service", detail="cache unreadable")
+
+
+def test_collected_through_takes_the_edge_both_sources_reach(tmp_path: Path) -> None:
+    """Take the earlier of the two sources' edges, because a window needs both of them.
+
+    An instant only the pull requests reach is not an instant a window can end at: the direct
+    commits over the days beyond the commit source's edge were never collected, and reporting the
+    window anyway would understate every governance denominator by exactly those commits.
+    """
+    settings = configuration(tmp_path)
+    cache_pull_request_facts(settings.database, pull_request_coverage(window(7)), (), complete=True)
+    cache_direct_commit_facts(
+        settings.database,
+        commit_coverage(window(7)).model_copy(update={"ends_at": datetime(2026, 8, 6, tzinfo=UTC)}),
+        (),
+        complete=True,
+    )
+
+    assert collected_through(settings) == datetime(2026, 8, 6, tzinfo=UTC)
+
+
+def test_collected_through_reports_nothing_collected_when_one_source_is_missing(tmp_path: Path) -> None:
+    """Report `None` when either source has no coverage at all, including a wholly cold cache."""
+    settings = configuration(tmp_path)
+
+    assert collected_through(settings) is None
+
+    cache_pull_request_facts(settings.database, pull_request_coverage(window(7)), (), complete=True)
+
+    assert collected_through(settings) is None
+
+
+def test_collected_through_ignores_a_superseded_signature(tmp_path: Path) -> None:
+    """Ignore a superseded signature's edge, however far ahead of the current one it reaches.
+
+    `source_coverage` accumulates a row set per signature, so an older build's rows are still there.
+    They are not coverage this build can report from, and anchoring a window at one would ask every
+    repository for history nothing current covers.
+    """
+    settings = configuration(tmp_path)
+    cache_pull_request_facts(settings.database, pull_request_coverage(window(7)), (), complete=True)
+    cache_direct_commit_facts(settings.database, commit_coverage(window(7)), (), complete=True)
+    cache_pull_request_facts(
+        settings.database,
+        pull_request_coverage(window(7)).model_copy(
+            update={"query_hash": "superseded", "ends_at": datetime(2026, 9, 1, tzinfo=UTC)},
+        ),
+        (),
+        complete=True,
+    )
+
+    assert collected_through(settings) == datetime(2026, 8, 8, tzinfo=UTC)
+
+
+def test_collected_through_reports_an_unreadable_cache_as_nothing_collected(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Degrade to nothing collected rather than raising, because the service is offline always.
+
+    A page saying nothing has been collected is a better answer to a broken cache than a failed
+    request, so the failure is logged rather than propagated.
+    """
+    with (
+        caplog.at_level("WARNING"),
+        patch("metrics.evidence.prevailing_cached_coverage", side_effect=StorageError("cache unreadable")),
+    ):
+        edge = collected_through(configuration(tmp_path))
+
+    assert edge is None
+    assert caplog.messages == ["Could not read the collection cache's coverage: cache unreadable"]
 
 
 def test_collected_repository_evidence_records_fetched_intervals(tmp_path: Path) -> None:
