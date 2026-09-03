@@ -6,9 +6,17 @@
                                            [--cache .metrics/copilot] [--no-repositories]
 
 Writes the report to stdout and progress to stderr, so stdout can be redirected into a file.
-Requires a token in GH_TOKEN or GITHUB_TOKEN, or `gh` logged in. This is user-run only: the loop
-that maintains plan.md never holds a GitHub token (architecture.md, "Access"), so neither this
-report nor its numbers can be produced inside it.
+
+Authenticates the way `metrics collect` does, through `metrics.credentials`: a GitHub App
+installation when GH_APP_ID, GH_APP_INSTALLATION_ID and GH_APP_PRIVATE_KEY_PATH (or
+GH_APP_PRIVATE_KEY) are all set, and GH_TOKEN otherwise. An App is worth configuring here for the
+same reason it is there — an installation's permissions are granted by the organisation rather than
+intersected with a user's — and it is what makes the seat list readable without an owner's personal
+token. This script keeps two fallbacks the main collection has no use for, GITHUB_TOKEN and
+whatever `gh` is logged in as, because it is run from a developer's shell where one of those is
+usually already present. This is user-run only: the loop that maintains plan.md never holds a
+GitHub credential (architecture.md, "Access"), so neither this report nor its numbers can be
+produced inside it.
 
 `scripts/probe-copilot-usage.sh` probes `GET /orgs/{org}/copilot/metrics`, which is aggregate-only
 and short-retention. GitHub has since replaced it with a reports API
@@ -129,6 +137,17 @@ from typing import Any
 
 import requests
 import yaml
+
+from metrics.credentials import (
+    ACCESS_TOKEN_VARIABLE,
+    APP_IDENTIFIER_VARIABLE,
+    INSTALLATION_IDENTIFIER_VARIABLE,
+    AppInstallation,
+    CredentialsError,
+    GitHubCredentials,
+    key_configured,
+    resolve_credentials,
+)
 
 DEFAULT_API_URL = "https://api.github.com"
 # config.yml, not hmcts.yml: the team files carry only `teams`, and naming one here would report a
@@ -504,31 +523,50 @@ class Reader:
     window and the run carries on. A rate limit raises instead, because it applies to every
     remaining day just as it applied to this one, and days written under it would record this run's
     exhaustion as the organisation's idleness.
+
+    The credential is asked for a token per request rather than pinned into the session's headers,
+    exactly as `GitHubClient` does it. A GitHub App installation token lives an hour and is replaced
+    inside a margin before that, and a ninety-day window with a per-repository report runs long
+    enough to cross the boundary, so a token frozen at startup would stop working mid-window and
+    every remaining day would be recorded as refused.
     """
 
-    def __init__(self, token: str) -> None:
-        """Prepare a session carrying the token and the pinned API version on every call."""
+    def __init__(self, credentials: GitHubCredentials) -> None:
+        """Prepare a session carrying the pinned API version, taking the token per call instead."""
         self.base_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL).rstrip("/")
+        self.credentials = credentials
         self.calls = 0
         self.rate_pauses = 0
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "Authorization": f"Bearer {token}",
                 "Accept": JSON_ACCEPT,
                 "X-GitHub-Api-Version": API_VERSION,
             }
         )
 
+    def authorization(self) -> dict[str, str]:
+        """Return the Authorization header for ONE request, minting or renewing a token if needed."""
+        return {"Authorization": f"Bearer {self.credentials.token()}"}
+
     def get(self, path: str, parameters: Mapping[str, Any] | None = None) -> Response:
-        """Fetch one path, retrying a transient network failure and briefly pausing a rate limit."""
+        """Fetch one path, retrying a transient network failure and briefly pausing a rate limit.
+
+        A 401 is retried ONCE, and only when the credential can produce a different token: an App
+        installation mints a replacement, and a personal access token says it cannot, in which case
+        the 401 is returned and stops the run. Without this, a token revoked or expired mid-window
+        would be reported as the token never having had the role.
+        """
         pauses = 0
         failures = 0
+        refreshed = False
         requested = f"{self.base_url}{path}"
         while True:
             try:
                 self.calls += 1
-                raw = self.session.get(requested, params=parameters, timeout=REQUEST_TIMEOUT)
+                raw = self.session.get(
+                    requested, headers=self.authorization(), params=parameters, timeout=REQUEST_TIMEOUT
+                )
             except requests.RequestException as failure:
                 failures += 1
                 if failures >= MAXIMUM_NETWORK_ATTEMPTS:
@@ -539,6 +577,9 @@ class Reader:
             # raw.url rather than the path, so the query GitHub actually received is what gets
             # reported: the `day` a report was refused for is half of what makes a 404 legible.
             response = Response(raw.status_code, raw.text, url=raw.url)
+            if response.status == HTTPStatus.UNAUTHORIZED and not refreshed and self.credentials.refresh():
+                refreshed = True
+                continue
             if not is_rate_limited(response):
                 return response
             if pauses >= MAXIMUM_RATE_PAUSES:
@@ -1489,7 +1530,8 @@ def render_subscriptions(options: Options, collection: Collection, rollups: Roll
             heading("WHO PAYS FOR EACH ACTIVE USER"),
             f"  The seat list could not be read, so no user's subscription is known: {seats.detail}",
             "  Every user is therefore reported as `?`. Reading the seat list needs organisation owner, or",
-            "  the 'GitHub Copilot Business' / billing permission on a fine-grained token, or",
+            "  the 'GitHub Copilot Business' / billing permission — granted to a GitHub App installation",
+            "  by the organisation, or held by the user behind a fine-grained token — or",
             "  manage_billing:copilot on a classic one. Until it is readable, no credit figure in this",
             "  report can be attributed.",
         ]
@@ -1890,12 +1932,17 @@ def build_json(options: Options, collection: Collection, rollups: Rollups, days:
     }
 
 
-def resolve_token() -> str:
-    """Find a GitHub token in the environment, falling back to whatever `gh` is logged in as."""
-    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
-        token = os.environ.get(name)
-        if token:
-            return token
+def fallback_token() -> str | None:
+    """Find a token in the two places this script looks and the main collection does not.
+
+    GH_TOKEN is deliberately absent: `resolve_credentials` reads it itself, and reading it here as
+    well would put this script's precedence rules in two places. What is left is a shell's
+    conveniences — GITHUB_TOKEN, which is what CI and `gh` itself export, and whatever `gh` is
+    logged in as — which exist because this report is run by hand from a developer's terminal.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token
     executable = shutil.which("gh")
     if executable is not None:
         # Not a shell, and the path comes from `which`, not from anything user-supplied.
@@ -1908,7 +1955,65 @@ def resolve_token() -> str:
         )
         if completed.returncode == 0 and completed.stdout.strip():
             return completed.stdout.strip()
-    sys.exit("no token: set GH_TOKEN, or log in with 'gh auth login'")
+    return None
+
+
+def app_configured(environment: Mapping[str, str]) -> bool:
+    """Report whether the whole App set is configured, which is what `resolve_credentials` selects on.
+
+    Asked here for one reason only: so that a fully configured App does not send this script off to
+    run `gh auth token` for a fallback it will never use. The rule itself is not reimplemented — the
+    key half is `credentials.key_configured`, and if the answer here is wrong the only cost is a
+    fallback that is computed and then ignored.
+    """
+    return bool(
+        environment.get(APP_IDENTIFIER_VARIABLE)
+        and environment.get(INSTALLATION_IDENTIFIER_VARIABLE)
+        and key_configured(environment)
+    )
+
+
+def authentication_mode(credentials: GitHubCredentials) -> str:
+    """Name the credential this run authenticates with, so a refusal is read against the right one.
+
+    The App and installation ids are identifiers rather than secrets — anyone who can read the App's
+    page can see them — so they are named. Nothing about the key or the token is.
+    """
+    if isinstance(credentials, AppInstallation):
+        return f"GitHub App {credentials.app_identifier}, installation {credentials.installation_identifier}"
+    return "a personal access token"
+
+
+def resolve_run_credentials() -> GitHubCredentials:
+    """Build the credential every call in this run is made with, and prove it before the window starts.
+
+    `resolve_credentials` decides, so this report and `metrics collect` select the same way from the
+    same variables: the App installation when all three of its variables are set, GH_TOKEN
+    otherwise. The two fallbacks this script adds are offered to it as GH_TOKEN would have been,
+    which keeps the whole precedence order in one expression and means a half-configured App still
+    falls back to a token exactly as it does in the main collection.
+
+    Minted here, before any day is fetched, for the reason `cli.github_credentials` does it: in App
+    mode this forces the exchange the first request would have made anyway, so a wrong key or a
+    stale installation id stops the run in one line while a human is still watching, rather than
+    ninety days of refusals in.
+    """
+    environment = dict(os.environ)
+    if not app_configured(environment) and not environment.get(ACCESS_TOKEN_VARIABLE):
+        fallback = fallback_token()
+        if fallback:
+            environment[ACCESS_TOKEN_VARIABLE] = fallback
+    # Its own session, and not the reader's: the reader pins the reports API version on every call it
+    # makes, and the token exchange is not one of those calls.
+    try:
+        credentials = resolve_credentials(requests.Session(), environment)
+        credentials.token()
+    except CredentialsError as failure:
+        sys.exit(
+            f"cannot authenticate to GitHub: {failure}\nThis script also accepts GITHUB_TOKEN, or 'gh auth login'."
+        )
+    progress(f"authenticating as {authentication_mode(credentials)}")
+    return credentials
 
 
 def read_organization(path: Path) -> str:
@@ -1989,7 +2094,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not days:
         sys.exit(f"empty window: --until {options.until.isoformat()} is before {EARLIEST_REPORT_DAY.isoformat()}")
 
-    reader = Reader(resolve_token())
+    credentials = resolve_run_credentials()
+    reader = Reader(credentials)
     downloads = download_session()
     progress(f"scope {options.scope_kind}/{options.scope_name}, {days[0].isoformat()} .. {days[-1].isoformat()}")
     try:
@@ -1997,16 +2103,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     except AccessError as refused:
         sys.exit(
             f"refused: {refused}\n"
-            "This is the token's access and not a property of the day asked for, so the run stopped\n"
-            "instead of spending a call per remaining day to be told the same thing again.\n"
-            "  401  the token was not accepted at all: check it is set, unexpired, and SSO-authorised\n"
-            "       for this organisation.\n"
-            "  403  the token is accepted but lacks the role: reading these reports needs organisation\n"
-            "       owner or the fine-grained 'View Organization Copilot Metrics' permission, plus\n"
-            "       read:org on a classic token, and the Copilot metrics policy must be enabled."
+            "This is the credential's access and not a property of the day asked for, so the run\n"
+            "stopped instead of spending a call per remaining day to be told the same thing again.\n"
+            "  401  the credential was not accepted at all: check it is set, unexpired, and — for a\n"
+            "       token — SSO-authorised for this organisation.\n"
+            "  403  the credential is accepted but lacks the role: reading these reports needs\n"
+            "       organisation owner or the 'View Organization Copilot Metrics' permission, which a\n"
+            "       GitHub App installation is granted by the organisation and a fine-grained token\n"
+            "       only inherits from its user, plus read:org on a classic token. The Copilot metrics\n"
+            "       policy must also be enabled."
         )
     except RateLimitError as limit:
         sys.exit(f"rate limit did not clear: {limit}")
+    except CredentialsError as failure:
+        # Only an App installation reaches here, and only once its held token has genuinely expired:
+        # `AppInstallation` carries an early renewal that failed and re-attempts on the next call.
+        sys.exit(f"credentials failed mid-run after {reader.calls} calls: {failure}")
 
     rollups = build_rollups(collection.user_rows, collection.teams, collection.seat_assignments, options.scope_name)
     progress(
