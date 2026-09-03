@@ -78,6 +78,7 @@ from metrics.domain import (
     SonarReport,
     SonarResolution,
     SourceCoverage,
+    UnreviewedSubstantialOutcome,
     WindowProvenance,
 )
 from metrics.evidence import (
@@ -520,6 +521,75 @@ def test_repository_practice_evidence_omits_a_disabled_assessment() -> None:
 
     assert report.assessment is None
     assert report.behaviour
+
+
+def graded_facts(unreviewed: int) -> RepositoryEvidence:
+    """Build a cohort of ten substantial merges, the given number of them merged unreviewed.
+
+    Ten is `minimum_merges`, so the policy grades the window rather than suppressing every
+    behavioural condition over it, and each merge is sized past the triviality thresholds so that
+    the substantial count has a denominator.
+    """
+    starts_at = datetime(2026, 7, 1, tzinfo=UTC)
+    return cached_facts().model_copy(
+        update={
+            "pull_requests": tuple(
+                PullRequestFact(
+                    identifier=300 + number,
+                    repository="cath-service",
+                    number=number,
+                    created_at=starts_at,
+                    merged_at=starts_at + timedelta(days=1),
+                    draft=False,
+                    author_login="author",
+                    author_type="User",
+                    reviews=()
+                    if number <= unreviewed
+                    else (
+                        ReviewFact(
+                            identifier=400 + number,
+                            submitted_at=starts_at + timedelta(hours=1),
+                            state=ReviewState.APPROVED,
+                            author_login="reviewer",
+                            author_type="User",
+                        ),
+                    ),
+                    additions=200,
+                    deletions=0,
+                    changed_files=5,
+                )
+                for number in range(1, 11)
+            ),
+        },
+    )
+
+
+def test_repository_practice_evidence_carries_the_policys_unreviewed_substantial_verdict() -> None:
+    """Carry the verdict in the block, so a consumer needs no sentence parsed to read it."""
+    clean = graded_facts(0).practices((unreviewed_merge(),), default_policy(), uncollected_reports(), "civil", ())
+    lapsed = graded_facts(4).practices((unreviewed_merge(),), default_policy(), uncollected_reports(), "civil", ())
+
+    assert clean.unreviewed_substantial is UnreviewedSubstantialOutcome.NONE
+    assert lapsed.unreviewed_substantial is UnreviewedSubstantialOutcome.ABOVE
+
+
+def test_repository_practice_evidence_omits_the_verdict_where_the_policy_graded_nothing() -> None:
+    """Leave the field absent for a disabled policy and for a cohort too thin to grade.
+
+    A verdict the policy never reached would put a judgement in the block that no condition in it
+    supports, and reporting the absence as a pass would clear an unmeasured repository.
+    """
+    disabled = graded_facts(4).practices(
+        (unreviewed_merge(),),
+        ReadinessPolicy(AssessmentConfiguration(enabled=False), TrivialityConfiguration()),
+        uncollected_reports(),
+        "civil",
+        (),
+    )
+    thin = cached_facts().practices((unreviewed_merge(),), default_policy(), uncollected_reports(), "civil", ())
+
+    assert disabled.unreviewed_substantial is None
+    assert thin.unreviewed_substantial is None
 
 
 def test_repository_practice_evidence_carries_the_owning_team_and_the_cohort_metrics() -> None:

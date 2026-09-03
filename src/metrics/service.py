@@ -29,7 +29,7 @@ from typing import Annotated, Self
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from pydantic import NonNegativeInt, PositiveInt, model_validator
+from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt, model_validator
 
 from metrics.config import (
     Configuration,
@@ -43,11 +43,14 @@ from metrics.domain import (
     ActorReadiness,
     BehaviourMetricSummary,
     EvidenceModel,
+    MergeGateEvidence,
+    MergeGateReport,
     PracticeEvidenceReport,
     ReadinessLabel,
     ReportingWindow,
     RepositoryPracticeEvidence,
     RepositoryTrend,
+    UnreviewedSubstantialOutcome,
     actor_labels,
 )
 from metrics.evidence import collected_through, offline_practice_report
@@ -197,6 +200,14 @@ class RepositoryRow(EvidenceModel):
     Every count is optional and `detail` carries the reason there are none, because a repository the
     cache cannot cover must not appear among zeros: "nothing merged" and "nobody collected this
     window" are different answers, and the list is where they would be confused first.
+
+    The last four say what the row's own counts cannot, so a list can distribute the estate without
+    loading every evidence block. Each is UNMEASURED WHEN ABSENT, as every count above it is: the two
+    gate figures where there is no gate to read or its rules were withheld, `unreviewed_substantial`
+    where the policy graded nothing, and `sonar_coverage` where no SonarCloud project resolved, its
+    measures could not be read, or the project sent no coverage metric to read. All four are absent
+    besides on a repository this window could not be reported for at all, which is the branch
+    carrying `detail`. None of the four is zero by default.
     """
 
     repository: str
@@ -207,6 +218,10 @@ class RepositoryRow(EvidenceModel):
     currently_open: NonNegativeInt | None = None
     stale_open: NonNegativeInt | None = None
     finding_occurrences: NonNegativeInt | None = None
+    required_approving_reviews: NonNegativeInt | None = None
+    required_status_checks: NonNegativeInt | None = None
+    unreviewed_substantial: UnreviewedSubstantialOutcome | None = None
+    sonar_coverage: NonNegativeFloat | None = None
     detail: str | None = None
 
 
@@ -784,6 +799,23 @@ State = Annotated[ServiceState, Depends(service_state)]
 Bundle = Annotated[ReportBundle, Depends(requested_bundle)]
 
 
+def readable_gate(report: MergeGateReport) -> MergeGateEvidence | None:
+    """Return the gate whose rules can be read as configuration, or nothing where they cannot.
+
+    The precedence is the one `ReadinessPolicy.governance` reads a gate in, which is why only two
+    cases are withheld: a gate nobody collected, and a protected branch whose rules GitHub did not
+    disclose. The second is evidence of nothing — reporting it as a branch requiring no review would
+    blame a missing permission on the team that owns the repository.
+
+    An UNPROTECTED default branch is returned rather than withheld, because it is an observed fact:
+    it enforces nothing whatever rules ride with it, so its caller reports 0 rather than nothing.
+    """
+    gate = report.gate
+    if gate is None or (gate.protected and not gate.rules_observed):
+        return None
+    return gate
+
+
 def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
     """Summarise one repository for a list, saying why instead when the window has no evidence.
 
@@ -800,6 +832,11 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
             detail=bundle.unavailable[repository],
         )
     summary = evidence.open_pull_requests.summary
+    gate = readable_gate(evidence.merge_gate)
+    # 0 on an unprotected branch and the rules' own figures on a protected one, so that a branch
+    # anybody can push to is counted as requiring nothing rather than as unknown.
+    enforcing = gate is not None and gate.protected
+    measures = evidence.sonar.measures
     return RepositoryRow(
         repository=repository,
         team=evidence.team,
@@ -813,6 +850,12 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
         # Occurrences rather than findings, as `blocking` counts them: two rules each reporting six
         # merges is twelve occurrences, and counting findings would flatter the repository.
         finding_occurrences=sum(item.occurrences for item in evidence.behaviour),
+        required_approving_reviews=None if gate is None else gate.required_approvals if enforcing else 0,
+        required_status_checks=None if gate is None else len(gate.required_contexts) if enforcing else 0,
+        # Carried as the policy graded it, absent included: the block's own field already says that
+        # absent means nothing was graded rather than that nothing was found.
+        unreviewed_substantial=evidence.unreviewed_substantial,
+        sonar_coverage=None if measures is None else measures.coverage,
     )
 
 

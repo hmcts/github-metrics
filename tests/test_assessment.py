@@ -38,6 +38,7 @@ from metrics.domain import (
     ReviewState,
     StatusCheck,
     StatusChecksRule,
+    UnreviewedSubstantialOutcome,
 )
 
 
@@ -988,6 +989,87 @@ def test_a_trivial_unreviewed_merge_does_not_count_as_substantial() -> None:
     assert detail(assessment, "substantial-changes-reviewed") == (
         "substantial merges with no independent human review: 0 of 19 (0%), within the maximum of 1% or 0 merges"
     )
+
+
+def test_no_unreviewed_substantial_merge_is_reported_apart_from_an_allowance_forgiving_one() -> None:
+    """Separate a window where nothing merged unreviewed from one the allowance forgave."""
+    clean = compliant_facts(20)
+    forgiven = facts(
+        *(pull_request(number, reviewed=True) for number in range(1, 249)),
+        *(pull_request(number, reviewed=False) for number in range(249, 251)),
+    )
+
+    assert policy().unreviewed_substantial_outcome(clean) is UnreviewedSubstantialOutcome.NONE
+    assert policy().unreviewed_substantial_outcome(forgiven) is UnreviewedSubstantialOutcome.WITHIN
+    # Read against the condition either projection came from, as the ABOVE case is: the two share one
+    # arithmetic, so a change splitting them apart has to fail here rather than in one direction only.
+    assert ", within the maximum of" in detail(policy().assess(clean, gate()), "substantial-changes-reviewed")
+    assert detail(policy().assess(forgiven, gate()), "substantial-changes-reviewed") == (
+        "substantial merges with no independent human review: 2 of 250 (0.8%), within the maximum of 1% or 0 merges"
+    )
+
+
+def test_unreviewed_substantial_merging_above_the_allowance_is_reported_as_above() -> None:
+    """Project the same verdict the condition reaches, from the same counts."""
+    cohort = facts(
+        *(pull_request(number, reviewed=True) for number in range(1, 20)),
+        pull_request(20, reviewed=False),
+    )
+
+    assert policy().unreviewed_substantial_outcome(cohort) is UnreviewedSubstantialOutcome.ABOVE
+    assert detail(policy().assess(cohort, gate()), "substantial-changes-merged-unreviewed") == (
+        "substantial merges with no independent human review: 1 of 20 (5%), above the maximum of 1% or 0 merges"
+    )
+
+
+def test_a_cohort_too_thin_to_grade_projects_no_unreviewed_substantial_outcome() -> None:
+    """Report nothing where the policy suppressed every behavioural condition.
+
+    A window below `minimum_merges` was not graded on this or anything else, and returning a pass
+    for it would report an unmeasured repository as a clean one.
+    """
+    cohort = facts(pull_request(1, reviewed=False))
+
+    assert policy().unreviewed_substantial_outcome(cohort) is None
+    assert tuple(item.condition for item in policy().assess(cohort, gate()).blocking) == ("insufficient-merges",)
+
+
+def test_a_window_holding_no_substantial_merge_projects_no_outcome() -> None:
+    """Report nothing where there was no denominator, however large the cohort.
+
+    The one window the condition and the projection READ differently, and deliberately: with nothing
+    substantial to forgive the condition is clear, while a projection that said `none` would report
+    an unmeasured window as a clean one to a reader who cannot see the detail below.
+    """
+    cohort = facts(*(pull_request(number, reviewed=False, substantial=False) for number in range(1, 21)))
+
+    assert policy().unreviewed_substantial_outcome(cohort) is None
+    assert detail(policy().assess(cohort, gate()), "substantial-changes-reviewed") == (
+        "substantial merges with no independent human review: 0 of 0 (0%), within the maximum of 1% or 0 merges"
+    )
+
+
+def test_the_absolute_allowance_is_projected_as_within_too() -> None:
+    """Read either allowance as forgiving, as the condition does."""
+    cohort = facts(
+        *(pull_request(number, reviewed=True) for number in range(1, 19)),
+        *(pull_request(number, reviewed=False) for number in range(19, 21)),
+    )
+    tolerant = AssessmentConfiguration.model_validate(
+        {"unreviewed-substantial-merges": {"maximum_count": 2, "maximum_percentage": 1}},
+    )
+
+    assert policy(tolerant).unreviewed_substantial_outcome(cohort) is UnreviewedSubstantialOutcome.WITHIN
+
+
+def test_an_unreviewed_direct_commit_counts_towards_the_projected_outcome() -> None:
+    """Count a substantial push straight to the default branch, which no review could have caught."""
+    cohort = facts(
+        *(pull_request(number, reviewed=True) for number in range(1, 20)),
+        direct_commits=(direct_commit(20),),
+    )
+
+    assert policy().unreviewed_substantial_outcome(cohort) is UnreviewedSubstantialOutcome.ABOVE
 
 
 def test_configured_thresholds_decide_the_label_rather_than_fixed_code() -> None:

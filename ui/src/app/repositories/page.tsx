@@ -9,7 +9,13 @@ import { RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTabl
 import { Panel, Section } from '@/components/Section';
 import { SummaryPieChart } from '@/components/charts/SummaryPieChart';
 import { getOverview, getRepositories, getWindows } from '@/lib/api';
-import { distributionSlices } from '@/lib/chart';
+import {
+  checksSlices,
+  coverageSlices,
+  distributionSlices,
+  reviewSlices,
+  unreviewedSlices,
+} from '@/lib/chart';
 import { count, span } from '@/lib/format';
 import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
 
@@ -80,11 +86,37 @@ export default async function RepositoriesPage({
         </div>
       </Panel>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {/* Five donuts over the same estate, so each one's total is the number of repositories
+          configured — including the ones nothing could be measured on, which are counted in an
+          unknown slice rather than dropped. None of them is filtered by the search box below, for
+          the reason the readiness donut never was: they describe the estate, not the table. */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <SummaryPieChart
           title="Readiness labels"
-          data={distributionSlices(overview.labels)}
-          tooltip="How many repositories carry each readiness label at this span. Repositories the span could not be reported for carry no label and are counted as not reported instead."
+          // `overview.labels` distributes the reported repositories only, so the unreportable ones
+          // are added here: without them this donut would total less than the four beside it.
+          data={distributionSlices(overview.labels, overview.unavailable)}
+          tooltip="How many repositories carry each readiness label at this span. Repositories the span could not be reported for carry no label and are counted as not assessed instead."
+        />
+        <SummaryPieChart
+          title="Enforces review"
+          data={reviewSlices(repositories)}
+          tooltip="How many approving reviews each repository's merge gate requires on its default branch: multiple is two or more, required is one. An unprotected branch is counted as not required, because its gate was read and it requires nothing. Unknown is a repository whose gate was not collected, whose branch is protected and whose rules GitHub withheld, or that this span could not be reported for at all."
+        />
+        <SummaryPieChart
+          title="Enforces CI"
+          data={checksSlices(repositories)}
+          tooltip="Whether each repository's merge gate requires any status check to pass on its default branch. This is the configuration: it says a check is required, not which check it is or whether it passed. Unknown is a repository whose gate was not collected, whose branch is protected and whose rules GitHub withheld, or that this span could not be reported for at all."
+        />
+        <SummaryPieChart
+          title="Unreviewed substantial merges"
+          data={unreviewedSlices(repositories)}
+          tooltip="How the readiness policy graded each repository's substantial merges that reached the default branch without independent review. Within allowance means some merged unreviewed and the allowance the policy was configured with forgives them. Unknown is a repository with too few merges to grade, a window holding no substantial merge, an assessment that is switched off, or a span that could not be reported for at all."
+        />
+        <SummaryPieChart
+          title="Test coverage"
+          data={coverageSlices(repositories)}
+          tooltip="The line coverage each repository's SonarCloud project reports, banded where the repository's own page bands it. Unknown is a repository that resolved to no SonarCloud project, one whose measures could not be read, one whose project sent no coverage metric, or one this span could not be reported for at all — and never a project reporting 0%."
         />
       </div>
 

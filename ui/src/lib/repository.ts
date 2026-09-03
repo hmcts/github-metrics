@@ -153,8 +153,8 @@ export function excludedDetail(cohort: CohortSummary): string {
  *
  * The rules are FLATTENED, not summarised away: GitHub can answer with several pull-request rules
  * and several status-check rulesets for one branch, so the required approvals are the strictest of
- * them and the required contexts are all of them, which is what actually has to be satisfied to
- * merge. `unmodelled_rules` is printed for the same reason the JSON carries it — a limitation the
+ * them and the required contexts are all of them, each named once, which is what actually has to be
+ * satisfied to merge. `unmodelled_rules` is printed for the same reason the JSON carries it — a limitation the
  * contract admits and the page hides is worse than one neither admits.
  *
  * No gate means no rows: the block carries the reason instead, and the page prints that rather than
@@ -162,9 +162,12 @@ export function excludedDetail(cohort: CohortSummary): string {
  */
 export function mergeGateRows(gate: MergeGateEvidence): LabelledValue[] {
   const required = Math.max(0, ...gate.pull_requests.map((rule) => rule.required_approving_review_count));
-  const contexts = gate.status_checks.flatMap((rule) =>
-    rule.required_status_checks.map((check) => check.context),
-  );
+  // DISTINCT contexts, matching `MergeGateEvidence.required_contexts`: two rulesets both demanding
+  // `build` demand one check, so naming it twice would print a row the text report does not and
+  // count a check the estate donut does not.
+  const contexts = [
+    ...new Set(gate.status_checks.flatMap((rule) => rule.required_status_checks.map((check) => check.context))),
+  ];
   const dismissed = gate.pull_requests.some((rule) => rule.dismiss_stale_reviews_on_push);
   // A protected branch whose rules GitHub WITHHELD arrives with the same empty rule arrays as one
   // that carries no rules at all — `inventory.merge_gate_without_rule_details` builds both, and

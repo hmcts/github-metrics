@@ -28,6 +28,7 @@ from metrics.domain import (
     OpenPullRequestReport,
     OpenPullRequestSnapshot,
     OpenPullRequestSummary,
+    PullRequestRule,
     RateObservation,
     ReadinessLabel,
     RepositoryInventoryIssue,
@@ -45,6 +46,8 @@ from metrics.domain import (
     SonarReport,
     SonarResolution,
     SourceCoverage,
+    StatusCheck,
+    StatusChecksRule,
     StoredSonarMapping,
     TrendDelta,
     TrendMetric,
@@ -108,6 +111,80 @@ def test_merge_gate_report_requires_a_gate_or_the_reason_there_is_none(fields: d
     """Refuse a merge gate block that is silently empty, or that both reports and disclaims a gate."""
     with pytest.raises(ValidationError, match="either a gate or the reason it is unavailable"):
         MergeGateReport.model_validate(fields)
+
+
+def merge_gate(
+    pull_requests: tuple[PullRequestRule, ...] = (),
+    status_checks: tuple[StatusChecksRule, ...] = (),
+) -> MergeGateEvidence:
+    """Return a protected gate carrying the rules under test and nothing else."""
+    return MergeGateEvidence(
+        branch="main",
+        protected=True,
+        pull_requests=pull_requests,
+        status_checks=status_checks,
+        restricts_deletions=False,
+        blocks_force_pushes=False,
+        rules_observed=True,
+    )
+
+
+def review_rule(count: int) -> PullRequestRule:
+    """Return a pull-request rule requiring `count` approving reviews and nothing else."""
+    return PullRequestRule(
+        dismiss_stale_reviews_on_push=False,
+        require_code_owner_review=False,
+        require_last_push_approval=False,
+        required_approving_review_count=count,
+        required_review_thread_resolution=False,
+    )
+
+
+def checks_rule(*contexts: str) -> StatusChecksRule:
+    """Return a status-check rule requiring `contexts` in the order given."""
+    return StatusChecksRule(
+        strict_required_status_checks_policy=False,
+        required_status_checks=tuple(StatusCheck(context=context) for context in contexts),
+    )
+
+
+@pytest.mark.parametrize(
+    ("counts", "required"),
+    [((), 0), ((0,), 0), ((1,), 1), ((2,), 2), ((1, 2), 2), ((2, 1), 2), ((0, 1, 3, 2), 3)],
+)
+def test_a_gate_requires_the_strictest_approval_count_any_of_its_rules_demands(
+    counts: tuple[int, ...],
+    required: int,
+) -> None:
+    """Report the count a merge actually has to satisfy, which is the strictest rule's, not the first."""
+    assert merge_gate(pull_requests=tuple(review_rule(count) for count in counts)).required_approvals == required
+
+
+def test_a_gate_with_no_pull_request_rule_requires_no_approval_rather_than_nothing() -> None:
+    """Report 0 for a gate stating no review rule, which `rules_observed` separates from unseen rules."""
+    assert merge_gate().required_approvals == 0
+
+
+@pytest.mark.parametrize(
+    ("rules", "contexts"),
+    [
+        ((), ()),
+        ((checks_rule(),), ()),
+        ((checks_rule("build"),), ("build",)),
+        ((checks_rule("lint", "build"),), ("lint", "build")),
+        ((checks_rule("lint"), checks_rule("build", "test")), ("lint", "build", "test")),
+        # Two rulesets demanding the same check demand one check, so it is named once.
+        ((checks_rule("build"), checks_rule("build")), ("build",)),
+        ((checks_rule("lint", "build"), checks_rule("build", "test")), ("lint", "build", "test")),
+        ((checks_rule("build", "build"),), ("build",)),
+    ],
+)
+def test_a_gate_names_every_required_context_across_its_rules_in_rule_order(
+    rules: tuple[StatusChecksRule, ...],
+    contexts: tuple[str, ...],
+) -> None:
+    """Gather the contexts of every ruleset, unsorted and once each, leaving the sort to the caller."""
+    assert merge_gate(status_checks=rules).required_contexts == contexts
 
 
 @pytest.mark.parametrize(

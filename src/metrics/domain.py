@@ -346,6 +346,33 @@ class MergeGateEvidence(EvidenceModel):
     restricts_branch_names: bool = False
     unmodelled_rules: tuple[str, ...] = ()
 
+    @property
+    def required_approvals(self) -> int:
+        """Return the strictest approval count any rule demands, and 0 where no rule demands one.
+
+        Several rules can apply to one branch and the strictest of them is what a merge actually
+        has to satisfy, so the maximum is the figure to report. 0 means no rule required a review,
+        which `rules_observed` — not this property — separates from nobody having been allowed to
+        look.
+        """
+        return max((rule.required_approving_review_count for rule in self.pull_requests), default=0)
+
+    @property
+    def required_contexts(self) -> tuple[str, ...]:
+        """Return each DISTINCT status-check context the rules require, in the order first stated.
+
+        One entry per context, because two rulesets both demanding `build` demand one check and a
+        caller counting the contexts would otherwise report two. The classic protection path already
+        collapses its own duplicates, so this is what makes the two collection routes report the same
+        gate the same way.
+
+        Unsorted on purpose: callers that show the contexts to a reader sort them there, and the
+        count is the same either way.
+        """
+        return tuple(
+            dict.fromkeys(check.context for rule in self.status_checks for check in rule.required_status_checks),
+        )
+
 
 class MergeGateReport(EvidenceModel):
     """Report one repository's stored merge gate, or why there is none to show.
@@ -1021,6 +1048,27 @@ class ReadinessAssessment(EvidenceModel):
     clear: tuple[ReadinessCondition, ...]
 
 
+class UnreviewedSubstantialOutcome(StrEnum):
+    """Say where a window's unreviewed substantial merging sat against its allowance.
+
+    This PROJECTS the judgement `ReadinessPolicy.unreviewed_substantial` already makes; it adds no
+    judgement of its own and shares that condition's arithmetic, so the two cannot GRADE one window
+    differently. It exists because the figure lived only inside the wording of a condition's detail,
+    and a consumer that wanted the verdict had to parse a sentence to get it.
+
+    Where the two READ differently is a window holding no substantial merge at all: the condition is
+    clear, having nothing to forgive, and this is absent, having no denominator to report a verdict
+    over. Absent is deliberately not `NONE` there — see `unreviewed_substantial_outcome`.
+
+    `WITHIN` is not a pass and not a failure: it is the allowance forgiving what it was configured to
+    forgive, which is a different fact from nothing having merged unreviewed at all.
+    """
+
+    NONE = "none"
+    WITHIN = "within"
+    ABOVE = "above"
+
+
 class RateObservation(EvidenceModel):
     """Describe an aggregate rate without assigning a target or judgment."""
 
@@ -1228,6 +1276,11 @@ class RepositoryPracticeEvidence(EvidenceModel):
     `metrics` holds the nine neutral aggregates over this repository's whole cohort, which the
     readable report has always shown and the JSON did not carry. They are the same figures a
     `--metric` drill-down emits, computed once and shared, so the two renderings cannot diverge.
+
+    `unreviewed_substantial` carries the policy's verdict on unreviewed substantial merging, which
+    otherwise exists only inside the wording of one assessment condition. Absent means the POLICY
+    GRADED NOTHING — the assessment is disabled, the cohort is too thin to grade, or the window held
+    no substantial merge to measure — and never that nothing was found merged unreviewed.
     """
 
     repository: str
@@ -1237,6 +1290,7 @@ class RepositoryPracticeEvidence(EvidenceModel):
     provenance: WindowProvenance
     cohort: CohortSummary
     assessment: ReadinessAssessment | None = None
+    unreviewed_substantial: UnreviewedSubstantialOutcome | None = None
     merge_gate: MergeGateReport
     open_pull_requests: OpenPullRequestReport
     security: SecurityAlertReport

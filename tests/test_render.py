@@ -503,6 +503,23 @@ def test_the_gate_reports_its_rules_and_the_instant_it_was_read(report: str) -> 
     assert "  Dismiss stale reviews on push  no" in report
 
 
+def test_a_context_two_rulesets_both_require_is_named_once() -> None:
+    """Print one entry per required check, so a check demanded twice does not read as two checks."""
+    stored = gate_report()
+    gate = stored.gate
+    assert gate is not None
+    duplicated = stored.model_copy(
+        update={"gate": gate.model_copy(update={"status_checks": (*gate.status_checks, *gate.status_checks)})},
+    )
+    rendered = render_practice_report(
+        practice_report(practice_evidence(merge_gate=duplicated)),
+        {"cath-service": drill_down()},
+        teams(),
+    )
+
+    assert "  Required status checks         build\n" in rendered
+
+
 def test_undisclosed_gate_enforcement_is_not_rendered_as_a_bypass(report: str) -> None:
     """Never present an unobservable field as a gate administrators can bypass."""
     assert "  Applies to administrators      not disclosed" in report

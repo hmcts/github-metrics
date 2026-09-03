@@ -1378,7 +1378,11 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   a cache the service cannot read must fail while a human is watching.
   THE THREE ESTATE LISTS ARE ROUTES, NOT SECTIONS OF ONE PAGE (2026-09-02). `/repositories` is the
   landing page and carries what the overview carried — the organisation header, the four estate
-  figures and the readiness donut — while `/contributors` and `/teams` carry the same header above
+  figures and the readiness donut, joined on 2026-09-03 by four more donuts (enforced review,
+  enforced CI, unreviewed substantial merging and test coverage) drawn off the `/repositories` rows'
+  own fields, each counting EVERY configured repository at the span with an unknown band for the ones
+  nothing could be read for, and none of the five filtered by the search box, because a picture that
+  moved with a filter would still be read as the estate — while `/contributors` and `/teams` carry the same header above
   their own list and nothing else; `/` redirects to `/repositories`, carrying `?weeks=` through so a
   link to the old landing page does not silently change the window. THE NAV BAR'S OWN THREE LINKS
   CANNOT CARRY THE SPAN — the layout renders that bar and a layout is handed no search parameters —

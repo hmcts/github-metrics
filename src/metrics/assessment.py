@@ -51,6 +51,7 @@ from metrics.domain import (
     ReadinessAssessment,
     ReadinessCondition,
     ReadinessLabel,
+    UnreviewedSubstantialOutcome,
 )
 
 
@@ -135,7 +136,7 @@ class ReadinessPolicy:
 
     def review_requirement(self, gate: MergeGateEvidence) -> Judgement:
         """Judge whether the gate requires an approving review, which is the first veto."""
-        required = max((rule.required_approving_review_count for rule in gate.pull_requests), default=0)
+        required = gate.required_approvals
         if not required:
             return self.blocking(
                 "pull-request-review-not-required",
@@ -153,7 +154,7 @@ class ReadinessPolicy:
         A caution rather than a veto: `checks-passing-at-merge` measures whether CI actually held at
         the merge point, which is the stronger signal than whether a rule nominally demanded it.
         """
-        contexts = tuple(check.context for rule in gate.status_checks for check in rule.required_status_checks)
+        contexts = gate.required_contexts
         if not contexts:
             return self.caution(
                 "status-checks-not-required",
@@ -298,13 +299,20 @@ class ReadinessPolicy:
             self.branch_names(gate),
         )
 
-    def sample(self, cached: CachedBehaviourFacts) -> Judgement:
-        """Judge whether the cohort is large enough to show a pattern at all.
+    def sufficient(self, cached: CachedBehaviourFacts) -> bool:
+        """Report whether the cohort holds enough merges for a pattern to be read from it.
 
         Counted over both routes onto the default branch. A repository doing most of its work in
         direct commits has plenty of evidence to grade, and counting merged pull requests alone
         would report it as unassessable precisely where the bypass is worst.
+
+        Shared with `sample` so that the condition saying a window was not graded and every
+        projection of what it was graded as read one arithmetic rather than two.
         """
+        return len(cached.pull_requests) + len(cached.direct_commits) >= self.configuration.minimum_merges
+
+    def sample(self, cached: CachedBehaviourFacts) -> Judgement:
+        """Judge whether the cohort is large enough to show a pattern at all."""
         merged = len(cached.pull_requests)
         commits = len(cached.direct_commits)
         reported = merged + commits
@@ -312,7 +320,7 @@ class ReadinessPolicy:
         measured = (
             f"merges into the default branch: {reported} ({merged} merged pull requests and {commits} direct commits)"
         )
-        if reported < minimum:
+        if not self.sufficient(cached):
             return self.blocking(
                 "insufficient-merges",
                 ReadinessLabel.CANNOT_ASSESS,
@@ -441,30 +449,49 @@ class ReadinessPolicy:
         """Report whether one merge is too large to be treated as trivial."""
         return size_class(change, self.triviality.maximum_lines, self.triviality.maximum_files) == "substantial"
 
-    def unreviewed_substantial(self, cached: CachedBehaviourFacts) -> Judgement:
-        """Contrast substantial merges made unreviewed against every substantial merge.
+    def unreviewed_substantial_counts(self, cached: CachedBehaviourFacts) -> tuple[int, int, float]:
+        """Count the substantial merges made unreviewed, every substantial merge, and the percentage.
 
         Counted from facts rather than from the `unreviewed-merge` rule's findings, so disabling that
-        rule cannot turn an unmeasured count into a passing one. Amber rather than red on its own: the
-        coverage rate is what shows a systemic failure, and this stops a green without duplicating it.
+        rule cannot turn an unmeasured count into a passing one.
 
-        Graded against a proportional allowance and an absolute one, and clear when EITHER forgives
-        it. A count alone cannot separate a lapse from a habit — the same two unreviewed merges are
-        noise against 246 and a pattern against 20 — so `maximum_percentage` carries the judgement
-        and `maximum_count` is the floor that keeps a thin cohort from being condemned by
-        arithmetic. The percentage compared is the rounded one the detail reports, so a reader can
-        never see a figure that appears to sit inside a boundary it was judged outside of.
+        The percentage is rounded HERE, once, because it is both the figure the condition's detail
+        reports and the figure the allowance is tested against. Rounding it twice would let a reader
+        see a number that appears to sit inside a boundary it was judged outside of.
         """
         merged = tuple(pull_request for pull_request in cached.pull_requests if self.substantial(pull_request))
         pushed = tuple(commit for commit in cached.direct_commits if self.substantial(commit))
         # Every substantial direct commit is unreviewed: there was no pull request to review it.
         unreviewed = sum(not eligible_reviews(pull_request) for pull_request in merged) + len(pushed)
         merges = len(merged) + len(pushed)
+        return unreviewed, merges, round(unreviewed / merges * 100, 1) if merges else 0.0
+
+    def within_unreviewed_allowance(self, unreviewed: int, percentage: float) -> bool:
+        """Report whether either allowance forgives the unreviewed substantial merges counted.
+
+        A proportional allowance and an absolute one, forgiving when EITHER holds. A count alone
+        cannot separate a lapse from a habit — the same two unreviewed merges are noise against 246
+        and a pattern against 20 — so `maximum_percentage` carries the judgement and `maximum_count`
+        is the floor that keeps a thin cohort from being condemned by arithmetic.
+        """
         thresholds = self.configuration.unreviewed_substantial_merges
-        percentage = round(unreviewed / merges * 100, 1) if merges else 0.0
+        return percentage <= thresholds.maximum_percentage or unreviewed <= thresholds.maximum_count
+
+    def unreviewed_substantial(self, cached: CachedBehaviourFacts) -> Judgement:
+        """Contrast substantial merges made unreviewed against every substantial merge.
+
+        Amber rather than red on its own: the coverage rate is what shows a systemic failure, and
+        this stops a green without duplicating it.
+
+        The counts, the percentage and the allowance test are shared with
+        `unreviewed_substantial_outcome`, which projects this verdict for a consumer that would
+        otherwise have to read it out of the sentence below.
+        """
+        unreviewed, merges, percentage = self.unreviewed_substantial_counts(cached)
+        thresholds = self.configuration.unreviewed_substantial_merges
         measured = f"substantial merges with no independent human review: {unreviewed} of {merges} ({percentage:g}%)"
         boundary = f"{thresholds.maximum_percentage:g}% or {thresholds.maximum_count} merges"
-        if percentage <= thresholds.maximum_percentage or unreviewed <= thresholds.maximum_count:
+        if self.within_unreviewed_allowance(unreviewed, percentage):
             return self.clear(
                 "substantial-changes-reviewed",
                 f"{measured}, within the maximum of {boundary}",
@@ -474,6 +501,28 @@ class ReadinessPolicy:
             ReadinessLabel.AMBER,
             f"{measured}, above the maximum of {boundary}",
         )
+
+    def unreviewed_substantial_outcome(self, cached: CachedBehaviourFacts) -> UnreviewedSubstantialOutcome | None:
+        """Project the verdict `unreviewed_substantial` reaches, or nothing where it graded nothing.
+
+        Nothing on a cohort below `minimum_merges`, whose behavioural conditions are suppressed
+        entirely rather than graded, and nothing on a window holding no substantial merge, where
+        there was no denominator to judge. Both are unmeasured, and an unmeasured thing must never be
+        reported as a pass — the reader of a projection cannot see the detail that would say so.
+
+        `NONE` is kept apart from `WITHIN` because they are different facts: nothing merged
+        unreviewed, against an allowance forgiving what it was configured to forgive.
+        """
+        if not self.sufficient(cached):
+            return None
+        unreviewed, merges, percentage = self.unreviewed_substantial_counts(cached)
+        if not merges:
+            return None
+        if not unreviewed:
+            return UnreviewedSubstantialOutcome.NONE
+        if self.within_unreviewed_allowance(unreviewed, percentage):
+            return UnreviewedSubstantialOutcome.WITHIN
+        return UnreviewedSubstantialOutcome.ABOVE
 
     def behaviour(self, cached: CachedBehaviourFacts) -> tuple[Judgement, ...]:
         """Judge observed behaviour, or state that the window holds too little to judge.

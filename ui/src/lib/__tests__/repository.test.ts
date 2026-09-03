@@ -172,6 +172,21 @@ describe('mergeGateRows', () => {
     expect(value(rows, 'Required status checks')).toBe('build, sonar');
   });
 
+  it('names a context two rulesets both require once, as the text report does', () => {
+    const rows = mergeGateRows(
+      gate({
+        status_checks: [
+          { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'build' }] },
+          {
+            strict_required_status_checks_policy: false,
+            required_status_checks: [{ context: 'build' }, { context: 'sonar' }],
+          },
+        ],
+      }),
+    );
+    expect(value(rows, 'Required status checks')).toBe('build, sonar');
+  });
+
   it('says none rather than nothing where a branch requires no check and no rule was unmodelled', () => {
     const rows = mergeGateRows(gate());
     expect(value(rows, 'Required status checks')).toBe('none');

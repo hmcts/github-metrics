@@ -15,6 +15,11 @@ const config: Config = {
           amber: '#fbbf24',
           green: '#4ade80',
           none: '#64748b',
+          // A CHART MARK ONLY, and named here so the five colours the site draws with are one list.
+          // No class reads it: the one band it fills — a gate requiring two or more approvals — is
+          // better than the green beside it rather than a fifth verdict, and nothing outside a donut
+          // legend makes that distinction.
+          'green-strong': '#16a34a',
         },
         accent: '#818cf8',
       },

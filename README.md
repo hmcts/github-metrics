@@ -1418,6 +1418,42 @@ The endpoints are `/healthz`, `/windows`, `/overview`, `/repositories`,
 `/teams/{team}`; every data endpoint takes `?weeks=` and refuses a span off the list rather than clamping it. A request
 naming no span gets four weeks, or the longest span the configuration allows below that.
 
+A `/repositories` row is the repository, the team that owns it, its readiness label and the counts the list's columns
+print. Since 2026-09-03 it carries four more the columns do not print, added for the estate donuts above the table:
+`required_approving_reviews` and `required_status_checks` off the merge gate, `unreviewed_substantial` off the evidence
+block's field of the same name, and `sonar_coverage` off `sonar.measures.coverage`. All four are optional and absent
+means unmeasured, as every other count on the row does — none of them defaults to zero, so a repository with no
+SonarCloud project resolved reads as unknown rather than as a project reporting no coverage.
+
+The two gate fields are read in the precedence `ReadinessPolicy.governance` reads a gate in, which is what decides
+whether a repository lands in the red slice of a donut or the grey one:
+
+1. no gate collected — both absent;
+2. `protected` false — both `0`, whatever else the gate says: a branch anybody can push to enforces nothing, and that
+   is an observed fact rather than a gap;
+3. `protected` true and `rules_observed` false — both absent. A protected branch whose rules GitHub withheld is
+   evidence of nothing, and reporting it as requiring no review would blame a missing permission on the team that owns
+   the repository;
+4. otherwise the strictest `required_approving_review_count` across the gate's rules, and how many **distinct**
+   required status-check contexts its rulesets name — two rulesets both demanding `build` demand one check.
+
+So an unprotected branch reads as **not required** and a protected branch with withheld rules reads as **unknown**. The
+figures themselves are the `required_approvals` and `required_contexts` properties on the gate, which `metrics evidence`
+already prints the same two figures from, so the page and the text report cannot disagree about one gate.
+
+`unreviewed_substantial` is a field on each repository's evidence block too, carrying the readiness policy's verdict on
+substantial merges that reached the default branch with no independent review: `none` where nothing merged unreviewed,
+`within` where the allowance forgives what did, and `above` where it does not. It projects the judgement the
+`substantial-changes-reviewed` / `substantial-changes-merged-unreviewed` condition already makes and shares that
+condition's counts, percentage and allowance test, so the two cannot grade one window differently; the verdict
+previously existed only inside the wording of that condition's detail, and a consumer that wanted it had to parse a
+sentence. `within` is not a pass and not a failure — it is the allowance doing what it was configured for, which is a
+different fact from nothing having merged unreviewed at all. Absent means **the policy graded nothing**: the assessment
+is disabled, the cohort is below `minimum_merges` and its behavioural conditions are suppressed, or the window held no
+substantial merge to be a denominator. It never means nothing was found. That last case is the one place the field and
+the condition read differently rather than grading differently: with no substantial merge there is nothing to forgive,
+so the condition is clear while the field stays absent, because an unmeasured window must not be projected as a pass.
+
 An `/actors` row is a `login`, the number of `repositories` that login appears in, and `labels` — the **distinct**
 readiness labels of the repositories the report counts for them, best first, which since 2026-09-02 is what the
 dashboard's readiness column shows and sorts on. It lists what the repositories already carry and combines nothing:

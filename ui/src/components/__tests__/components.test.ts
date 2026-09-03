@@ -565,6 +565,26 @@ describe('the loading skeletons', () => {
   });
 
   /**
+   * A bone per donut, and the row that wraps them — five on the landing page, one on a team's.
+   *
+   * The count is the whole point of the shape: a single bone where five charts are about to land
+   * leaves the table below it jumping down the page as they arrive, which is exactly what the
+   * loading boundary exists to prevent. The wider grid is asserted with it, because a row of five
+   * drawn one-up at every width is not the page it is standing in for either.
+   */
+  it('draws a bone per donut the page is about to hold, in the grid that page uses', () => {
+    const markup = renderToStaticMarkup(createElement(LoadingRepositories));
+
+    expect(markup.match(/h-48 w-full/g)).toHaveLength(5);
+    expect(markup).toContain('grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4');
+
+    // A team's page opens on one donut, and one keeps the narrower row it always had.
+    const team = renderToStaticMarkup(createElement(LoadingTeam));
+    expect(team.match(/h-48 w-full/g)).toHaveLength(1);
+    expect(team).toContain('grid grid-cols-1 lg:grid-cols-3 gap-4');
+  });
+
+  /**
    * The list routes' skeleton, which the other two of the three lists share.
    *
    * Rendered here as well as the landing page's, because `SkeletonList` is a second shape and not a

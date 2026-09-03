@@ -21,6 +21,15 @@ export type FindingSeverity = 'high' | 'medium' | 'low';
 
 export type SonarGateLevel = 'OK' | 'ERROR' | 'NONE';
 
+/**
+ * Where a window's unreviewed substantial merging sat against the allowance it was judged by.
+ *
+ * `domain.UnreviewedSubstantialOutcome` verbatim. `within` is neither a pass nor a failure: it is the
+ * allowance forgiving what it was configured to forgive, which is a different fact from nothing
+ * having merged unreviewed at all — so the three words are three answers, not a scale of two.
+ */
+export type UnreviewedSubstantialOutcome = 'none' | 'within' | 'above';
+
 export interface RateObservation {
   status: ObservationStatus;
   numerator: number;
@@ -277,6 +286,7 @@ export interface RepositoryPracticeEvidence {
   provenance: WindowProvenance;
   cohort: CohortSummary;
   assessment?: ReadinessAssessment;
+  unreviewed_substantial?: UnreviewedSubstantialOutcome;
   merge_gate: MergeGateReport;
   open_pull_requests: OpenPullRequestReport;
   security: SecurityAlertReport;
@@ -405,6 +415,18 @@ export interface OverviewSummary {
   labels: Record<string, number>;
 }
 
+/**
+ * One repository in a list, whether this window could be reported for it or not.
+ *
+ * The last four say what the row's own counts cannot, so `/repositories` can distribute the estate
+ * without loading every evidence block. Each is UNMEASURED WHEN ABSENT, as every count above it is:
+ * the two gate figures where there is no gate to read or its rules were withheld,
+ * `unreviewed_substantial` where the policy graded nothing, and `sonar_coverage` where no SonarCloud
+ * project resolved, its measures could not be read, or it sent no coverage metric. All four are
+ * absent besides on a repository the window could not be reported for at all, the row that carries
+ * `detail`. None of the four is zero by default — an unprotected default branch is the one thing that
+ * reads as a real `0`, because the gate was read and it requires nothing.
+ */
 export interface RepositoryRow {
   repository: string;
   team: string;
@@ -414,6 +436,10 @@ export interface RepositoryRow {
   currently_open?: number;
   stale_open?: number;
   finding_occurrences?: number;
+  required_approving_reviews?: number;
+  required_status_checks?: number;
+  unreviewed_substantial?: UnreviewedSubstantialOutcome;
+  sonar_coverage?: number;
   detail?: string;
 }
 

@@ -237,8 +237,8 @@ def render_merge_gate(report: MergeGateReport) -> tuple[str, ...]:
     gate = report.gate
     if gate is None:
         return *heading(title), f"  not available: {report.detail}"
-    required = max((rule.required_approving_review_count for rule in gate.pull_requests), default=0)
-    contexts = tuple(check.context for rule in gate.status_checks for check in rule.required_status_checks)
+    required = gate.required_approvals
+    contexts = gate.required_contexts
     dismissed = any(rule.dismiss_stale_reviews_on_push for rule in gate.pull_requests)
     return (
         *heading(title),

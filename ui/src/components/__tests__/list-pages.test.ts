@@ -41,16 +41,44 @@ const OVERVIEW: OverviewSummary = {
   ends_at: '2026-08-31T00:00:00Z',
   built_at: '2026-08-31T01:00:00Z',
   collected_through: '2026-08-31T00:00:00Z',
-  repositories: 2,
-  unavailable: 0,
+  repositories: 3,
+  unavailable: 1,
   teams: 1,
   actors: 1,
   merged_pull_requests: 9,
   direct_commits: 1,
+  // The reported two only: `label_counts` counts the unreportable repository nowhere, which is why
+  // the readiness donut has to be told how many the span left out.
   labels: { green: 1, amber: 1 },
 };
 
-const REPOSITORIES: RepositoryRow[] = [{ repository: 'api', team: 'platform', readiness: 'green' }];
+/**
+ * Three repositories: one measured well, one measured badly, and one nothing could be read on.
+ *
+ * The third is what the donuts are counted against — no label and every field absent, so each of
+ * the five bands it lands in is the ungraded one and every donut still totals three.
+ */
+const REPOSITORIES: RepositoryRow[] = [
+  {
+    repository: 'api',
+    team: 'platform',
+    readiness: 'green',
+    required_approving_reviews: 2,
+    required_status_checks: 3,
+    unreviewed_substantial: 'none',
+    sonar_coverage: 92.5,
+  },
+  {
+    repository: 'web',
+    team: 'platform',
+    readiness: 'amber',
+    required_approving_reviews: 0,
+    required_status_checks: 0,
+    unreviewed_substantial: 'above',
+    sonar_coverage: 41,
+  },
+  { repository: 'batch', team: 'platform', detail: 'no window could be reported for this repository' },
+];
 
 const ACTORS: ActorRow[] = [{ login: 'ada', repositories: 2, labels: ['green'] }];
 
@@ -208,10 +236,13 @@ describe('the three list routes', () => {
    */
   it('says how many repositories the span reported, where it could not report them all', async () => {
     stubService();
-    const reported = renderToStaticMarkup(
+    // The fixture estate is three repositories with one of them unreportable, which is the row the
+    // donuts are counted against.
+    const partial = renderToStaticMarkup(
       await RepositoriesPage({ searchParams: Promise.resolve({}) }),
     );
-    expect(reported).toContain('all reported');
+    expect(partial).toContain('2 reported');
+    expect(partial).not.toContain('all reported');
 
     requested = [];
     vi.stubGlobal(
@@ -219,17 +250,103 @@ describe('the three list routes', () => {
       vi.fn((url: string) => {
         const body = (() => {
           if (url.includes('/windows')) return WINDOWS;
-          if (url.includes('/overview')) return { ...OVERVIEW, repositories: 12, unavailable: 2 };
+          if (url.includes('/overview')) return { ...OVERVIEW, repositories: 12, unavailable: 0 };
           return REPOSITORIES;
         })();
         return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
       }),
     );
-    const partial = renderToStaticMarkup(
+    const reported = renderToStaticMarkup(
       await RepositoriesPage({ searchParams: Promise.resolve({}) }),
     );
 
-    expect(partial).toContain('10 reported');
-    expect(partial).not.toContain('all reported');
+    expect(reported).toContain('all reported');
+  });
+
+  /** The five donut titles, in the order they are drawn in. */
+  const DONUTS = [
+    'Readiness labels',
+    'Enforces review',
+    'Enforces CI',
+    'Unreviewed substantial merges',
+    'Test coverage',
+  ];
+
+  /**
+   * The legend of one donut, read off the rendered page as the band words and the counts under them.
+   *
+   * The chart canvas is a recharts wedge and says nothing a test can read, so the legend is where the
+   * figures are — which is also where a reader finds them for a band drawn at zero.
+   */
+  function legend(markup: string, title: string): Record<string, number> {
+    const opened = markup.indexOf(`>${title}</h3>`);
+    expect(opened).toBeGreaterThan(-1);
+    const next = markup.indexOf('<h3', opened + 1);
+    const panel = markup.slice(opened, next === -1 ? undefined : next);
+    const bands: Record<string, number> = {};
+    const entries = panel.matchAll(
+      /text-slate-400">([^<]+)<\/span><span class="text-xs text-slate-600 tabular-nums">(\d+)</g,
+    );
+    for (const match of entries) {
+      bands[match[1] ?? ''] = Number(match[2]);
+    }
+    return bands;
+  }
+
+  /**
+   * The five estate donuts, each counting EVERY repository at the span.
+   *
+   * The counts are the point rather than the titles: a donut wired to the wrong slice builder, or one
+   * quietly dropping the rows whose field is absent, renders five headings just the same. So the
+   * unmeasured repository is asserted into each ungraded band, and every donut — the readiness one
+   * included, which is distributed over the REPORTED repositories and has to be told about the rest —
+   * is asserted to total the three the estate holds.
+   */
+  it('draws five donuts over the estate, counting the unmeasured repository in each', async () => {
+    stubService();
+    const markup = renderToStaticMarkup(await RepositoriesPage({ searchParams: Promise.resolve({}) }));
+
+    // Drawn in this order, which is the order the plan states and the order they read in.
+    const positions = DONUTS.map((title) => markup.indexOf(`>${title}</h3>`));
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
+    expect(Math.min(...positions)).toBeGreaterThan(-1);
+    // The grid `SkeletonChart` stands in for while the page is cold, asserted at both ends: the
+    // bones and the charts drawn at different widths is the layout shift the boundary exists to stop.
+    expect(markup).toContain('grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4');
+
+    expect(legend(markup, 'Enforces review')).toEqual({
+      Multiple: 1,
+      Required: 0,
+      'Not required': 1,
+      Unknown: 1,
+    });
+    expect(legend(markup, 'Enforces CI')).toEqual({ Required: 1, 'Not required': 1, Unknown: 1 });
+    expect(legend(markup, 'Unreviewed substantial merges')).toEqual({
+      'None unreviewed': 1,
+      'Within allowance': 0,
+      'Above allowance': 1,
+      Unknown: 1,
+    });
+    expect(legend(markup, 'Test coverage')).toEqual({
+      '90% or more': 1,
+      '80% to under 90%': 0,
+      'Below 80%': 1,
+      Unknown: 1,
+    });
+    expect(legend(markup, 'Readiness labels')).toEqual({
+      Ready: 1,
+      Caution: 1,
+      Blocked: 0,
+      'Cannot assess': 0,
+      'Not assessed': 1,
+    });
+
+    // And each of the five totals the whole estate, which is what counting the unmeasured row into
+    // an ungraded band rather than dropping it buys: the donuts and the table agree on how many
+    // repositories there are.
+    for (const title of DONUTS) {
+      const counts = Object.values(legend(markup, title));
+      expect(counts.reduce((total, value) => total + value, 0)).toBe(REPOSITORIES.length);
+    }
   });
 });

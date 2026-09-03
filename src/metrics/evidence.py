@@ -164,6 +164,10 @@ class RepositoryEvidence(CachedBehaviourFacts):
         `team` and `metrics` arrive from the caller for the same reason the stored blocks do: the
         owning team is configuration and the metric set is built from it, and neither is derivable
         from a repository's cached facts.
+
+        `unreviewed_substantial` is set only where the policy is enabled, beside the assessment it
+        projects: a disabled policy graded nothing, and reporting a verdict it never reached would
+        put a judgement in the block that no condition in it supports.
         """
         return RepositoryPracticeEvidence(
             repository=self.repository,
@@ -173,6 +177,7 @@ class RepositoryEvidence(CachedBehaviourFacts):
             provenance=self.provenance,
             cohort=self.cohort,
             assessment=policy.assess(self, current_state.merge_gate) if policy.enabled else None,
+            unreviewed_substantial=policy.unreviewed_substantial_outcome(self) if policy.enabled else None,
             merge_gate=current_state.merge_gate,
             open_pull_requests=current_state.open_pull_requests,
             security=current_state.security,

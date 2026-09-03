@@ -76,7 +76,7 @@ when it supports 10; `eslint.config.mjs` says the same thing beside the config i
 | Route | What it answers |
 | --- | --- |
 | `/` | nothing of its own: it redirects to `/repositories`, carrying `?weeks=` through where one was given |
-| `/repositories` | the estate at one span: counts, the label distribution, and the repositories to drill into |
+| `/repositories` | the estate at one span: counts, five donuts over every configured repository, and the repositories to drill into |
 | `/teams` | every configured team at that span, with the labels its repositories carry |
 | `/contributors` | everyone who contributed to a reported repository at that span, by the labels their repositories carry |
 | `/repositories/[repository]` | one repository's whole evidence block and its periods since enablement |
@@ -85,6 +85,20 @@ when it supports 10; `eslint.config.mjs` says the same thing beside the config i
 
 The rows are in the order the nav bar puts them, which from 2026-09-02 reads down the estate:
 repositories, the teams that own them, then the people who work in them.
+
+**The donuts on `/repositories` count every configured repository at the span, and the search box does not filter
+them.** They read Readiness labels, Enforces review, Enforces CI, Unreviewed substantial merges, then Test coverage —
+the label distribution off `/overview` and the other four off the rows' four service fields, added on 2026-09-03.
+`/overview`'s distribution covers the repositories the span could REPORT, so `distributionSlices` is handed
+`overview.unavailable` beside it and counts those repositories as not assessed; without that the readiness donut would
+total less than the four next to it and read as a smaller estate. The
+table narrows as a reader types and the pictures above it do not, because a donut that moved with a filter would still
+be read as the estate; the readiness one has always worked that way and the four follow it. Every band is drawn in the
+legend even where it counted nothing, so a legend states the whole scale while the wedge states only what exists, and a
+span with nothing to count says "No data" rather than drawing an empty ring. An unknown slice is always a repository
+nothing could be read for and never one measured at zero, and each donut's tooltip says which absences its own unknown
+covers — for the two gate donuts, that the gate says a check is required rather than which check it is or whether it
+passed.
 
 **The three lists were one page until 2026-09-02**, with the nav pointing at `#repositories`, `#actors` and `#teams`
 anchors down it. They are routes now, so a link names what it lands on and a reader loads the third of the estate they
@@ -185,7 +199,12 @@ proportional face.
 ### Colour
 
 Two palettes, one file: `tailwind.config.ts` names `rag-red #f87171`, `rag-amber #fbbf24`, `rag-green #4ade80`,
-`rag-none #64748b` and `accent #818cf8`. Two modules resolve them, and the split is which of them is judging.
+`rag-green-strong #16a34a`, `rag-none #64748b` and `accent #818cf8`. Two modules resolve them, and the split is which
+of them is judging.
+
+`rag-green-strong` is a chart mark and nothing else: no class reads it, and the one band it fills — a merge gate
+requiring two or more approving reviews — is better than the green beside it rather than a fifth verdict. It is named
+in the config all the same, so the colours the site draws with are one list.
 
 `src/lib/rag.ts` carries the report's own judgement — the four readiness LABELS. `borderClass` for the `border-l-4`
 colour bar, `RAG_LABEL` for the word, `RAG_HEX` for chart marks where a class cannot reach.
@@ -204,7 +223,13 @@ place:
   colour meaning something where there is one.
 - **The threshold lives in `tone.ts` and nowhere else.** No component holds a boundary and no hex literal appears in
   one. Each function names its `assessment.py` counterpart in a comment where one exists, so a page and the policy can
-  be checked against each other by reading them side by side.
+  be checked against each other by reading them side by side. The four donut band tables are there for that reason
+  too — the key, the word and the mark per band, best first, with `lib/chart.ts` only counting rows into them — and
+  `coverageTone` is one function the repository page's Sonar measure and the coverage donut both read, so moving the
+  90/80 boundary moves both.
+- **A chart mark comes from `TONE_HEX`**, which derives from `RAG_HEX` rather than restating the four hexes: recharts
+  takes a fill as a string, so a donut cannot reach a Tailwind class, and a second copy of the palette is how a wedge
+  and the row it counts drift into two greens nobody chose. `STRONG_GOOD_HEX` is the single mark that is not a tone.
 - **Where the policy already graded a figure, the page carries its verdict.** A behaviour metric card takes its tone
   from the assessment condition that graded the metric, so a card can never contradict the CLEAR list above it, and a
   blocking assessment row keeps the readiness label it imposed rather than a second opinion in the same colour.

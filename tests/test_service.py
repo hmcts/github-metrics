@@ -27,12 +27,14 @@ from metrics.domain import (
     EvidenceUnavailable,
     FindingSeverity,
     MaintenanceReport,
+    MergeGateEvidence,
     MergeGateReport,
     ObservationStatus,
     OpenPullRequestReport,
     OpenPullRequestSummary,
     PracticeEvidenceReport,
     PracticeFinding,
+    PullRequestRule,
     RateObservation,
     ReadinessAssessment,
     ReadinessCondition,
@@ -41,10 +43,14 @@ from metrics.domain import (
     RepositoryPracticeEvidence,
     RepositoryTrend,
     SecurityAlertReport,
+    SonarMeasures,
     SonarReport,
     SourceCoverage,
+    StatusCheck,
+    StatusChecksRule,
     TrendPeriod,
     TrendThroughput,
+    UnreviewedSubstantialOutcome,
     WindowProvenance,
 )
 from metrics.service import (
@@ -225,6 +231,51 @@ def open_pull_requests() -> OpenPullRequestReport:
     )
 
 
+def review_rule(count: int) -> PullRequestRule:
+    """Return a pull-request rule requiring `count` approving reviews and nothing else."""
+    return PullRequestRule(
+        dismiss_stale_reviews_on_push=False,
+        require_code_owner_review=False,
+        require_last_push_approval=False,
+        required_approving_review_count=count,
+        required_review_thread_resolution=False,
+    )
+
+
+def checks_rule(*contexts: str) -> StatusChecksRule:
+    """Return a status-check rule requiring the named contexts."""
+    return StatusChecksRule(
+        strict_required_status_checks_policy=False,
+        required_status_checks=tuple(StatusCheck(context=context) for context in contexts),
+    )
+
+
+def protected_gate() -> MergeGateEvidence:
+    """Return an observed gate on a protected branch requiring two approvals and three checks.
+
+    Two pull-request rules of differing strictness and two status-check rulesets, so that a row
+    reporting the strictest approval count and the whole context set is distinguishable from one
+    reporting the first rule it found.
+    """
+    return MergeGateEvidence(
+        branch="main",
+        protected=True,
+        pull_requests=(review_rule(1), review_rule(2)),
+        status_checks=(checks_rule("build", "test"), checks_rule("lint")),
+        restricts_deletions=True,
+        blocks_force_pushes=True,
+        rules_observed=True,
+    )
+
+
+def sonar_report(coverage: float | None) -> SonarReport:
+    """Return a Sonar block whose measures carry that coverage, or none where SonarCloud reported none."""
+    return SonarReport(
+        fetched_at=ends_at(),
+        measures=SonarMeasures(project_key="hmcts_cath-service", coverage=coverage),
+    )
+
+
 def practice_evidence(repository: str, team: str, **overrides: object) -> RepositoryPracticeEvidence:
     """Build one repository's practice evidence, overriding selected blocks."""
     evidence = RepositoryPracticeEvidence(
@@ -390,6 +441,32 @@ def client(tmp_path: Path, loader: Loader, series: Series) -> Iterator[TestClien
     settings = configuration(tmp_path)
     with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
         yield connected
+
+
+Listing = Callable[..., dict[str, object]]
+"""Serve the repository list over a report whose cath-service block carries the given overrides."""
+
+
+@pytest.fixture
+def listed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Listing:
+    """Return the cath-service row a report carrying the blocks under test is listed with."""
+
+    def row(**overrides: object) -> dict[str, object]:
+        report = practice_report()
+        replaced = tuple(
+            practice_evidence(item.repository, item.team, **overrides) if item.repository == "cath-service" else item
+            for item in report.repositories
+        )
+        amended = report.model_copy(update={"repositories": replaced})
+        monkeypatch.setattr("metrics.service.offline_practice_report", lambda _configuration, _window: amended)
+        settings = configuration(tmp_path)
+        with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+            listing: dict[str, dict[str, object]] = {
+                item["repository"]: item for item in connected.get("/repositories").json()
+            }
+        return listing["cath-service"]
+
+    return row
 
 
 def test_the_spans_on_offer_exclude_any_the_configured_maximum_forbids() -> None:
@@ -1123,6 +1200,105 @@ def test_a_repository_the_window_cannot_cover_is_listed_with_the_reason(client: 
 
     assert rows["other-service"]["detail"].startswith("cached pull_request evidence does not cover")
     assert "merged_pull_requests" not in rows["other-service"]
+
+
+def test_a_repository_the_window_cannot_cover_states_none_of_the_four_estate_figures(client: TestClient) -> None:
+    """Leave every derived field absent where there is no evidence block, as the counts beside it are."""
+    row = {item["repository"]: item for item in client.get("/repositories").json()}["other-service"]
+
+    assert "required_approving_reviews" not in row
+    assert "required_status_checks" not in row
+    assert "unreviewed_substantial" not in row
+    assert "sonar_coverage" not in row
+
+
+def test_an_uncollected_merge_gate_leaves_both_gate_figures_unknown(client: TestClient) -> None:
+    """Report nothing for a gate nobody collected: 0 would read as a repository requiring nothing."""
+    row = {item["repository"]: item for item in client.get("/repositories").json()}["cath-service"]
+
+    assert "required_approving_reviews" not in row
+    assert "required_status_checks" not in row
+
+
+def test_a_repository_the_policy_graded_nothing_for_omits_the_unreviewed_verdict(client: TestClient) -> None:
+    row = {item["repository"]: item for item in client.get("/repositories").json()}["cath-service"]
+
+    assert "unreviewed_substantial" not in row
+
+
+def test_a_repository_with_no_sonar_measures_omits_its_coverage_rather_than_reading_zero(
+    client: TestClient,
+) -> None:
+    row = {item["repository"]: item for item in client.get("/repositories").json()}["cath-service"]
+
+    assert "sonar_coverage" not in row
+
+
+def test_a_listed_repository_states_what_its_merge_gate_requires(listed: Listing) -> None:
+    row = listed(merge_gate=MergeGateReport(fetched_at=ends_at(), gate=protected_gate()))
+
+    assert row["required_approving_reviews"] == 2
+    assert row["required_status_checks"] == 3
+
+
+def test_an_unprotected_default_branch_requires_nothing_rather_than_being_unknown(listed: Listing) -> None:
+    """Count a branch anybody can push to as requiring nothing, whatever rules ride with it.
+
+    The gate is reported with rules attached and unprotected at once, which the collector does not
+    produce, because the precedence is what is under test: protection is read before the rules are.
+    """
+    unprotected = protected_gate().model_copy(update={"protected": False})
+    row = listed(merge_gate=MergeGateReport(fetched_at=ends_at(), gate=unprotected))
+
+    assert row["required_approving_reviews"] == 0
+    assert row["required_status_checks"] == 0
+
+
+def test_a_protected_branch_whose_rules_were_withheld_is_unknown_rather_than_unrequired(listed: Listing) -> None:
+    """Withhold both figures where GitHub disclosed no rules, rather than blaming the permission gap."""
+    withheld = protected_gate().model_copy(update={"rules_observed": False})
+    row = listed(merge_gate=MergeGateReport(fetched_at=ends_at(), gate=withheld))
+
+    assert "required_approving_reviews" not in row
+    assert "required_status_checks" not in row
+
+
+def test_a_protected_branch_with_no_rules_at_all_requires_nothing(listed: Listing) -> None:
+    bare = protected_gate().model_copy(update={"pull_requests": (), "status_checks": ()})
+    row = listed(merge_gate=MergeGateReport(fetched_at=ends_at(), gate=bare))
+
+    assert row["required_approving_reviews"] == 0
+    assert row["required_status_checks"] == 0
+
+
+@pytest.mark.parametrize("outcome", list(UnreviewedSubstantialOutcome))
+def test_a_listed_repository_carries_the_policys_verdict_on_unreviewed_substantial_merging(
+    listed: Listing,
+    outcome: UnreviewedSubstantialOutcome,
+) -> None:
+    row = listed(unreviewed_substantial=outcome)
+
+    assert row["unreviewed_substantial"] == outcome.value
+
+
+def test_a_listed_repository_carries_the_coverage_sonar_measured(listed: Listing) -> None:
+    row = listed(merge_gate=MergeGateReport(fetched_at=ends_at(), gate=protected_gate()), sonar=sonar_report(81.5))
+
+    assert row["sonar_coverage"] == 81.5
+
+
+def test_a_sonar_project_that_reported_no_coverage_leaves_the_figure_absent(listed: Listing) -> None:
+    """Separate a project SonarCloud measured no coverage for from one it measured none of at all."""
+    row = listed(sonar=sonar_report(None))
+
+    assert "sonar_coverage" not in row
+
+
+def test_a_project_covering_none_of_its_lines_is_served_as_zero_rather_than_omitted(listed: Listing) -> None:
+    """Keep 0% a measurement: the donut bands it red, and omitting it would read as unmeasured."""
+    row = listed(sonar=sonar_report(0))
+
+    assert row["sonar_coverage"] == 0
 
 
 def test_a_repository_reports_its_whole_evidence_block(client: TestClient) -> None:

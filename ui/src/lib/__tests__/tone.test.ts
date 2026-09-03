@@ -8,25 +8,37 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { RAG_HEX } from '@/lib/rag';
 import {
+  CHECKS_BANDS,
+  COVERAGE_BANDS,
+  REVIEW_BANDS,
+  STRONG_GOOD_HEX,
   TONES,
   TONE_BORDER,
+  TONE_HEX,
   TONE_VALUE,
+  UNREVIEWED_BANDS,
   alertTone,
   borderClass,
+  checksBand,
   codeownersTone,
   conditionTone,
+  coverageBand,
+  coverageTone,
   directCommitTone,
   gateFieldTone,
   maintenanceTone,
   openPullRequestTone,
+  reviewBand,
   sonarGateTone,
   sonarMeasureTone,
   sonarRatingTone,
+  unreviewedBand,
   valueClass,
 } from '@/lib/tone';
-import type { GateField, OpenPullRequestField, SonarMeasure } from '@/lib/tone';
-import type { OpenAlertCount, SonarMeasures } from '@/lib/types';
+import type { Band, GateField, OpenPullRequestField, SonarMeasure } from '@/lib/tone';
+import type { OpenAlertCount, SonarMeasures, UnreviewedSubstantialOutcome } from '@/lib/types';
 
 /** The measures a repository reported, with only the fields one case is about filled in. */
 function measures(fields: Partial<SonarMeasures> = {}): SonarMeasures {
@@ -67,6 +79,119 @@ describe('tone maps', () => {
     expect(borderClass(undefined)).toBe(TONE_BORDER.neutral);
     expect(valueClass('bad')).toBe(TONE_VALUE.bad);
     expect(borderClass('good')).toBe(TONE_BORDER.good);
+  });
+
+  it('draws its chart marks in the report palette rather than a second copy of it', () => {
+    expect(Object.keys(TONE_HEX).sort()).toEqual([...TONES].sort());
+    expect(TONE_HEX.good).toBe(RAG_HEX.green);
+    expect(TONE_HEX.warn).toBe(RAG_HEX.amber);
+    expect(TONE_HEX.bad).toBe(RAG_HEX.red);
+    expect(TONE_HEX.neutral).toBe(RAG_HEX.none);
+  });
+
+  it('keeps the one mark that is not a tone out of the four', () => {
+    // A deeper green than `good`, and nothing else on the site is set in it.
+    expect(STRONG_GOOD_HEX).toBe('#16a34a');
+    expect(Object.values(TONE_HEX)).not.toContain(STRONG_GOOD_HEX);
+  });
+});
+
+describe('donut bands', () => {
+  /** Every table: the marks a reader tells the bands apart by, and the order they read in. */
+  const TABLES: readonly (readonly Band[])[] = [REVIEW_BANDS, CHECKS_BANDS, UNREVIEWED_BANDS, COVERAGE_BANDS];
+
+  it('ends every table with the unmeasured band, in the slate an ungraded row is drawn in', () => {
+    for (const table of TABLES) {
+      const last = table.at(-1);
+      expect(last?.key).toBe('unknown');
+      expect(last?.name).toBe('Unknown');
+      expect(last?.mark).toBe(TONE_HEX.neutral);
+    }
+  });
+
+  it('gives every band its own key, its own words and its own mark', () => {
+    for (const table of TABLES) {
+      expect(new Set(table.map((band) => band.key)).size).toBe(table.length);
+      expect(new Set(table.map((band) => band.name)).size).toBe(table.length);
+      expect(new Set(table.map((band) => band.mark)).size).toBe(table.length);
+    }
+  });
+
+  it('orders each table best first, so the legend reads down into the estate’s worst', () => {
+    expect(REVIEW_BANDS.map((band) => band.key)).toEqual(['multiple', 'required', 'none', 'unknown']);
+    expect(CHECKS_BANDS.map((band) => band.key)).toEqual(['required', 'none', 'unknown']);
+    expect(UNREVIEWED_BANDS.map((band) => band.key)).toEqual(['none', 'within', 'above', 'unknown']);
+    expect(COVERAGE_BANDS.map((band) => band.key)).toEqual(['high', 'moderate', 'low', 'unknown']);
+  });
+});
+
+describe('the required-approvals band', () => {
+  it('separates two approvals from exactly one, and one from none', () => {
+    expect(reviewBand(3)).toBe('multiple');
+    expect(reviewBand(2)).toBe('multiple');
+    expect(reviewBand(1)).toBe('required');
+    expect(reviewBand(0)).toBe('none');
+  });
+
+  it('counts a gate nobody could read as unmeasured rather than as requiring nothing', () => {
+    expect(reviewBand(undefined)).toBe('unknown');
+    expect(reviewBand(null)).toBe('unknown');
+  });
+});
+
+describe('the required-checks band', () => {
+  it('reads any required context as required and none as not required', () => {
+    expect(checksBand(4)).toBe('required');
+    expect(checksBand(1)).toBe('required');
+    expect(checksBand(0)).toBe('none');
+  });
+
+  it('counts a gate nobody could read as unmeasured', () => {
+    expect(checksBand(undefined)).toBe('unknown');
+    expect(checksBand(null)).toBe('unknown');
+  });
+});
+
+describe('the unreviewed-substantial band', () => {
+  it('carries the policy’s three verdicts through unchanged', () => {
+    expect(unreviewedBand('none')).toBe('none');
+    expect(unreviewedBand('within')).toBe('within');
+    expect(unreviewedBand('above')).toBe('above');
+  });
+
+  it('counts a window the policy graded nothing in as unmeasured, never as clean', () => {
+    expect(unreviewedBand(undefined)).toBe('unknown');
+    expect(unreviewedBand(null)).toBe('unknown');
+  });
+
+  it('counts a verdict this build does not know as unmeasured rather than as no band at all', () => {
+    // The pages are served from a `metrics-serve` versioned apart from them, so a value off the
+    // union is a real arrival; a row landing in no band would leave the donut short of the estate.
+    expect(unreviewedBand('forgiven' as UnreviewedSubstantialOutcome)).toBe('unknown');
+  });
+});
+
+describe('the coverage band', () => {
+  it('bands on the boundary the repository page colours coverage with', () => {
+    expect(coverageBand(100)).toBe('high');
+    expect(coverageBand(90)).toBe('high');
+    expect(coverageBand(89.9)).toBe('moderate');
+    expect(coverageBand(80)).toBe('moderate');
+    expect(coverageBand(79.9)).toBe('low');
+    expect(coverageBand(0)).toBe('low');
+  });
+
+  it('reads one boundary with the card beside it, rather than a second copy of the numbers', () => {
+    for (const coverage of [100, 90, 89.9, 80, 79.9, 0]) {
+      expect(sonarMeasureTone('coverage', measures({ coverage }))).toBe(coverageTone(coverage));
+    }
+  });
+
+  it('counts an unreported project as unmeasured rather than as 0%', () => {
+    expect(coverageTone(undefined)).toBe('neutral');
+    expect(coverageTone(null)).toBe('neutral');
+    expect(coverageBand(undefined)).toBe('unknown');
+    expect(coverageBand(null)).toBe('unknown');
   });
 });
 
