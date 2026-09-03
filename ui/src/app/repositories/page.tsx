@@ -30,12 +30,12 @@ export const dynamic = 'force-dynamic';
 export default async function RepositoriesPage({
   searchParams,
 }: {
-  searchParams?: { weeks?: SearchValue };
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
   const windows = await getWindows();
   const weeks = resolveWeeks(
-    searchParams?.weeks,
-    cookies().get(WEEKS_COOKIE)?.value,
+    (await searchParams)?.weeks,
+    (await cookies()).get(WEEKS_COOKIE)?.value,
     windows.options,
     windows.default,
   );

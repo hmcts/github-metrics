@@ -2,7 +2,7 @@
 
 import clsx from 'clsx';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useState, useTransition } from 'react';
+import { useState, useTransition } from 'react';
 import { weeksCookie } from '@/lib/weeks';
 
 /**
@@ -30,17 +30,29 @@ export function NavWeekSelector({ options, active }: { options: readonly number[
   // Tracks the click so the button highlights immediately, without waiting for the server render the
   // navigation triggers — otherwise the pressed state lags the whole round trip.
   const [selected, setSelected] = useState<number | null>(null);
+  // The span the guess above was made against, so a render at a different one can be recognised.
+  const [guessedFrom, setGuessedFrom] = useState(active);
   const [pending, startTransition] = useTransition();
-  const current = selected ?? active;
 
-  // Dropped the moment a render arrives at a different span. Only the query string changes on a span
-  // switch, so React keeps this component mounted and the optimistic value would outlive what it was
-  // guessing at: pressing Back would leave the button for the span the reader just left highlighted
-  // over figures that are now the other window's.
+  // The guess is dropped the moment a render arrives at a different span. Only the query string
+  // changes on a span switch, so React keeps this component mounted and the optimistic value would
+  // outlive what it was guessing at: pressing Back would leave the button for the span the reader
+  // just left highlighted over figures that are now the other window's.
   //
-  // The transition ends on the same render this effect answers to, so the guess and the dimming lift
-  // together: neither is left standing over figures the other has already given up on.
-  useEffect(() => setSelected(null), [active]);
+  // Adjusted during render rather than in an effect: an effect would commit one paint showing the
+  // stale guess over the new figures, and calling setState from an effect body cascades renders.
+  // React re-runs this component with the reset state before painting, so nothing stale is shown.
+  const stale = guessedFrom !== active;
+  if (stale) {
+    setGuessedFrom(active);
+    setSelected(null);
+  }
+
+  // The transition ends on the same render this reset answers to, so the guess and the dimming lift
+  // together: neither is left standing over figures the other has already given up on. No arm for
+  // the stale case: the reset above re-runs this component before anything is committed, so by the
+  // time a value reaches the DOM `selected` is already null and this is `active`.
+  const current = selected ?? active;
 
   function choose(weeks: number) {
     setSelected(weeks);

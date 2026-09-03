@@ -34,17 +34,17 @@ export default async function TeamPage({
   params,
   searchParams,
 }: {
-  params: { team: string };
-  searchParams?: { weeks?: SearchValue };
+  params: Promise<{ team: string }>;
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
   const windows = await getWindows();
   const weeks = resolveWeeks(
-    searchParams?.weeks,
-    cookies().get(WEEKS_COOKIE)?.value,
+    (await searchParams)?.weeks,
+    (await cookies()).get(WEEKS_COOKIE)?.value,
     windows.options,
     windows.default,
   );
-  const detail = await readTeam(params.team, weeks);
+  const detail = await readTeam((await params).team, weeks);
   const missing = unreported(detail);
 
   return (

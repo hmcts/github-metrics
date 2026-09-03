@@ -15,10 +15,18 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import RepositoryPage from '@/app/repositories/[repository]/page';
-import type { RepositoryDetail, RepositoryPracticeEvidence, WindowOptions } from '@/lib/types';
+import type {
+  ContributorRow,
+  PracticeFinding,
+  RepositoryDetail,
+  RepositoryPracticeEvidence,
+  RepositoryTrend,
+  TrendWindow,
+  WindowOptions,
+} from '@/lib/types';
 
 vi.mock('next/headers', () => ({
-  cookies: () => ({ get: () => undefined }),
+  cookies: () => Promise.resolve({ get: () => undefined }),
 }));
 
 vi.mock('next/navigation', () => ({
@@ -125,32 +133,47 @@ function evidence(): RepositoryPracticeEvidence {
 }
 
 /**
- * Render the page against a stubbed service, at whatever evidence the case is about.
+ * Render the page against a stubbed service answering with one whole `RepositoryDetail`.
  *
  * The page is an async server component, so it is awaited into an element tree and that tree — all
  * synchronous components — is what `renderToStaticMarkup` is handed.
+ *
+ * `series` is the trend, which is the one fetch on this page allowed to fail: `null` refuses it, and
+ * every case that is not about the trend section refuses it so the charts stay out of the markup.
  */
-async function render(
-  change: (block: RepositoryPracticeEvidence) => RepositoryPracticeEvidence = (block) => block,
+async function renderDetail(
+  detail: RepositoryDetail,
+  series: RepositoryTrend | null = null,
 ): Promise<string> {
-  const detail: RepositoryDetail = {
-    repository: 'api',
-    team: 'platform',
-    evidence: change(evidence()),
-    contributors: [],
-  };
   vi.stubGlobal(
     'fetch',
     vi.fn((url: string) => {
       if (url.includes('/trend')) {
-        return Promise.reject(new Error('no trend in this test'));
+        return series === null
+          ? Promise.reject(new Error('no trend in this test'))
+          : Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(series) });
       }
       const body = url.includes('/windows') ? WINDOWS : detail;
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
     }),
   );
-  const page = await RepositoryPage({ params: { repository: 'api' }, searchParams: {} });
+  const page = await RepositoryPage({
+    params: Promise.resolve({ repository: 'api' }),
+    searchParams: Promise.resolve({}),
+  });
   return renderToStaticMarkup(page);
+}
+
+/** Render the page at whatever evidence the case is about, on an otherwise full detail. */
+async function render(
+  change: (block: RepositoryPracticeEvidence) => RepositoryPracticeEvidence = (block) => block,
+): Promise<string> {
+  return renderDetail({
+    repository: 'api',
+    team: 'platform',
+    evidence: change(evidence()),
+    contributors: [],
+  });
 }
 
 /** The pair wrapper's classes, as one string, so a test names the layout it is asserting. */
@@ -269,5 +292,204 @@ describe('repository page layout', () => {
 
     expect(markup).toContain('Readiness');
     expect(heading(markup, 'Behaviour')).toBeLessThan(heading(markup, 'Readiness'));
+  });
+});
+
+/**
+ * What the page draws for a repository the span holds nothing for, and what it refuses to draw.
+ *
+ * The rule is that a configured repository keeps its page either way: a 404 for one would read as a
+ * repository nobody has heard of, when what happened is that the caches do not cover this span.
+ */
+describe('a repository the span cannot be reported for', () => {
+  /** The detail the service sends for a repository it could not report: no evidence, and a reason. */
+  function unavailable(detail?: string): RepositoryDetail {
+    return { repository: 'api', team: 'platform', contributors: [], detail };
+  }
+
+  it('keeps the page, states the span holds nothing, and passes the service’s reason on', async () => {
+    const markup = await renderDetail(unavailable('the caches hold no window at 8 weeks'));
+
+    expect(markup).toContain('This span holds no evidence for api.');
+    expect(markup).toContain('the caches hold no window at 8 weeks');
+    expect(markup).toContain('run metrics collect for the span being asked for');
+    // The header is still there, with the team link and the selector, and carries no label.
+    expect(markup).toContain('href="/teams/platform?weeks=8"');
+    expect(markup).toContain('Reporting window');
+    expect(markup).not.toContain('border-l-4');
+  });
+
+  it('says no reason was given rather than a blank where the service gave none', async () => {
+    const markup = await renderDetail(unavailable());
+
+    expect(markup).toContain('no reason was given —');
+  });
+
+  it('draws none of the evidence blocks, and asks for no trend it could not draw', async () => {
+    const asked: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        asked.push(url);
+        const body = url.includes('/windows') ? WINDOWS : unavailable('nothing collected');
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+      }),
+    );
+    const markup = renderToStaticMarkup(
+      await RepositoryPage({
+        params: Promise.resolve({ repository: 'api' }),
+        searchParams: Promise.resolve({}),
+      }),
+    );
+
+    for (const block of ['Merges reported', 'Merge gate', 'SonarCloud', 'Findings']) {
+      expect(markup).not.toContain(block);
+    }
+    // A series is cut from the caches per period, which is work worth doing only for a page that is
+    // going to draw the rest of the block too.
+    expect(asked.some((url) => url.includes('/trend'))).toBe(false);
+  });
+
+  /** Refuse the repository read with `status`, which is how the two refusals are told apart. */
+  async function refuse(status: number): Promise<unknown> {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        url.includes('/windows')
+          ? Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(WINDOWS) })
+          : Promise.resolve({
+              ok: false,
+              status,
+              text: () => Promise.resolve('{"detail":"no repository api is configured"}'),
+            }),
+      ),
+    );
+    return RepositoryPage({
+      params: Promise.resolve({ repository: 'api' }),
+      searchParams: Promise.resolve({}),
+    });
+  }
+
+  it('answers a name the configuration does not hold as not found', async () => {
+    await expect(refuse(404)).rejects.toThrow('notFound');
+  });
+
+  it('lets every other refusal surface as the fault it is', async () => {
+    await expect(refuse(500)).rejects.toThrow('API 500');
+  });
+});
+
+/**
+ * The blocks that state an absence, and the two lists that state what they hold.
+ *
+ * Every one of these is a signal the collector could not read, and each has its own sentence: a
+ * merge gate GitHub withheld, open pull-request state nobody collected, a security family that was
+ * refused, a maintenance search that ran no window, a Sonar project with no measures. A single
+ * "not available" across them would lose which question went unanswered, and a zero in place of any
+ * of them would report a missing permission as a passing check.
+ */
+describe('the repository page’s absences and lists', () => {
+  it('says which signal was not collected, one sentence each', async () => {
+    const markup = await render((block) => ({
+      ...block,
+      open_pull_requests: { fetched_at: block.open_pull_requests.fetched_at, detail: 'the pull-request list was refused' },
+      security: { fetched_at: block.security.fetched_at, detail: 'alerts need security-events scope' },
+      maintenance: { fetched_at: block.maintenance.fetched_at, maintenance: block.maintenance.maintenance, windows: [] },
+      // No `fetched_at` at all: a block this build never stored has no read-at stamp to print, and a
+      // heading reading "read Invalid Date" would be worse than one that says only what it is.
+      sonar: { detail: 'no Sonar project is mapped' },
+    }));
+
+    expect(markup).toContain('Open pull-request state was not collected for this repository.');
+    expect(markup).toContain('the pull-request list was refused');
+    expect(markup).toContain('No security alert family could be read for this repository.');
+    expect(markup).toContain('alerts need security-events scope');
+    expect(markup).toContain('No maintenance window was checked for this repository.');
+    // The Sonar section keeps its gate card and draws no measures behind it, and its heading says
+    // nothing about when a block that was never stored was read.
+    expect(markup).toContain('SonarCloud');
+    expect(markup).not.toContain('Lines of code');
+    const [, sonar = ''] = markup.split('SonarCloud');
+    expect(sonar.slice(0, 200)).not.toContain('read ');
+    // No count anywhere claims one of them was zero.
+    expect(markup).not.toContain('Opened in window');
+  });
+
+  it('draws the findings and the contributors it was sent, in the report’s own order', async () => {
+    const findings: PracticeFinding[] = [
+      {
+        rule: 'unreviewed-merge',
+        severity: 'high',
+        actor_login: 'ada',
+        occurrences: 2,
+        authored_merges: 6,
+        percentage: 33.3,
+        message: 'merged without an independent review',
+        occurrences_by_size: { small: 2 },
+        pull_requests: [
+          { number: 41, url: 'https://github.com/hmcts/api/pull/41', merged_at: '2026-08-02T00:00:00Z', size_class: 'small' },
+        ],
+      },
+    ];
+    const contributors: ContributorRow[] = [
+      { login: 'ada', contributions: 6, blocking: 2, metrics: [] },
+      { login: 'grace', contributions: 3, blocking: 0, metrics: [] },
+    ];
+    const markup = await renderDetail({
+      repository: 'api',
+      team: 'platform',
+      evidence: { ...evidence(), behaviour: findings },
+      contributors,
+    });
+
+    expect(markup).toContain('unreviewed-merge');
+    expect(markup).toContain('merged without an independent review');
+    expect(markup).toContain('href="/contributors/ada?weeks=8"');
+    expect(markup).toContain('href="/contributors/grace?weeks=8"');
+    expect(markup.indexOf('>ada<')).toBeLessThan(markup.indexOf('>grace<'));
+    expect(markup).not.toContain('No practice rule fired on this repository at this span.');
+    expect(markup).not.toContain('Nobody authored a reported merge in this repository');
+  });
+
+  /**
+   * The trend section, which appears only where the series the service answered with holds periods.
+   *
+   * The section is the one part of this page whose fetch is allowed to fail, and an empty series is
+   * the same as a refused one as far as the page is concerned: there is nothing to plot, and a chart
+   * of a single baseline window would read as a period that was measured.
+   */
+  it('draws the trend where the series holds periods, and nothing where it does not', async () => {
+    const window: TrendWindow = {
+      starts_at: '2026-06-01T00:00:00Z',
+      ends_at: '2026-06-29T00:00:00Z',
+      provenance: { offline: true, intervals_fetched: 0 },
+      cohort: { merged: 10, reported: 10, excluded_authors: {}, direct_commits: 2 },
+      throughput: { merges: 12, merged_pull_requests: 10, direct_commits: 2, active_contributors: 3 },
+      metrics: [],
+    };
+    const series: RepositoryTrend = {
+      repository: 'api',
+      enablement_at: '2026-06-01T00:00:00Z',
+      baseline: window,
+      periods: [{ ...window, starts_at: '2026-06-29T00:00:00Z', ends_at: '2026-07-27T00:00:00Z', index: 1, deltas: [] }],
+      alert_observations: [],
+    };
+    const detail: RepositoryDetail = {
+      repository: 'api',
+      team: 'platform',
+      evidence: evidence(),
+      contributors: [],
+    };
+
+    const drawn = await renderDetail(detail, series);
+    expect(drawn).toContain('Trend');
+    expect(drawn).toContain('1 whole period of 28 days since 2026-06-01');
+    // Cut to the count `/windows` publishes, so a long-enabled repository is served a bounded series.
+    expect(drawn).toContain('Merges by route');
+
+    const empty = await renderDetail(detail, { ...series, periods: [] });
+    expect(empty).not.toContain('Merges by route');
+    // And the section is absent for a series the endpoint refused outright, which `render` stubs.
+    expect(await render()).not.toContain('Merges by route');
   });
 });

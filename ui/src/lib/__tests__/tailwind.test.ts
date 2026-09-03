@@ -24,7 +24,7 @@ const SOURCE = fileURLToPath(new URL('../../', import.meta.url));
  *
  * A class string in a test is an assertion ABOUT markup, not markup a browser is served, and the
  * component it asserts on lives in a directory that is scanned. `src/__tests__` exists because
- * `src/middleware.ts` sits at the top of `src` and its test sits beside it; the nested
+ * `src/proxy.ts` sits at the top of `src` and its test sits beside it; the nested
  * `components/__tests__` and `lib/__tests__` are already covered by their parent's glob.
  */
 const TESTS = '__tests__';

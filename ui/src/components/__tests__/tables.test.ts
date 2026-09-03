@@ -25,6 +25,7 @@ describe('ActorsTable', () => {
         { login: 'dan', repositories: 4, labels: ['green'] },
       ],
       weeks: 8,
+      labelled: true,
     }),
   );
 
@@ -89,11 +90,37 @@ describe('ActorsTable', () => {
       createElement(ActorsTable, {
         rows: [{ login: 'erin', repositories: 2 }],
         weeks: 8,
+        labelled: true,
       }),
     );
     expect(older).toContain('>erin<');
     expect(older).toContain('Cannot assess');
     expect(older).not.toContain('Not assessed');
+  });
+
+  /**
+   * The other cause of an empty label list, which the badge above would state as the wrong fact.
+   *
+   * With `AssessmentConfiguration.enabled` off, `evidence.py` grades no repository, so every
+   * `/actors` row arrives with an empty list and `/overview` counts the whole estate under
+   * `not_assessed`. "Cannot assess" would report unreadable merge gates across an estate nothing
+   * was ever asked about — and `/repositories` and `/teams` say "Not assessed" about the very same
+   * repositories on the same deployment.
+   */
+  it('says not assessed, not cannot assess, where the policy graded nothing in the window', () => {
+    const ungraded = renderToStaticMarkup(
+      createElement(ActorsTable, {
+        rows: [
+          { login: 'erin', repositories: 2, labels: [] },
+          { login: 'frank', repositories: 1, labels: [] },
+        ],
+        weeks: 8,
+        labelled: false,
+      }),
+    );
+    expect(ungraded).toContain('>erin<');
+    expect(ungraded).toContain('Not assessed');
+    expect(ungraded).not.toContain('Cannot assess');
   });
 });
 

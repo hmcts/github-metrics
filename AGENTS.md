@@ -29,12 +29,27 @@
 Run `uv run poe check` before considering work complete. It must pass Ruff linting and formatting, strict mypy, and
 pytest without weakening their configuration. Use `uv run poe cover` when coverage is relevant.
 
-Work touching `ui/` must also pass `npm --prefix ui run check` (which runs ESLint, `tsc --noEmit`, vitest, and `next build` in one step, the UI's equivalent of `uv run poe check`). Run both when a change spans the service and the pages it feeds.
+Work touching `ui/` must also pass `npm --prefix ui run check` (which runs ESLint, `tsc --noEmit`, vitest with
+coverage, and `next build` in one step, the UI's equivalent of `uv run poe check`). Run both when a change spans the
+service and the pages it feeds.
 
-Where `check`'s `next build` step fails on a case-insensitive mount — `ENOTDIR` or `ENOENT` under
-`.next/standalone`, on a different path each run, which is the environment and not the code — run `npm --prefix ui run
+`check`'s vitest step reports coverage and enforces it: `src/**` is at 100% statements, branches, functions and lines,
+and `vitest.config.mts` pins the thresholds there, so a new untested branch fails the gate. Use `npm --prefix ui run
+coverage` to run that step alone, and `npm --prefix ui run coverage:html` for the browsable report under `ui/coverage`
+— the HTML reporter is deliberately not in `check`, because it writes files this mount intermittently refuses.
+The text table having no rows means every file is at 100%, not that coverage failed to collect. Thresholds go up,
+never down; see [`ui/README.md`](ui/README.md#coverage).
+
+Where `check`'s `next build` step fails on this virtiofs mount — `File exists (os error 17)` under `.next`,
+or `ENOTDIR`/`ENOENT` under `.next/standalone` before Next 16, on a different chunk each run, which is the
+environment and not the code — run `npm --prefix ui run
 lint`, `npm --prefix ui run typecheck` and `npm --prefix ui run test` instead. Those three are the parts that judge the
 change; `check` is still the command to run wherever the build works. See [`ui/README.md`](ui/README.md).
+
+To confirm a build off the mount, copy the configs, `src` and `node_modules` into a scratch directory on local
+storage and run `npx next build` there. **Copies, not symlinks:** Turbopack rejects a symlinked `src` or
+`node_modules` outright with `Symlink [project]/… is invalid, it points out of the filesystem root`, which the
+webpack builder before Next 16 tolerated.
 
 ## Coding Standards
 
@@ -64,6 +79,22 @@ In `ui/`, the same rules in TypeScript, plus:
   restating the target, so raising a target in the assessment configuration is what changes a colour.
 - Every route segment carries a `loading.tsx` drawn from `ui/src/components/Skeleton.tsx`, so a cold bundle shows the
   page's bones rather than a blank screen. A new segment without one is unfinished.
+- Tests default to the `node` environment and render components through `react-dom/server`. A component whose
+  behaviour only exists after the first paint — a debounce, a hover, a header click, a chart recharts will not draw
+  unmeasured — gets its own `.tsx` test with a `@vitest-environment jsdom` docblock and `@testing-library/react`.
+  Nothing configures a suite-wide DOM.
+- Route files under `ui/src/app` are tested from `ui/src/components/__tests__`, not from beside the routes: the test
+  awaits the page and hands the tree to `renderToStaticMarkup`, stubbing `next/headers`, `next/navigation` and
+  `fetch`. `params` and `searchParams` are promises from Next 16 onwards, so a test passes real ones.
+- Lint is flat-config `eslint .` against `ui/eslint.config.mjs`, whose `ignores` replace the deleted `.eslintignore`.
+  It names `@next/eslint-plugin-next`, `typescript-eslint` and `eslint-plugin-react-hooks` directly instead of
+  extending `eslint-config-next`, which is what keeps a clean install free of warnings on ESLint 10 — do not swap it
+  back for the shareable config without reading the reasoning in `ui/README.md`. There are no accessibility lint rules
+  as a result, so ARIA is asserted in the component tests.
+  A helper file under a `__tests__` directory is instrumented for coverage unless its name matches `*.test.ts(x)`, so
+  shared test scaffolding has to be reached by a test or it fails the 100% gate.
+- The request hook is `ui/src/proxy.ts` exporting `proxy`, Next 16's name for what was `middleware.ts` exporting
+  `middleware`. The old convention still runs but warns at build time.
 - See `ui/README.md` for the design tokens and the guardrails the pages keep.
 
 ## Git

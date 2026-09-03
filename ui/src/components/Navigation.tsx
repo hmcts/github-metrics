@@ -25,7 +25,7 @@ import { BarChart3, Building2, FolderGit2, Users } from 'lucide-react';
  *
  * These links are therefore the only ones in the app that carry no `?weeks=`: a layout is handed no
  * search parameters, so this component cannot know the span to put on them. The span survives a click
- * through the `weeks` cookie instead, which `src/middleware.ts` writes for any request that named one.
+ * through the `weeks` cookie instead, which `src/proxy.ts` writes for any request that named one.
  */
 export function Navigation() {
   return (

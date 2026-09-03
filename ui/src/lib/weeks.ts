@@ -14,7 +14,7 @@
  *
  * The cookie exists so that arriving at a page through a nav link, which carries no `?weeks=`, shows
  * the span the reader was last reading at rather than resetting to four weeks. Two things write it:
- * the selector, before it navigates, and the middleware, for a reader who arrived on a link that
+ * the selector, before it navigates, and the proxy, for a reader who arrived on a link that
  * named a span without ever pressing a button — see `rememberableWeeks`.
  */
 
@@ -102,10 +102,10 @@ export function landingTarget(parameter: SearchValue): string {
  * which is handed no search parameters — so the span they land on comes from the cookie. A reader
  * who followed a shared `?weeks=26` link and never touched the selector has no cookie, and the
  * first nav click would drop them to the service's default with nothing saying the window moved.
- * The middleware closes that by writing what the URL asked for, which is the same preference the
+ * The proxy closes that by writing what the URL asked for, which is the same preference the
  * selector would have written had they pressed the button themselves.
  *
- * The value is NOT checked against the spans on offer: the middleware would need a round trip to
+ * The value is NOT checked against the spans on offer: the proxy would need a round trip to
  * `/windows` on every request to know them, and `resolveWeeks` already drops a cookie holding a span
  * off the list. A positive integer is the whole check, and it keeps what could not be a span out of
  * a cookie that lives a year. A number is returned rather than the raw text so the cookie is written

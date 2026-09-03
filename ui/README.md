@@ -30,13 +30,17 @@ on with nothing on the page to say so.
 npm --prefix ui run check
 ```
 
-`check` is the whole gate in one step — `next lint`, `tsc --noEmit`, `vitest run`, `next build` — the counterpart of
-`uv run poe check` for the Python. The Python tooling never sees this directory and this gate never sees the Python.
+`check` is the whole gate in one step — `eslint`, `tsc --noEmit`, `vitest run --coverage`, `next build` — the
+counterpart of `uv run poe check` for the Python. The Python tooling never sees this directory and this gate never
+sees the Python. The coverage table prints as part of it and its thresholds are part of the pass, so a change that
+adds an untested branch fails `check` rather than passing it quietly; see [Coverage](#coverage).
 
-Its `next build` step needs a case-sensitive filesystem. On a case-insensitive mount the `output: 'standalone'` trace
-copy fails with `ENOTDIR` or `ENOENT` on a `.next/standalone/node_modules/next/dist/...` path that already exists as a
-directory, on a different path each run — the same tree builds clean with `.next` written outside the mount, so it is
-the environment and not the code under it. Where that happens, the three commands that judge a change are
+Its `next build` step needs a filesystem whose directory cache is coherent under concurrent writes. On the
+virtiofs mount this repository is checked out on, Turbopack fails writing a chunk it has just created —
+`File exists (os error 17)` under `.next`, on a different chunk each run — and before Next 16 the same
+incoherency showed as `ENOTDIR` or `ENOENT` under `.next/standalone`. The same tree builds clean with `.next` written
+outside the mount, so it is the environment and not the code under it. Where that happens, the three commands that
+judge a change are
 
 ```bash
 npm --prefix ui run lint
@@ -45,6 +49,27 @@ npm --prefix ui run test
 ```
 
 and `check` is the one to run wherever the build works, because a page that will not build is not a passing change.
+
+### Install notices
+
+A clean install prints none. No `npm warn deprecated` lines, no ERESOLVE peer warnings, 0 vulnerabilities from
+`npm audit`, and no package in the tree runs an install script — so an npm client that asks about install scripts has
+nothing to ask about.
+
+Keeping it that way is why the lint config names its three plugins rather than extending `eslint-config-next`. Every
+published `eslint@9.x` is registry-deprecated, so staying on 9 costs a deprecation warning; but `eslint-config-next`
+bundles `eslint-plugin-react`, `eslint-plugin-jsx-a11y` and `eslint-plugin-import`, all three of which peer at `^9`,
+so moving to 10 with it costs three ERESOLVE warnings instead — and `eslint-plugin-react@7.37.5` then throws on a
+context API 10 removed. Naming `@next/eslint-plugin-next`, `typescript-eslint` and `eslint-plugin-react-hooks`
+directly, which all support 10, costs neither. It halves the tree on the way past — 365 packages rather than 529 —
+and drops `unrs-resolver`, the platform-binding `postinstall` that `eslint-config-next` pulled in through
+`eslint-import-resolver-typescript`. `esbuild`'s install script went the same way when vitest 4 moved to Vite 8,
+which transforms with oxc.
+
+What that gives up is the accessibility rules from `eslint-plugin-jsx-a11y`, which has no release supporting ESLint 10
+at all. The ARIA the pages depend on is asserted directly in `src/components/__tests__` instead — the sortable
+headers' `aria-sort`, the week selector's `aria-busy` — so it is checked, just not by a linter. Add the plugin back
+when it supports 10; `eslint.config.mjs` says the same thing beside the config it applies to.
 
 ## Pages
 
@@ -80,12 +105,16 @@ with `withWeeks`, so no navigation quietly changes the window. The span resolves
 lands on the span the reader was last reading at.
 
 The three links in the nav bar are the one place a link cannot carry the span: the bar is rendered by the layout, and
-Next.js hands a layout no search parameters. The cookie is what covers them, so `src/middleware.ts` writes it for any
+Next.js hands a layout no search parameters. The cookie is what covers them, so `src/proxy.ts` writes it for any
 request that named a span — not just for a press of the selector, which is the only writer a reader who arrived on
 somebody else's `?weeks=26` link never triggers. Without it, their first nav click dropped the whole page to four
 weeks with nothing saying the window had moved. The value is not checked against the spans on offer there, because
-the middleware would need a `/windows` round trip per request to know them and `resolveWeeks` already drops a cookie
+the proxy would need a `/windows` round trip per request to know them and `resolveWeeks` already drops a cookie
 holding a span off the list; a positive integer is the whole check.
+
+The file is `src/proxy.ts` exporting `proxy`, which is Next 16's name for what earlier versions called
+`src/middleware.ts` exporting `middleware`. The old convention still runs, but it prints a deprecation warning at
+build time, and a build that prints nothing is easier to read than one whose noise has to be remembered as harmless.
 
 Every segment carries a `loading.tsx` drawn from `Skeleton.tsx`, and the week selector wraps its `router.replace` in
 `useTransition` — dimming the button group and marking it `aria-busy` while the page is on its way. The service keeps
@@ -138,7 +167,10 @@ an `EmptyState` next to a full section leaves its half short and does not stretc
 
 **The repository page is no longer in the evidence block's own order.** Behaviour sits directly under the cohort row,
 above the blocking, caution and clear groups, because a reader wants the measurements before the verdict drawn from
-them. That is the only departure, and the page's own doc comment records it.
+them. There is a second departure INSIDE the clear group: `gradedFirst` in `lib/repository.ts` sinks the informational
+rows below the graded ones, because a section that alternates between a green bar and no bar reads as checks that lost
+their colour. No condition moves between groups and the policy's own order survives inside each half. Both departures
+are recorded in the page's own doc comment.
 
 **A settings block is a list, not a grid of cards.** The twelve merge-gate fields, the three maintenance windows and
 the three alert families go through `DefinitionList`, where the labels line up and the block is read down. Twelve
@@ -243,4 +275,37 @@ These come from `docs/architecture.md`, "Scope boundaries", and they bind the UI
 `src/lib` holds the logic as pure functions, tested under `src/lib/__tests__`; `src/components` holds the markup,
 with `'use client'` only where recharts or component state needs it; `src/app` holds the routes, which do the I/O and
 little else. A component that can be checked has its markup asserted in `src/components/__tests__` through
-`react-dom/server` — the client tables that read the router are checked as their pure parts instead.
+`react-dom/server`.
+
+Vitest's default environment is `node`, because that renderer needs no document. A test that needs one — a debounce,
+a hover, a header click, anything that only happens after the first paint — opts in for its own file with a
+`@vitest-environment jsdom` docblock at the top, and drives the component with `@testing-library/react`. The two live
+side by side in the same directories; nothing configures a suite-wide DOM.
+
+### Coverage
+
+```bash
+npm --prefix ui run coverage       # the text report, as `check` runs it
+npm --prefix ui run coverage:html  # the browsable report under ui/coverage
+```
+
+**The target is 100% of `src/**` on all four measures**, and `vitest.config.mts` sets the thresholds there, so it is
+the gate's answer rather than an aspiration in a document. `test` and so `check` both run with `--coverage`; the first
+script above exists to run it alone.
+
+The text report prints no file rows while everything is at 100% — istanbul lists only the files that miss something,
+so an empty table under a full summary is the report saying nothing is missing, and rows appear as soon as a figure
+drops. The HTML report is the second script rather than part of the gate: it writes a directory per source tree, and
+on this virtiofs mount that intermittently dies with `ENOENT: mkdir coverage/src`, the same incoherency that breaks
+`next build`. Vitest does not fail a run over a crashed reporter, so keeping it in `check` meant a green gate that
+printed a stack trace. `coverage/` is gitignored either way.
+
+100% is reachable here because this app measures nothing of its own: the arithmetic is pure functions in `src/lib`,
+the routes are fetch-and-render, and a component's markup is a return value. The two things that made the last few
+percent awkward were both testable rather than exempt — a client component's handlers need a document, which is what
+the jsdom files above are for, and recharts draws nothing at all until something measures it, so those tests stub a
+`ResizeObserver` and run the opening animation out on fake timers.
+
+A threshold is ratcheted upwards and never lowered. Genuinely uninstrumentable code goes in the config's `exclude`
+with a comment saying why — `src/lib/types.ts` is the one entry, a module `tsc` erases entirely — because an
+exclusion names what is not covered where a reduced percentage only hides it.

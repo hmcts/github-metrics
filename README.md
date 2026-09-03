@@ -1376,7 +1376,8 @@ npm --prefix ui install
 API_URL=http://localhost:8000 npm --prefix ui run dev
 ```
 
-The UI is the one part of this repository that needs Node — 18.17 or newer, which is what Next.js 14 requires. The
+The UI is the one part of this repository that needs Node — 20.9 or newer, which is what Next.js 16 requires, and
+20.19 or newer to run its tests, which is jsdom 29's floor. `ui/Dockerfile` builds and runs on `node:26-alpine`. The
 Python side needs none of it, and a host that only ever collects can ignore `ui/` entirely.
 
 `collect` is the only step that needs `GH_TOKEN` or the App variables, and it is the step that decides what the
@@ -1452,9 +1453,11 @@ caches do not cover reports that reason and no counts.
 
 The UI fetches server-side, so the service needs no CORS headers and no browser ever calls it directly. `API_URL`
 tells the Next.js server where it is, defaulting to `http://localhost:8000`. `npm --prefix ui run build` then
-`npm --prefix ui start` serves it for real; `npm --prefix ui run check` is the whole UI gate — lint, types, tests,
-build — in one step, as `uv run poe check` is for the Python. Its build step needs a case-sensitive filesystem, so on
-a case-insensitive mount the three commands that judge a change are `lint`, `typecheck` and `test` run separately. See
+`npm --prefix ui start` serves it for real; `npm --prefix ui run check` is the whole UI gate — lint, types, tests with
+coverage, build — in one step, as `uv run poe check` is for the Python, and its coverage thresholds are part of the
+pass. Where its build step fails on the virtiofs mount this repository is checked out on — `File exists (os error 17)`
+under `.next`, on a different chunk each run, which is the environment and not the code — the three commands that
+judge a change are `lint`, `typecheck` and `test` run separately. See
 [`ui/README.md`](ui/README.md) for that, the pages, the design tokens, and the guardrails the UI keeps.
 
 ### In containers

@@ -18,8 +18,11 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import LoadingContributor from '@/app/contributors/[login]/loading';
 import LoadingContributors from '@/app/contributors/loading';
+import LoadingRepository from '@/app/repositories/[repository]/loading';
 import LoadingRepositories from '@/app/repositories/loading';
+import LoadingTeam from '@/app/teams/[team]/loading';
 import LoadingTeams from '@/app/teams/loading';
 import { ActorRepositoriesTable } from '@/components/ActorRepositoriesTable';
 import { ActorsTable } from '@/components/ActorsTable';
@@ -396,6 +399,14 @@ describe('OrganisationHeader', () => {
     expect(markup).not.toContain('Collected');
     expect(markup).toContain('Report built');
   });
+
+  it('leaves the control slot out where the page handed it none', () => {
+    // `action` is optional, and an empty wrapper pushed to the right of the organisation name would
+    // be an invisible box holding the row open for a control that was never passed.
+    const markup = renderToStaticMarkup(createElement(OrganisationHeader, { overview: OVERVIEW }));
+    expect(markup).toContain('hmcts');
+    expect(markup).not.toContain('ml-auto');
+  });
 });
 
 describe('Navigation', () => {
@@ -570,6 +581,41 @@ describe('the loading skeletons', () => {
     expect(contributors.match(/h-4 w-full/g)).toHaveLength(12);
     expect(teams.match(/h-4 w-full/g)).toHaveLength(6);
   });
+
+  /**
+   * The three detail routes' skeletons, which are three shapes rather than one.
+   *
+   * Each stands in for a different page — a repository's cohort row and evidence blocks, a team's
+   * donut above two tables, a contributor's repositories above one behaviour section — so a
+   * skeleton copied from the wrong route would draw bones the page then does not fill, and the
+   * layout would jump as the figures land. That is exactly what no type check can see.
+   */
+  it('draws each detail route’s own shape, announced as loading like the lists are', () => {
+    const repository = renderToStaticMarkup(createElement(LoadingRepository));
+    const team = renderToStaticMarkup(createElement(LoadingTeam));
+    const contributor = renderToStaticMarkup(createElement(LoadingContributor));
+
+    for (const markup of [repository, team, contributor]) {
+      expect(markup).toContain('<p role="status" class="sr-only">Loading</p>');
+      expect(markup).toContain('aria-hidden="true"');
+      expect(markup).toContain('animate-pulse');
+    }
+
+    // The repository page opens on the cohort row, which is the only card row of the three.
+    expect(repository).toContain('lg:grid-cols-4');
+    expect(team).not.toContain('lg:grid-cols-4');
+    expect(contributor).not.toContain('lg:grid-cols-4');
+
+    // The team page is the only one of the three that opens on a chart.
+    expect(team).toContain('h-48 w-full');
+    expect(repository).not.toContain('h-48 w-full');
+    expect(contributor).not.toContain('h-48 w-full');
+
+    // And each asks for the rows its own page holds: three sections, two, and two.
+    expect(repository.match(/border-b border-slate-800/g)).toHaveLength(3);
+    expect(team.match(/border-b border-slate-800/g)).toHaveLength(2);
+    expect(contributor.match(/border-b border-slate-800/g)).toHaveLength(2);
+  });
 });
 
 describe('the shared vocabulary', () => {
@@ -640,6 +686,7 @@ describe('the shared vocabulary', () => {
           // cell that renders through `RAGLabel` is the one part of this list that is not a login.
           rows: [{ login: 'octocat', repositories: 1, labels: ['green'] }],
           weeks: 4,
+          labelled: true,
         }),
       ),
       renderToStaticMarkup(

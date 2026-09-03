@@ -95,7 +95,18 @@ export type ConditionOutcome = 'blocking' | 'caution' | 'clear';
  *   • A caution is amber and a clear condition is green, which is what the two sections mean.
  *   • An informational condition carries NO COLOUR: `ReadinessPolicy.neutral()` and the sufficient
  *     cohort are reported without being judged, and green would report them as checks that passed.
+ *
+ * The three overloads say which of those two answers a caller can get, because `blocking` is the only
+ * outcome with no tone: a caller that has already dealt with the blocking case — `metricTone`, which
+ * reads the label itself — then needs no fallback for an answer it cannot receive, and a fallback
+ * that cannot be reached is a branch no test can cover.
  */
+export function conditionTone(outcome: 'blocking', condition: ReadinessCondition): undefined;
+export function conditionTone(outcome: 'caution' | 'clear', condition: ReadinessCondition): Tone;
+export function conditionTone(
+  outcome: ConditionOutcome,
+  condition: ReadinessCondition,
+): Tone | undefined;
 export function conditionTone(outcome: ConditionOutcome, condition: ReadinessCondition): Tone | undefined {
   if (outcome === 'blocking') {
     return undefined;

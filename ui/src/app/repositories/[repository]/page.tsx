@@ -37,10 +37,14 @@ import { WEEKS_COOKIE, resolveWeeks, withWeeks, type SearchValue } from '@/lib/w
  * One repository's whole evidence block at one window span.
  *
  * The page is the block, and mostly in the block's own order: the cohort it was all measured over,
- * then each collected signal, the findings, and who authored the window. The one departure is
- * behaviour and readiness, which the page swaps: the metrics sit directly under the cohort row and
- * the policy's blocking, caution and clear groups follow them, because a reader wants the figures
- * before the grading drawn from them. Nothing is recomputed here — every figure is one the service
+ * then each collected signal, the findings, and who authored the window. Two departures, and only
+ * two. Behaviour and readiness are SWAPPED: the metrics sit directly under the cohort row and the
+ * policy's blocking, caution and clear groups follow them, because a reader wants the figures before
+ * the grading drawn from them. And inside the clear group, `repository.gradedFirst` sinks the
+ * informational rows below the graded ones, for the reason its own comment gives — no condition
+ * moves between groups, and the policy's order survives inside each half of that one.
+ *
+ * Nothing is recomputed here — every figure is one the service
  * sent, formatted by `lib/repository.ts` — so the page and `metrics evidence` for the same span are
  * one claim rather than two that can drift.
  *
@@ -53,17 +57,17 @@ export default async function RepositoryPage({
   params,
   searchParams,
 }: {
-  params: { repository: string };
-  searchParams?: { weeks?: SearchValue };
+  params: Promise<{ repository: string }>;
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
   const windows = await getWindows();
   const weeks = resolveWeeks(
-    searchParams?.weeks,
-    cookies().get(WEEKS_COOKIE)?.value,
+    (await searchParams)?.weeks,
+    (await cookies()).get(WEEKS_COOKIE)?.value,
     windows.options,
     windows.default,
   );
-  const detail = await readRepository(params.repository, weeks);
+  const detail = await readRepository((await params).repository, weeks);
   const evidence = detail.evidence;
 
   const header = (

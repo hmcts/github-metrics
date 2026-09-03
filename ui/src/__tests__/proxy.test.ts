@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { describe, expect, it } from 'vitest';
-import { config, middleware } from '@/middleware';
+import { config, proxy } from '@/proxy';
 
 /**
  * What the navigation bar relies on: a request that named a span leaves with that span remembered.
@@ -18,10 +18,10 @@ function ask(url: string, cookie?: string): NextRequest {
 }
 
 function written(url: string, cookie?: string): string | null {
-  return middleware(ask(url, cookie)).headers.get('set-cookie');
+  return proxy(ask(url, cookie)).headers.get('set-cookie');
 }
 
-describe('middleware', () => {
+describe('proxy', () => {
   it('remembers the span a link named, so the next nav link keeps it', () => {
     expect(written('/repositories?weeks=26')).toContain('weeks=26');
     expect(written('/repositories?weeks=26')).toContain('path=/');
@@ -50,7 +50,7 @@ describe('middleware', () => {
   });
 
   it('lets the page it was asked for through untouched', () => {
-    expect(middleware(ask('/repositories?weeks=26')).status).toBe(200);
+    expect(proxy(ask('/repositories?weeks=26')).status).toBe(200);
   });
 
   it('runs for pages and not for the build’s own assets', () => {

@@ -1013,8 +1013,11 @@ def serve_actors(bundle: Bundle) -> tuple[ActorRow, ...]:
     client can group people by what they work in without asking for every person's detail. The count
     is over every repository they contributed to while the labels are over `reported_repositories`
     alone, so a row may count more repositories than it carries labels for — a person whose every
-    repository is `cannot_assess` counts them all and lists nothing. The order served stays
-    alphabetical: what a client does with the labels is its own presentation.
+    repository is `cannot_assess` counts them all and lists nothing. An empty list means the same
+    where the readiness policy is DISABLED and nothing was graded at all, which a row cannot tell
+    apart: `/overview` distributes the same window's repositories over the labels and `not_assessed`,
+    which is where the two are distinguishable. The order served stays alphabetical: what a client
+    does with the labels is its own presentation.
     """
     return tuple(
         ActorRow(login=actor.actor_login, repositories=len(actor.repositories), labels=actor_labels(actor))

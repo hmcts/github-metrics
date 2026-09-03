@@ -145,6 +145,23 @@ export function combinationKey(labels: readonly ReadinessLabel[] | undefined): s
 }
 
 /**
+ * Whether the readiness policy graded ANYTHING in this window, read off a label distribution.
+ *
+ * The four labels are the policy's answers and `not_assessed` is its absence, so a distribution
+ * where every repository is counted under the latter means the policy graded nothing at all —
+ * `AssessmentConfiguration.enabled` off, which `evidence.py` reports as `assessment=None` for every
+ * repository. That is a different fact from a repository the policy graded and could not read, and
+ * the two are indistinguishable from one person's row: `domain.actor_labels` returns an empty list
+ * for both, so a page that reads emptiness alone states the wrong one for half its readers.
+ *
+ * Total over `RAGStates` rather than over a list of the service's four keys, as every map in this
+ * module is: a label added to `ReadinessLabel` counts here without this function being touched.
+ */
+export function anyLabelled(labels: Record<string, number>): boolean {
+  return RAG_STATES.some((resolved) => resolved !== 'none' && (labels[resolved] ?? 0) > 0);
+}
+
+/**
  * Resolve a key from a label DISTRIBUTION to a state.
  *
  * The service counts ungraded repositories under `not_assessed`, its own key rather than a label, so

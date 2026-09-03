@@ -4,6 +4,9 @@ import { WEEKS_COOKIE, rememberableWeeks, weeksCookie } from '@/lib/weeks';
 /**
  * Remembers the span a request named, so the navigation bar cannot quietly change the window.
  *
+ * Named `proxy` in `src/proxy.ts`: Next 16 deprecated the `middleware` file convention in favour of
+ * this one, and the two are the same hook under two names.
+ *
  * The three list links are rendered by the layout, which Next.js hands no search parameters, so they
  * carry no `?weeks=` and resolve their span from the cookie. The selector writes that cookie, which
  * covers a reader who chose a span here — but not one who arrived on a shared `/repositories?weeks=26`
@@ -18,7 +21,7 @@ import { WEEKS_COOKIE, rememberableWeeks, weeksCookie } from '@/lib/weeks';
  * This does not touch what the CURRENT render reads: `resolveWeeks` takes `?weeks=` over the cookie,
  * so the page the reader asked for is the page they get, cookie or no cookie.
  */
-export function middleware(request: NextRequest): NextResponse {
+export function proxy(request: NextRequest): NextResponse {
   const response = NextResponse.next();
   const asked = rememberableWeeks(request.nextUrl.searchParams.get(WEEKS_COOKIE));
   if (asked !== null && String(asked) !== request.cookies.get(WEEKS_COOKIE)?.value) {

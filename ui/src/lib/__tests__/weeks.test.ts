@@ -105,7 +105,7 @@ describe('rememberableWeeks', () => {
   });
 
   it('remembers a span off this service’s list, which resolveWeeks then drops', () => {
-    // The middleware cannot ask `/windows` per request, so the list is not checked here. A cookie
+    // The proxy cannot ask `/windows` per request, so the list is not checked here. A cookie
     // holding 30 is read as no choice by `parseWeeks` and the page falls back, as it does today.
     expect(rememberableWeeks('30')).toBe(30);
     expect(parseWeeks(String(rememberableWeeks('30')), OPTIONS)).toBeNull();

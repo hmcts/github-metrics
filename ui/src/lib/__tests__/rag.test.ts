@@ -6,6 +6,7 @@ import {
   RAG_HEX,
   RAG_LABEL,
   RAG_STATES,
+  anyLabelled,
   badgeClass,
   borderClass,
   combinationKey,
@@ -132,6 +133,32 @@ describe('combinationKey', () => {
   // rendering and `/contributors` throwing.
   it('reads an absent list as an unlabelled person rather than throwing', () => {
     expect(combinationKey(undefined)).toBeUndefined();
+  });
+});
+
+describe('anyLabelled', () => {
+  /** Every key `service.label_counts` sends, zeros included, as a window with nothing graded. */
+  const UNGRADED = { green: 0, amber: 0, red: 0, cannot_assess: 0, not_assessed: 7 };
+
+  it('reads a window the policy graded nothing in, however many repositories it holds', () => {
+    expect(anyLabelled(UNGRADED)).toBe(false);
+  });
+
+  it('reads a window with any one label as graded, cannot_assess included', () => {
+    expect(anyLabelled({ ...UNGRADED, green: 1 })).toBe(true);
+    expect(anyLabelled({ ...UNGRADED, amber: 1 })).toBe(true);
+    expect(anyLabelled({ ...UNGRADED, red: 1 })).toBe(true);
+    // The distinction the contributor list needs: an estate the policy graded and could not read is
+    // graded, and its people carry "Cannot assess" rather than "Not assessed".
+    expect(anyLabelled({ ...UNGRADED, cannot_assess: 7, not_assessed: 0 })).toBe(true);
+  });
+
+  it('ignores the service’s not_assessed key, which is the policy’s absence and not a label', () => {
+    expect(anyLabelled({ not_assessed: 12 })).toBe(false);
+  });
+
+  it('reads an empty distribution as nothing graded rather than throwing', () => {
+    expect(anyLabelled({})).toBe(false);
   });
 });
 

@@ -105,4 +105,25 @@ describe('TrendSection', () => {
     });
     expect(thin).toContain('No behaviour metric was observed in any period of this series.');
   });
+
+  /**
+   * The heading is built from the parts that ARRIVED, and drops each part that did not.
+   *
+   * A repository the service has no enablement instant for sends none, and a period whose instants
+   * could not be read leaves `periodSpan` with nothing to measure. The heading then has to read as a
+   * shorter sentence rather than as "of null days" or "since undefined" — a page that printed either
+   * would be stating a fact the series does not carry.
+   */
+  it('leaves out the period length and the enablement date where the series carries neither', () => {
+    const partial = markup({
+      ...SERIES,
+      enablement_at: undefined,
+      periods: [{ ...PERIOD, starts_at: 'not an instant', ends_at: 'not an instant either' }],
+    });
+
+    expect(partial).toContain('1 whole period');
+    expect(partial).not.toContain('days');
+    expect(partial).not.toContain('since');
+    expect(partial).not.toMatch(/null|undefined|NaN/);
+  });
 });

@@ -9,18 +9,6 @@ import { nextDirection, sorted, type Direction, type SortValue } from '@/lib/sor
 import type { ActorRow, ReadinessLabel } from '@/lib/types';
 import { withWeeks } from '@/lib/weeks';
 
-/**
- * Everyone who contributed to a reported repository in this window, by their repositories' labels.
- *
- * The list orders by a COMBINATION OF LABELS THE REPOSITORIES ALREADY CARRY, on the 2026-09-02
- * instruction that admits exactly that and nothing more: the readiness column lists the distinct
- * labels a person's repositories hold, as the text report's actor section prints them, and the sort
- * is `combinationKey` over that list. There is still no score, no metric column and no per-person
- * verdict — the repository count is how many repositories a login appears in, which is navigation.
- *
- * Ties keep the login order the service sent, because `sorted` is stable, so everybody who is all
- * green stays alphabetical among themselves.
- */
 interface Column {
   key: string;
   label: string;
@@ -42,7 +30,33 @@ const COLUMNS: readonly Column[] = [
   READINESS,
 ];
 
-export function ActorsTable({ rows, weeks }: { rows: readonly ActorRow[]; weeks: number }) {
+/**
+ * Everyone who contributed to a reported repository in this window, by their repositories' labels.
+ *
+ * The list orders by a COMBINATION OF LABELS THE REPOSITORIES ALREADY CARRY, on the 2026-09-02
+ * instruction that admits exactly that and nothing more: the readiness column lists the distinct
+ * labels a person's repositories hold, as the text report's actor section prints them, and the sort
+ * is `combinationKey` over that list. There is still no score, no metric column and no per-person
+ * verdict — the repository count is how many repositories a login appears in, which is navigation.
+ *
+ * Ties keep the login order the service sent, because `sorted` is stable, so everybody who is all
+ * green stays in the order `/actors` served them in. That order is the service's own — Python's
+ * default sort over the logins — and the `Login` header re-sorts locale-aware through `compare`, so
+ * a header click can move mixed-case logins relative to each other. Both are alphabetical orders and
+ * neither ranks anybody; the header states which one the reader is looking at.
+ *
+ * `labelled` says whether the readiness policy graded anything at all in this window, which one
+ * person's row cannot say on its own — see `Readiness`.
+ */
+export function ActorsTable({
+  rows,
+  weeks,
+  labelled,
+}: {
+  rows: readonly ActorRow[];
+  weeks: number;
+  labelled: boolean;
+}) {
   const [column, setColumn] = useState<Column>(READINESS);
   const [direction, setDirection] = useState<Direction>('ascending');
 
@@ -86,7 +100,7 @@ export function ActorsTable({ rows, weeks }: { rows: readonly ActorRow[]; weeks:
                 {row.repositories}
               </td>
               <td className="py-2 pr-3 text-right">
-                <Readiness labels={row.labels} />
+                <Readiness labels={row.labels} labelled={labelled} />
               </td>
             </tr>
           ))}
@@ -109,10 +123,21 @@ export function ActorsTable({ rows, weeks }: { rows: readonly ActorRow[]; weeks:
  * sort last in both directions. `CANNOT ASSESS` has no place among green, amber and red, and "who is
  * worst" is a question about the graded people read either way round.
  *
- * A service older than 2026-09-02 sends no `labels` key at all, and reads the same way: everybody is
- * unassessable rather than the page failing to render.
+ * WHICH NEEDS `labelled`, because an empty list has two causes and `domain.actor_labels` says so:
+ * every repository `cannot_assess`, or a readiness policy switched off so no repository carries a
+ * label at all. Only the first is what the badge above describes. Under the second, "Cannot assess"
+ * would tell every reader their estate's merge gates were unreadable when nothing was ever graded —
+ * and `/repositories` and `/teams` would be saying "Not assessed" about the same repositories on the
+ * same deployment. So the page reads the window's label distribution once, through `anyLabelled`,
+ * and an ungraded estate gets the site's own word for ungraded.
+ *
+ * A service older than 2026-09-02 sends no `labels` key at all, and reads the same way as an empty
+ * one: unassessable rather than the page failing to render.
  */
-function Readiness({ labels }: { labels?: readonly ReadinessLabel[] }) {
+function Readiness({ labels, labelled }: { labels?: readonly ReadinessLabel[]; labelled: boolean }) {
+  if (!labelled) {
+    return <RAGLabel />;
+  }
   if (labels === undefined || labels.length === 0) {
     return <RAGLabel label="cannot_assess" />;
   }

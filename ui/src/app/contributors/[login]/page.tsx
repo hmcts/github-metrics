@@ -30,17 +30,17 @@ export default async function ActorPage({
   params,
   searchParams,
 }: {
-  params: { login: string };
-  searchParams?: { weeks?: SearchValue };
+  params: Promise<{ login: string }>;
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
   const windows = await getWindows();
   const weeks = resolveWeeks(
-    searchParams?.weeks,
-    cookies().get(WEEKS_COOKIE)?.value,
+    (await searchParams)?.weeks,
+    (await cookies()).get(WEEKS_COOKIE)?.value,
     windows.options,
     windows.default,
   );
-  const detail = await readActor(params.login, weeks);
+  const detail = await readActor((await params).login, weeks);
   const actor = detail.actor;
 
   return (

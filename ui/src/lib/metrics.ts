@@ -161,5 +161,8 @@ export function metricTone(
   // The clear and caution sections read exactly as they do in the assessment above, informational
   // conditions included — none of the nine metrics is informational today, and if one becomes so
   // the card follows the policy rather than needing to be told again here.
-  return conditionTone(found.outcome, found.condition) ?? 'neutral';
+  //
+  // No fallback: the blocking outcome returned above, and `conditionTone` answers with a tone for
+  // both of the two that are left.
+  return conditionTone(found.outcome, found.condition);
 }

@@ -6,6 +6,7 @@ import { NavWeekSelector } from '@/components/NavWeekSelector';
 import { OrganisationHeader } from '@/components/OrganisationHeader';
 import { Section } from '@/components/Section';
 import { getActors, getOverview, getWindows } from '@/lib/api';
+import { anyLabelled } from '@/lib/rag';
 import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
 
 /**
@@ -19,19 +20,21 @@ import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
  * Three requests where the overview made five — `/windows` for the spans, `/overview` for what the
  * header states, and `/actors` for the rows. `/overview` is fetched for the header rather than the
  * figures, which is a request this page would otherwise not need; it comes from the same built bundle
- * as the list, so it costs a round trip and no rebuild.
+ * as the list, so it costs a round trip and no rebuild. Its label distribution is read for one thing
+ * besides the header — whether the policy graded anything at all in this window, which the readiness
+ * column needs and no single row can say.
  */
 export const dynamic = 'force-dynamic';
 
 export default async function ContributorsPage({
   searchParams,
 }: {
-  searchParams?: { weeks?: SearchValue };
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
   const windows = await getWindows();
   const weeks = resolveWeeks(
-    searchParams?.weeks,
-    cookies().get(WEEKS_COOKIE)?.value,
+    (await searchParams)?.weeks,
+    (await cookies()).get(WEEKS_COOKIE)?.value,
     windows.options,
     windows.default,
   );
@@ -53,7 +56,10 @@ export default async function ContributorsPage({
             detail="Run metrics collect for the span being asked for, or widen the window."
           />
         ) : (
-          <ActorsTable rows={actors} weeks={weeks} />
+          // `/overview`'s label distribution is what says whether the policy graded anything in this
+          // window; one person's empty label list cannot tell an unreadable estate from an ungraded
+          // one. Fetched here already, for the header, so this costs no request.
+          <ActorsTable rows={actors} weeks={weeks} labelled={anyLabelled(overview.labels)} />
         )}
       </Section>
     </div>

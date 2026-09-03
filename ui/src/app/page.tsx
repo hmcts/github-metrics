@@ -16,10 +16,10 @@ import { landingTarget, type SearchValue } from '@/lib/weeks';
  */
 export const dynamic = 'force-dynamic';
 
-export default function LandingPage({
+export default async function LandingPage({
   searchParams,
 }: {
-  searchParams?: { weeks?: SearchValue };
+  searchParams?: Promise<{ weeks?: SearchValue }>;
 }) {
-  redirect(landingTarget(searchParams?.weeks));
+  redirect(landingTarget((await searchParams)?.weeks));
 }
