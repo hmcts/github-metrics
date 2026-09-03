@@ -50,6 +50,8 @@ const ROWS: RepositoryRow[] = [
     currently_open: 2,
     stale_open: 5,
     finding_occurrences: 7,
+    codeowners_files: 2,
+    sonar_reported: false,
   },
   {
     repository: 'api',
@@ -65,6 +67,10 @@ const ROWS: RepositoryRow[] = [
     currently_open: 6,
     stale_open: 0,
     finding_occurrences: 2,
+    // The two answers are crossed over from `web`'s, so a header wired to the other column's reader
+    // sorts the rows the other way round and fails rather than agreeing by coincidence.
+    codeowners_files: 0,
+    sonar_reported: true,
   },
 ];
 
@@ -75,6 +81,32 @@ function order(): string[] {
     .slice(1)
     .map((row) => within(row).getAllByRole('cell')[1]?.textContent ?? '')
     .map((cell) => cell.replace('No merge activity in this window.', ''));
+}
+
+/**
+ * One row's CODEOWNERS and Sonar cells, found where the header order puts those two columns.
+ *
+ * Read by header name rather than by a hardcoded pair of positions: a column inserted before Stale
+ * would otherwise leave these tests silently comparing two unrelated cells, and passing.
+ */
+function governanceCells(entry: HTMLElement): (HTMLElement | undefined)[] {
+  const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
+  const row = within(entry).getAllByRole('cell');
+  return ['CODEOWNERS', 'Sonar'].map((label) => row[headers.indexOf(label)]);
+}
+
+/** One row's two governance answers as text. */
+function answers(repository: string): (string | undefined)[] {
+  const entry = screen
+    .getAllByRole('row')
+    .slice(1)
+    .find((row) => within(row).getAllByRole('cell')[1]?.textContent?.startsWith(repository));
+  return governanceCells(entry as HTMLElement).map((cell) => cell?.textContent);
+}
+
+/** Every CODEOWNERS and Sonar cell in the table, whatever each of them answers. */
+function governance(): (HTMLElement | undefined)[] {
+  return screen.getAllByRole('row').slice(1).flatMap(governanceCells);
 }
 
 function header(label: string): HTMLElement {
@@ -122,7 +154,23 @@ describe('RepositoriesTable sorting', () => {
     expect(sortBy('Direct commits')).toEqual(['docs', 'web', 'api']);
     expect(sortBy('Open')).toEqual(['web', 'docs', 'api']);
     expect(sortBy('Stale')).toEqual(['docs', 'web', 'api']);
+    // No below Yes, and `api`'s unreadable answer last — the two columns disagree on which
+    // repository answers Yes, so each header has to be reading its own field.
+    expect(sortBy('CODEOWNERS')).toEqual(['docs', 'web', 'api']);
+    expect(sortBy('Sonar')).toEqual(['web', 'docs', 'api']);
     expect(sortBy('Findings')).toEqual(['docs', 'web', 'api']);
+  });
+
+  it('keeps the unreadable answer last when either governance column is reversed', () => {
+    mount();
+
+    sortBy('CODEOWNERS');
+    expect(sortBy('CODEOWNERS')).toEqual(['web', 'docs', 'api']);
+    expect(announced('CODEOWNERS')).toBe('descending');
+
+    sortBy('Sonar');
+    expect(sortBy('Sonar')).toEqual(['docs', 'web', 'api']);
+    expect(announced('Sonar')).toBe('descending');
   });
 
   it('reverses the column already sorted, and opens any other one ascending', () => {
@@ -153,6 +201,46 @@ describe('RepositoriesTable sorting', () => {
     sortBy('Merged');
 
     expect(replaced).toEqual([]);
+  });
+});
+
+describe('RepositoriesTable columns', () => {
+  it('heads the ten columns in order, the two governance answers after Stale', () => {
+    mount();
+
+    expect(screen.getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual([
+      'Team',
+      'Repository',
+      'Readiness',
+      'Merged',
+      'Direct commits',
+      'Open',
+      'Stale',
+      'CODEOWNERS',
+      'Sonar',
+      'Findings',
+    ]);
+  });
+
+  // All three answers a governance cell can print, on the three rows that produce them: a file
+  // found, a repository read that held none, and one nobody could read.
+  it('prints Yes, No and a dash, never a zero for an answer that was not read', () => {
+    mount();
+
+    expect(answers('web')).toEqual(['Yes', 'No']);
+    expect(answers('docs')).toEqual(['No', 'Yes']);
+    expect(answers('api')).toEqual(['-', '-']);
+  });
+
+  // Read off the whole cell rather than its own class list: the readiness cell three columns to the
+  // left is toned by a span INSIDE an uncoloured `<td>`, so a governance answer coloured the same way
+  // would slip past an assertion that only looked at the cell element.
+  it('tones neither answer: no cell in this table carries a grade', () => {
+    mount();
+
+    for (const cell of governance()) {
+      expect(cell?.outerHTML).not.toMatch(/emerald|amber|rose|rag-|red|green/);
+    }
   });
 });
 

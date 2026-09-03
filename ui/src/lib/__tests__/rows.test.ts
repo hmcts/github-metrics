@@ -8,6 +8,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  answerOrder,
+  codeownersPresent,
   filterRepositories,
   matchesRepository,
   orderRepositories,
@@ -87,6 +89,29 @@ describe('filterRepositories', () => {
   it('filters on the term alone when no readiness was named', () => {
     expect(filterRepositories(ROWS, 'legacy', null)).toHaveLength(1);
     expect(filterRepositories(ROWS, '', null)).toHaveLength(ROWS.length);
+  });
+});
+
+describe('codeownersPresent', () => {
+  it('answers yes on a file found and no on a repository that was read and held none', () => {
+    expect(codeownersPresent(row({ repository: 'hmcts/api', codeowners_files: 1 }))).toBe(true);
+    expect(codeownersPresent(row({ repository: 'hmcts/api', codeowners_files: 3 }))).toBe(true);
+    expect(codeownersPresent(row({ repository: 'hmcts/api', codeowners_files: 0 }))).toBe(false);
+  });
+
+  it('answers nothing where the count is absent, which is contents nobody could read', () => {
+    expect(codeownersPresent(row({ repository: 'hmcts/api' }))).toBeUndefined();
+  });
+});
+
+describe('answerOrder', () => {
+  it('orders no below yes, so ascending opens on the repositories without one', () => {
+    expect(answerOrder(false)).toBe(0);
+    expect(answerOrder(true)).toBe(1);
+  });
+
+  it('leaves an unreadable answer undefined, the value `sorted` holds back from both ends', () => {
+    expect(answerOrder(undefined)).toBeUndefined();
   });
 });
 

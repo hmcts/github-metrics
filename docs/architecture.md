@@ -1378,10 +1378,11 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   a cache the service cannot read must fail while a human is watching.
   THE THREE ESTATE LISTS ARE ROUTES, NOT SECTIONS OF ONE PAGE (2026-09-02). `/repositories` is the
   landing page and carries what the overview carried — the organisation header, the four estate
-  figures and the readiness donut, joined on 2026-09-03 by four more donuts (enforced review,
-  enforced CI, unreviewed substantial merging and test coverage) drawn off the `/repositories` rows'
+  figures and the readiness donut, joined on 2026-09-03 by five more donuts (enforced review,
+  enforced CI, unreviewed substantial merging, test coverage and security issues) drawn off the
+  `/repositories` rows'
   own fields, each counting EVERY configured repository at the span with an unknown band for the ones
-  nothing could be read for, and none of the five filtered by the search box, because a picture that
+  nothing could be read for, and none of the six filtered by the search box, because a picture that
   moved with a filter would still be read as the estate — while `/contributors` and `/teams` carry the same header above
   their own list and nothing else; `/` redirects to `/repositories`, carrying `?weeks=` through so a
   link to the old landing page does not silently change the window. THE NAV BAR'S OWN THREE LINKS
@@ -1453,6 +1454,17 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
     without judging, which is the neutral trio and `sufficient-merges` — so a renderer can tell a
     satisfied check from one that bears on the label in neither state. It adds no line to the text
     report and changes no label.
+    A DONUT MAY BAND A FIGURE STRICTER THAN THE CARD BESIDE IT (2026-09-03, at the user's
+    instruction). `securityBand` bands the estate's security donut on the worst of six signals — the
+    three alert families through `alertTone`, and SonarCloud's security rating, issues and hotspots —
+    and puts a security rating of C at High where `sonarRatingTone` puts the same letter at amber,
+    following Sonar's own scale. This is the first case of TWO UI THRESHOLDS GRADING ONE FIGURE
+    DIFFERENTLY, and it is allowed because the two answer different questions about the letter: the
+    repository page's card reports Sonar's grading, and the donut answers which repositories are
+    worth opening. Both boundaries stay in `tone.ts` with the divergence stated beside each, neither
+    reaches `assessment.py`, and security stays report-only and ungraded in the report. The three
+    alert families are the countervailing rule: the donut delegates to the same `alertTone` the cards
+    use, so donut and card can never disagree about a family.
   - PER-PERSON COUNTS BESIDE A LOGIN ON A REPOSITORY PAGE ARE IN SCOPE (2026-09-02, at the user's
     instruction). The contributors table on `/repositories/[repository]` carries, per login,
     contributions, pull requests merged, pushes straight onto the default branch, merges that

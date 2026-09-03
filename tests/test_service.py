@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
@@ -20,7 +21,10 @@ from metrics.config import Configuration, LookbackConfiguration
 from metrics.domain import (
     ActorReadiness,
     ActorRepositoryReadiness,
+    AlertSeverity,
     BehaviourMetricSummary,
+    CodeownersEvidence,
+    CodeownersFile,
     CodeownersReport,
     CohortSummary,
     EvidenceSource,
@@ -30,6 +34,7 @@ from metrics.domain import (
     MergeGateEvidence,
     MergeGateReport,
     ObservationStatus,
+    OpenAlertCount,
     OpenPullRequestReport,
     OpenPullRequestSummary,
     PracticeEvidenceReport,
@@ -42,8 +47,10 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryPracticeEvidence,
     RepositoryTrend,
+    SecurityAlertEvidence,
     SecurityAlertReport,
     SonarMeasures,
+    SonarRating,
     SonarReport,
     SourceCoverage,
     StatusCheck,
@@ -273,6 +280,45 @@ def sonar_report(coverage: float | None) -> SonarReport:
     return SonarReport(
         fetched_at=ends_at(),
         measures=SonarMeasures(project_key="hmcts_cath-service", coverage=coverage),
+    )
+
+
+def sonar_security_report(
+    rating: SonarRating | None = None,
+    issues: int | None = None,
+    hotspots: int | None = None,
+) -> SonarReport:
+    """Return a Sonar block whose measures carry the given security figures and nothing else."""
+    return SonarReport(
+        fetched_at=ends_at(),
+        measures=SonarMeasures(
+            project_key="hmcts_cath-service",
+            security_rating=rating,
+            security_issues=issues,
+            security_hotspots=hotspots,
+        ),
+    )
+
+
+def codeowners_report(*paths: str, recognised: bool = True) -> CodeownersReport:
+    """Return a CODEOWNERS block reporting a file at each named path, or none at all."""
+    return CodeownersReport(
+        fetched_at=ends_at(),
+        codeowners=CodeownersEvidence(
+            files=tuple(CodeownersFile(path=path, size_bytes=120, recognised_by_github=recognised) for path in paths),
+        ),
+    )
+
+
+def security_report() -> SecurityAlertReport:
+    """Return a security block with one readable family, one clear family and one GitHub refused."""
+    return SecurityAlertReport(
+        fetched_at=ends_at(),
+        alerts=SecurityAlertEvidence(
+            dependabot=OpenAlertCount(open=3, by_severity={AlertSeverity.HIGH: 2, AlertSeverity.LOW: 1}),
+            code_scanning=OpenAlertCount(open=0),
+            secret_scanning=OpenAlertCount(detail="alerts are not readable with this token"),
+        ),
     )
 
 
@@ -1299,6 +1345,117 @@ def test_a_project_covering_none_of_its_lines_is_served_as_zero_rather_than_omit
     row = listed(sonar=sonar_report(0))
 
     assert row["sonar_coverage"] == 0
+
+
+def test_a_listed_repository_counts_the_codeowners_files_it_holds(listed: Listing) -> None:
+    row = listed(codeowners=codeowners_report(".github/CODEOWNERS", "docs/CODEOWNERS"))
+
+    assert row["codeowners_files"] == 2
+
+
+def test_a_repository_holding_no_codeowners_file_is_counted_as_zero_rather_than_omitted(listed: Listing) -> None:
+    """Keep an observation an observation: every checked location was read and held no file."""
+    row = listed(codeowners=codeowners_report())
+
+    assert row["codeowners_files"] == 0
+
+
+def test_a_file_github_does_not_read_is_still_counted_by_the_row(listed: Listing) -> None:
+    """Count every file found, so the row and the repository card cannot disagree about one repository.
+
+    `codeownersCard` tones on the same raw total and names each file's `recognised_by_github` in its
+    detail line. Filtering the count here would leave the estate column answering No where the card
+    beside it reads one file, and the detail the distinction lives in is on the card, not the row.
+    """
+    row = listed(codeowners=codeowners_report("docs/CODEOWNERS.md", recognised=False))
+
+    assert row["codeowners_files"] == 1
+
+
+def test_an_unreadable_codeowners_block_leaves_the_count_absent_rather_than_zero(listed: Listing) -> None:
+    """Separate a repository owning nothing from one whose contents nobody could read."""
+    row = listed(codeowners=CodeownersReport(detail="repository contents are not readable with this token"))
+
+    assert "codeowners_files" not in row
+
+
+def test_a_listed_repository_with_readable_measures_reports_sonar(listed: Listing) -> None:
+    row = listed(sonar=sonar_report(81.5))
+
+    assert row["sonar_reported"] is True
+
+
+def test_a_repository_with_no_readable_measures_reports_no_sonar_rather_than_no_answer(listed: Listing) -> None:
+    """Answer False on a reportable row, so the column tells "no Sonar" from "no report"."""
+    row = listed(sonar=SonarReport(detail="no SonarCloud project resolved for this repository"))
+
+    assert row["sonar_reported"] is False
+
+
+def test_a_listed_repository_carries_the_three_sonar_security_measures(listed: Listing) -> None:
+    row = listed(sonar=sonar_security_report(rating=SonarRating(value=3.0), issues=7, hotspots=2))
+
+    assert row["sonar_security_rating"] == {"value": 3.0}
+    assert row["sonar_security_issues"] == 7
+    assert row["sonar_security_hotspots"] == 2
+
+
+def test_measures_reporting_no_security_metrics_leave_all_three_absent(listed: Listing) -> None:
+    """Distinguish a project measuring nothing about security from one measuring none of it."""
+    row = listed(sonar=sonar_report(81.5))
+
+    assert row["sonar_reported"] is True
+    assert "sonar_security_rating" not in row
+    assert "sonar_security_issues" not in row
+    assert "sonar_security_hotspots" not in row
+
+
+def test_a_project_with_nothing_open_reports_zeros_rather_than_omitting_them(listed: Listing) -> None:
+    """Keep a clean project a measurement: the security donut bands it clear."""
+    row = listed(sonar=sonar_security_report(issues=0, hotspots=0))
+
+    assert row["sonar_security_issues"] == 0
+    assert row["sonar_security_hotspots"] == 0
+
+
+def test_an_unreadable_sonar_block_leaves_all_three_security_measures_absent(listed: Listing) -> None:
+    row = listed(sonar=SonarReport(detail="no SonarCloud project resolved for this repository"))
+
+    assert "sonar_security_rating" not in row
+    assert "sonar_security_issues" not in row
+    assert "sonar_security_hotspots" not in row
+
+
+def test_a_listed_repository_carries_its_open_alerts_family_by_family(listed: Listing) -> None:
+    """Serve the alert block verbatim, so a clear family and a refused one stay distinguishable."""
+    row = listed(security=security_report())
+    alerts = cast("dict[str, object]", row["security"])
+
+    assert alerts["dependabot"] == {"open": 3, "by_severity": {"high": 2, "low": 1}}
+    assert alerts["code_scanning"] == {"open": 0, "by_severity": {}}
+    assert alerts["secret_scanning"] == {"by_severity": {}, "detail": "alerts are not readable with this token"}
+
+
+def test_a_security_block_carrying_a_reason_leaves_the_alerts_absent(listed: Listing) -> None:
+    row = listed(security=SecurityAlertReport(detail="no repository state has been collected; run metrics collect"))
+
+    assert "security" not in row
+
+
+def test_a_repository_the_window_cannot_cover_states_none_of_the_six_security_facts(client: TestClient) -> None:
+    """Leave all six absent where there is no evidence block, `sonar_reported` included.
+
+    `sonar_reported` is the one field that answers False rather than absent on a reportable
+    repository, so this is where "no report" has to stay apart from "no Sonar".
+    """
+    row = {item["repository"]: item for item in client.get("/repositories").json()}["other-service"]
+
+    assert "codeowners_files" not in row
+    assert "sonar_reported" not in row
+    assert "security" not in row
+    assert "sonar_security_rating" not in row
+    assert "sonar_security_issues" not in row
+    assert "sonar_security_hotspots" not in row
 
 
 def test_a_repository_reports_its_whole_evidence_block(client: TestClient) -> None:

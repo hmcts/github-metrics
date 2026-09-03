@@ -76,7 +76,7 @@ when it supports 10; `eslint.config.mjs` says the same thing beside the config i
 | Route | What it answers |
 | --- | --- |
 | `/` | nothing of its own: it redirects to `/repositories`, carrying `?weeks=` through where one was given |
-| `/repositories` | the estate at one span: counts, five donuts over every configured repository, and the repositories to drill into |
+| `/repositories` | the estate at one span: counts, six donuts over every configured repository, and the repositories to drill into |
 | `/teams` | every configured team at that span, with the labels its repositories carry |
 | `/contributors` | everyone who contributed to a reported repository at that span, by the labels their repositories carry |
 | `/repositories/[repository]` | one repository's whole evidence block and its periods since enablement |
@@ -87,18 +87,47 @@ The rows are in the order the nav bar puts them, which from 2026-09-02 reads dow
 repositories, the teams that own them, then the people who work in them.
 
 **The donuts on `/repositories` count every configured repository at the span, and the search box does not filter
-them.** They read Readiness labels, Enforces review, Enforces CI, Unreviewed substantial merges, then Test coverage —
-the label distribution off `/overview` and the other four off the rows' four service fields, added on 2026-09-03.
-`/overview`'s distribution covers the repositories the span could REPORT, so `distributionSlices` is handed
+them.** They read Readiness labels, Enforces review, Enforces CI, Unreviewed substantial merges, Test coverage, then
+Security issues — the label distribution off `/overview` and the other five off the rows' own service fields, added on
+2026-09-03. `/overview`'s distribution covers the repositories the span could REPORT, so `distributionSlices` is handed
 `overview.unavailable` beside it and counts those repositories as not assessed; without that the readiness donut would
-total less than the four next to it and read as a smaller estate. The
+total less than the five next to it and read as a smaller estate. The
 table narrows as a reader types and the pictures above it do not, because a donut that moved with a filter would still
-be read as the estate; the readiness one has always worked that way and the four follow it. Every band is drawn in the
+be read as the estate; the readiness one has always worked that way and the five follow it. Every band is drawn in the
 legend even where it counted nothing, so a legend states the whole scale while the wedge states only what exists, and a
 span with nothing to count says "No data" rather than drawing an empty ring. An unknown slice is always a repository
 nothing could be read for and never one measured at zero, and each donut's tooltip says which absences its own unknown
 covers — for the two gate donuts, that the gate says a check is required rather than which check it is or whether it
 passed.
+
+**Security issues bands on the worst of six signals**, because a repository is worth looking at for its worst one:
+the open Dependabot, code scanning and secret scanning alerts, and the SonarCloud security rating, issues and hotspots.
+High is a critical or high alert open, any secret scanning alert open at all, or a security rating of C or worse;
+Medium is any other alert open, a rating of B, or a Sonar security issue or hotspot above zero. The three alert
+families delegate to `alertTone`, which the repository page already colours its security cards with, so a donut and a
+card cannot disagree about one family. Unknown here is stricter than the word looks: it is a repository with **no**
+security data at all — every alert family withheld and no Sonar measures, or a span that could not report it — so a
+repository whose alerts were read clean and whose only gap is a SonarCloud project counts Clear.
+
+The rating threshold is the one place the UI is **deliberately stricter than the repository page**. `sonarRatingTone`
+puts C at amber, following Sonar's own scale; `securityBand` puts C at High, on the user's instruction, because this
+donut is read to find the repositories worth looking at. The divergence is stated in `tone.ts` beside both functions so
+it is not later "fixed" into agreement — the card reports Sonar's grading, the donut answers which repositories to open.
+
+**The estate table gained two governance columns between Stale and Findings** on 2026-09-03: CODEOWNERS and Sonar,
+both yes-or-no. CODEOWNERS reads Yes where the repository holds at least one CODEOWNERS file, No where every checked
+location was looked at and held none, and a dash where nobody could read the repository's contents. It answers whether a
+file is there, not whether GitHub reads it: a `.md` variant counts, because the repository page's CODEOWNERS card tones
+on the same total and names each file's recognition in its detail line, and a column that filtered would contradict the
+card beside it. Sonar reads Yes
+where its measures were read and No where no project resolved or the measures could not be read — it answers "is there
+Sonar information here", so its No is a fact rather than an absence, and only a repository the span could not report at
+all dashes. Both sort on the answer their own cell prints rather than the count behind it, and both put an unreadable
+answer last in either direction, as every column does. Neither is coloured: no figure in this table carries a tone, and
+neither answer is a grade — a repository with no CODEOWNERS file may be owned perfectly well by a rule the collector
+cannot see. `RepositoriesTable` is shared, so both columns appear on `/teams/[team]` as well, and the table there reads
+Team, Repository, Readiness, Merged, Direct commits, Open, Stale, CODEOWNERS, Sonar, Findings exactly as `/repositories`
+does.
 
 **The three lists were one page until 2026-09-02**, with the nav pointing at `#repositories`, `#actors` and `#teams`
 anchors down it. They are routes now, so a link names what it lands on and a reader loads the third of the estate they
@@ -223,10 +252,11 @@ place:
   colour meaning something where there is one.
 - **The threshold lives in `tone.ts` and nowhere else.** No component holds a boundary and no hex literal appears in
   one. Each function names its `assessment.py` counterpart in a comment where one exists, so a page and the policy can
-  be checked against each other by reading them side by side. The four donut band tables are there for that reason
+  be checked against each other by reading them side by side. The five donut band tables are there for that reason
   too — the key, the word and the mark per band, best first, with `lib/chart.ts` only counting rows into them — and
   `coverageTone` is one function the repository page's Sonar measure and the coverage donut both read, so moving the
-  90/80 boundary moves both.
+  90/80 boundary moves both. Where a donut deliberately grades a figure differently from the page, as `securityBand`
+  does a Sonar security rating of C, the divergence and the instruction behind it are stated in the comment.
 - **A chart mark comes from `TONE_HEX`**, which derives from `RAG_HEX` rather than restating the four hexes: recharts
   takes a fill as a string, so a donut cannot reach a Tailwind class, and a second copy of the palette is how a wedge
   and the row it counts drift into two greens nobody chose. `STRONG_GOOD_HEX` is the single mark that is not a tone.

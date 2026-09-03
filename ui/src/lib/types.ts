@@ -418,14 +418,24 @@ export interface OverviewSummary {
 /**
  * One repository in a list, whether this window could be reported for it or not.
  *
- * The last four say what the row's own counts cannot, so `/repositories` can distribute the estate
- * without loading every evidence block. Each is UNMEASURED WHEN ABSENT, as every count above it is:
- * the two gate figures where there is no gate to read or its rules were withheld,
- * `unreviewed_substantial` where the policy graded nothing, and `sonar_coverage` where no SonarCloud
- * project resolved, its measures could not be read, or it sent no coverage metric. All four are
- * absent besides on a repository the window could not be reported for at all, the row that carries
- * `detail`. None of the four is zero by default — an unprotected default branch is the one thing that
- * reads as a real `0`, because the gate was read and it requires nothing.
+ * Everything after `finding_occurrences` says what the row's own counts cannot, so `/repositories`
+ * can distribute the estate and answer for its governance without loading every evidence block. Each
+ * is UNMEASURED WHEN ABSENT, as every count above it is: the two gate figures where there is no gate
+ * to read or its rules were withheld, `unreviewed_substantial` where the policy graded nothing,
+ * `sonar_coverage` and the three Sonar security measures where no SonarCloud project resolved, its
+ * measures could not be read, or it sent no such metric, `codeowners_files` where nobody could read
+ * the repository's contents, and `security` where the whole alert block carries a reason instead of
+ * alerts. All of them are absent besides on a repository the window could not be reported for at all,
+ * the row that carries `detail`. None of them is zero by default — an unprotected default branch is
+ * the one thing that reads as a real `0`, because the gate was read and it requires nothing.
+ *
+ * `sonar_reported` is the one exception, and is `false` RATHER THAN ABSENT on a reportable repository
+ * whose measures could not be read or whose project never resolved: the column it feeds answers "is
+ * there Sonar information here", so "no Sonar" and "no report" have to stay apart.
+ *
+ * `security` carries `SecurityAlertEvidence` verbatim rather than flattened into scalars, because the
+ * per-family `open`/`by_severity`/`detail` is what `securityBand` needs — a family with nothing open
+ * and one GitHub refused are different answers, and only the block itself keeps them apart.
  */
 export interface RepositoryRow {
   repository: string;
@@ -440,6 +450,12 @@ export interface RepositoryRow {
   required_status_checks?: number;
   unreviewed_substantial?: UnreviewedSubstantialOutcome;
   sonar_coverage?: number;
+  codeowners_files?: number;
+  sonar_reported?: boolean;
+  security?: SecurityAlertEvidence;
+  sonar_security_rating?: SonarRating;
+  sonar_security_issues?: number;
+  sonar_security_hotspots?: number;
   detail?: string;
 }
 

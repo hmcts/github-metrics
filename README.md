@@ -1425,6 +1425,28 @@ block's field of the same name, and `sonar_coverage` off `sonar.measures.coverag
 means unmeasured, as every other count on the row does — none of them defaults to zero, so a repository with no
 SonarCloud project resolved reads as unknown rather than as a project reporting no coverage.
 
+Six more landed the same day, for the security donut and the two governance columns beside Stale:
+
+| Field | Read from | Absent when |
+| --- | --- | --- |
+| `codeowners_files` | how many CODEOWNERS files the block found, recognised by GitHub or not | nobody could read the repository's contents |
+| `sonar_reported` | whether Sonar measures were read | only on the unreportable branch — see below |
+| `security` | the security block's `alerts`, verbatim | the whole block carries a reason instead |
+| `sonar_security_rating` | `sonar.measures.security_rating` | no measures, or the project sent no rating |
+| `sonar_security_issues` | `sonar.measures.security_issues` | the same two cases |
+| `sonar_security_hotspots` | `sonar.measures.security_hotspots` | the same two cases |
+
+`sonar_reported` is the one field on the row that is **`False` rather than absent** where there is nothing to report: a
+reportable repository whose project never resolved, or whose measures could not be read, reads `False`, because the
+column it feeds answers "is there Sonar information here" and "no Sonar" has to stay apart from "no report". Only the
+unreportable branch leaves it absent, as it leaves every field but the repository, its team and the reason absent.
+
+`security` carries `SecurityAlertEvidence` whole rather than flattening its three alert families into scalars. The
+per-family `open`/`by_severity`/`detail` is what a band needs: a family with nothing open and one GitHub refused are
+different answers, and only the block itself keeps them apart. Security stays report-only and ungraded here — no
+readiness condition reads any of these six — so the band the donut draws is decided in the UI's own threshold table
+(see [`ui/README.md`](ui/README.md#colour)).
+
 The two gate fields are read in the precedence `ReadinessPolicy.governance` reads a gate in, which is what decides
 whether a repository lands in the red slice of a donut or the grey one:
 
@@ -1437,7 +1459,8 @@ whether a repository lands in the red slice of a donut or the grey one:
 4. otherwise the strictest `required_approving_review_count` across the gate's rules, and how many **distinct**
    required status-check contexts its rulesets name — two rulesets both demanding `build` demand one check.
 
-So an unprotected branch reads as **not required** and a protected branch with withheld rules reads as **unknown**. The
+So an unprotected branch reads as **unenforced** — the word the donut band carries — and a protected branch with
+withheld rules reads as **unknown**. The
 figures themselves are the `required_approvals` and `required_contexts` properties on the gate, which `metrics evidence`
 already prints the same two figures from, so the page and the text report cannot disagree about one gate.
 

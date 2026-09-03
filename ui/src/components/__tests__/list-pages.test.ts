@@ -56,8 +56,14 @@ const OVERVIEW: OverviewSummary = {
  * Three repositories: one measured well, one measured badly, and one nothing could be read on.
  *
  * The third is what the donuts are counted against — no label and every field absent, so each of
- * the five bands it lands in is the ungraded one and every donut still totals three.
+ * the six bands it lands in is the ungraded one and every donut still totals three.
  */
+const CLEAR_ALERTS = {
+  dependabot: { open: 0, by_severity: {} },
+  code_scanning: { open: 0, by_severity: {} },
+  secret_scanning: { open: 0, by_severity: {} },
+};
+
 const REPOSITORIES: RepositoryRow[] = [
   {
     repository: 'api',
@@ -67,6 +73,10 @@ const REPOSITORIES: RepositoryRow[] = [
     required_status_checks: 3,
     unreviewed_substantial: 'none',
     sonar_coverage: 92.5,
+    security: CLEAR_ALERTS,
+    sonar_security_rating: { value: 1 },
+    sonar_security_issues: 0,
+    sonar_security_hotspots: 0,
   },
   {
     repository: 'web',
@@ -76,6 +86,10 @@ const REPOSITORIES: RepositoryRow[] = [
     required_status_checks: 0,
     unreviewed_substantial: 'above',
     sonar_coverage: 41,
+    security: { ...CLEAR_ALERTS, dependabot: { open: 2, by_severity: { critical: 1, low: 1 } } },
+    sonar_security_rating: { value: 2 },
+    sonar_security_issues: 3,
+    sonar_security_hotspots: 1,
   },
   { repository: 'batch', team: 'platform', detail: 'no window could be reported for this repository' },
 ];
@@ -263,13 +277,14 @@ describe('the three list routes', () => {
     expect(reported).toContain('all reported');
   });
 
-  /** The five donut titles, in the order they are drawn in. */
+  /** The six donut titles, in the order they are drawn in. */
   const DONUTS = [
     'Readiness labels',
     'Enforces review',
     'Enforces CI',
     'Unreviewed substantial merges',
     'Test coverage',
+    'Security issues',
   ];
 
   /**
@@ -294,15 +309,15 @@ describe('the three list routes', () => {
   }
 
   /**
-   * The five estate donuts, each counting EVERY repository at the span.
+   * The six estate donuts, each counting EVERY repository at the span.
    *
    * The counts are the point rather than the titles: a donut wired to the wrong slice builder, or one
-   * quietly dropping the rows whose field is absent, renders five headings just the same. So the
+   * quietly dropping the rows whose field is absent, renders six headings just the same. So the
    * unmeasured repository is asserted into each ungraded band, and every donut — the readiness one
    * included, which is distributed over the REPORTED repositories and has to be told about the rest —
    * is asserted to total the three the estate holds.
    */
-  it('draws five donuts over the estate, counting the unmeasured repository in each', async () => {
+  it('draws six donuts over the estate, counting the unmeasured repository in each', async () => {
     stubService();
     const markup = renderToStaticMarkup(await RepositoriesPage({ searchParams: Promise.resolve({}) }));
 
@@ -316,13 +331,13 @@ describe('the three list routes', () => {
 
     expect(legend(markup, 'Enforces review')).toEqual({
       Multiple: 1,
-      Required: 0,
-      'Not required': 1,
+      Enforced: 0,
+      Unenforced: 1,
       Unknown: 1,
     });
-    expect(legend(markup, 'Enforces CI')).toEqual({ Required: 1, 'Not required': 1, Unknown: 1 });
+    expect(legend(markup, 'Enforces CI')).toEqual({ Enforced: 1, Unenforced: 1, Unknown: 1 });
     expect(legend(markup, 'Unreviewed substantial merges')).toEqual({
-      'None unreviewed': 1,
+      Clear: 1,
       'Within allowance': 0,
       'Above allowance': 1,
       Unknown: 1,
@@ -331,6 +346,14 @@ describe('the three list routes', () => {
       '90% or more': 1,
       '80% to under 90%': 0,
       'Below 80%': 1,
+      Unknown: 1,
+    });
+    // Clear alerts and an A rating against a critical Dependabot alert, which outranks the B rating
+    // and the open issues beside it: the band is the worst signal on the row, not a tally of them.
+    expect(legend(markup, 'Security issues')).toEqual({
+      Clear: 1,
+      Medium: 0,
+      High: 1,
       Unknown: 1,
     });
     expect(legend(markup, 'Readiness labels')).toEqual({

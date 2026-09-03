@@ -15,10 +15,12 @@ import {
   CHECKS_BANDS,
   COVERAGE_BANDS,
   REVIEW_BANDS,
+  SECURITY_BANDS,
   UNREVIEWED_BANDS,
   checksBand,
   coverageBand,
   reviewBand,
+  securityBand,
   unreviewedBand,
   type Band,
 } from '@/lib/tone';
@@ -80,9 +82,9 @@ export function bandSlices<Key extends string, Item>(
 }
 
 /**
- * The four estate donuts, each counting EVERY row it is given.
+ * The five estate donuts, each counting EVERY row it is given.
  *
- * A row whose field is absent is counted unknown rather than dropped, so the four totals and the
+ * A row whose field is absent is counted unknown rather than dropped, so the five totals and the
  * readiness donut beside them all add up to the same number of repositories — a donut that quietly
  * shrank to the measured ones would report a coverage gap as a smaller estate.
  */
@@ -100,6 +102,15 @@ export function unreviewedSlices(rows: readonly RepositoryRow[]): PieSlice[] {
 
 export function coverageSlices(rows: readonly RepositoryRow[]): PieSlice[] {
   return bandSlices(COVERAGE_BANDS, rows, (row) => coverageBand(row.sonar_coverage));
+}
+
+/**
+ * The security donut, banded off the row itself: `RepositoryRow` carries the four fields
+ * `SecuritySignals` names — six signals between them — so the row is passed through whole rather
+ * than picked apart here.
+ */
+export function securitySlices(rows: readonly RepositoryRow[]): PieSlice[] {
+  return bandSlices(SECURITY_BANDS, rows, (row) => securityBand(row));
 }
 
 export function totalValue(slices: readonly PieSlice[]): number {

@@ -13,6 +13,7 @@ import {
   CHECKS_BANDS,
   COVERAGE_BANDS,
   REVIEW_BANDS,
+  SECURITY_BANDS,
   STRONG_GOOD_HEX,
   TONES,
   TONE_BORDER,
@@ -31,6 +32,7 @@ import {
   maintenanceTone,
   openPullRequestTone,
   reviewBand,
+  securityBand,
   sonarGateTone,
   sonarMeasureTone,
   sonarRatingTone,
@@ -38,7 +40,12 @@ import {
   valueClass,
 } from '@/lib/tone';
 import type { Band, GateField, OpenPullRequestField, SonarMeasure } from '@/lib/tone';
-import type { OpenAlertCount, SonarMeasures, UnreviewedSubstantialOutcome } from '@/lib/types';
+import type {
+  OpenAlertCount,
+  SecurityAlertEvidence,
+  SonarMeasures,
+  UnreviewedSubstantialOutcome,
+} from '@/lib/types';
 
 /** The measures a repository reported, with only the fields one case is about filled in. */
 function measures(fields: Partial<SonarMeasures> = {}): SonarMeasures {
@@ -47,6 +54,22 @@ function measures(fields: Partial<SonarMeasures> = {}): SonarMeasures {
 
 function alerts(fields: Partial<OpenAlertCount> = {}): OpenAlertCount {
   return { by_severity: {}, ...fields };
+}
+
+/** A security block whose three families are all clear, bar the one a case is about. */
+function security(families: Partial<SecurityAlertEvidence> = {}): SecurityAlertEvidence {
+  return {
+    dependabot: alerts({ open: 0 }),
+    code_scanning: alerts({ open: 0 }),
+    secret_scanning: alerts({ open: 0 }),
+    ...families,
+  };
+}
+
+/** A block GitHub refused every family of, which is the shape that carries no security data. */
+function refusedSecurity(): SecurityAlertEvidence {
+  const refused = alerts({ detail: 'alerts are not enabled for this repository' });
+  return { dependabot: refused, code_scanning: refused, secret_scanning: refused };
 }
 
 describe('tone maps', () => {
@@ -98,7 +121,13 @@ describe('tone maps', () => {
 
 describe('donut bands', () => {
   /** Every table: the marks a reader tells the bands apart by, and the order they read in. */
-  const TABLES: readonly (readonly Band[])[] = [REVIEW_BANDS, CHECKS_BANDS, UNREVIEWED_BANDS, COVERAGE_BANDS];
+  const TABLES: readonly (readonly Band[])[] = [
+    REVIEW_BANDS,
+    CHECKS_BANDS,
+    UNREVIEWED_BANDS,
+    COVERAGE_BANDS,
+    SECURITY_BANDS,
+  ];
 
   it('ends every table with the unmeasured band, in the slate an ungraded row is drawn in', () => {
     for (const table of TABLES) {
@@ -122,6 +151,7 @@ describe('donut bands', () => {
     expect(CHECKS_BANDS.map((band) => band.key)).toEqual(['required', 'none', 'unknown']);
     expect(UNREVIEWED_BANDS.map((band) => band.key)).toEqual(['none', 'within', 'above', 'unknown']);
     expect(COVERAGE_BANDS.map((band) => band.key)).toEqual(['high', 'moderate', 'low', 'unknown']);
+    expect(SECURITY_BANDS.map((band) => band.key)).toEqual(['clear', 'medium', 'high', 'unknown']);
   });
 });
 
@@ -368,6 +398,78 @@ describe('security alerts', () => {
     for (const family of ['dependabot', 'code-scanning', 'secret-scanning'] as const) {
       expect(alertTone(family, refused)).toBe('neutral');
     }
+  });
+});
+
+describe('the security band', () => {
+  it('bands a repository on its worst signal, however clean the rest read', () => {
+    expect(
+      securityBand({
+        security: security({ dependabot: alerts({ open: 1, by_severity: { critical: 1 } }) }),
+        sonar_security_rating: { value: 1 },
+        sonar_security_issues: 0,
+        sonar_security_hotspots: 0,
+      }),
+    ).toBe('high');
+  });
+
+  it('raises High and Medium off each alert family on its own', () => {
+    const severe = alerts({ open: 2, by_severity: { high: 1, low: 1 } });
+    const mild = alerts({ open: 2, by_severity: { medium: 1, low: 1 } });
+    expect(securityBand({ security: security({ dependabot: severe }) })).toBe('high');
+    expect(securityBand({ security: security({ dependabot: mild }) })).toBe('medium');
+    expect(securityBand({ security: security({ code_scanning: severe }) })).toBe('high');
+    expect(securityBand({ security: security({ code_scanning: mild }) })).toBe('medium');
+    // Secret scanning reports no severity, so any open secret is High and it has no Medium.
+    expect(securityBand({ security: security({ secret_scanning: alerts({ open: 1 }) }) })).toBe('high');
+  });
+
+  it('reads a family GitHub refused as no data rather than as nothing open', () => {
+    const refused = alerts({ detail: 'alerts are not enabled for this repository' });
+    // The other two families were read and are clear, so the repository is Clear on those alone.
+    expect(securityBand({ security: security({ code_scanning: refused }) })).toBe('clear');
+    expect(securityBand({ security: refusedSecurity() })).toBe('unknown');
+  });
+
+  it('puts a C security rating at High, stricter than the repository page colours the letter', () => {
+    // Deliberate divergence: `sonarRatingTone` follows Sonar's scale and puts C at amber.
+    expect(securityBand({ sonar_security_rating: { value: 1 } })).toBe('clear');
+    expect(securityBand({ sonar_security_rating: { value: 2 } })).toBe('medium');
+    expect(securityBand({ sonar_security_rating: { value: 3 } })).toBe('high');
+    expect(sonarRatingTone({ value: 3 })).toBe('warn');
+    expect(securityBand({ sonar_security_rating: { value: 4 } })).toBe('high');
+    expect(securityBand({ sonar_security_rating: { value: 5 } })).toBe('high');
+  });
+
+  it('reads a rating off the 1-to-5 scale as no data, not as the worst there is', () => {
+    expect(securityBand({ sonar_security_rating: { value: 0 } })).toBe('unknown');
+    expect(securityBand({ sonar_security_rating: { value: 6 } })).toBe('unknown');
+    expect(securityBand({ sonar_security_rating: { value: 2.5 } })).toBe('unknown');
+    expect(securityBand({ sonar_security_rating: null })).toBe('unknown');
+  });
+
+  it('cautions on a Sonar issue or hotspot above zero, and clears one at zero', () => {
+    expect(securityBand({ sonar_security_issues: 0 })).toBe('clear');
+    expect(securityBand({ sonar_security_issues: 1 })).toBe('medium');
+    expect(securityBand({ sonar_security_hotspots: 0 })).toBe('clear');
+    expect(securityBand({ sonar_security_hotspots: 12 })).toBe('medium');
+  });
+
+  it('counts a repository with no signal at all as unmeasured', () => {
+    expect(securityBand({})).toBe('unknown');
+    expect(
+      securityBand({
+        security: null,
+        sonar_security_rating: null,
+        sonar_security_issues: null,
+        sonar_security_hotspots: null,
+      }),
+    ).toBe('unknown');
+  });
+
+  it('reads clear alerts and no Sonar project as Clear rather than as unmeasured', () => {
+    // Its security WAS read, and there was nothing open; the absent Sonar measures add no doubt.
+    expect(securityBand({ security: security() })).toBe('clear');
   });
 });
 

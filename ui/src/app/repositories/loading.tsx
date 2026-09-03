@@ -7,7 +7,7 @@ import {
 } from '@/components/Skeleton';
 
 /**
- * The landing page's bones: the organisation header, the four estate figures, the five donuts and
+ * The landing page's bones: the organisation header, the four estate figures, the six donuts and
  * the repositories table, in that order and at those sizes.
  *
  * The one page whose skeleton is not just a header over a table, because it is the one page carrying
@@ -19,7 +19,7 @@ export default function LoadingRepositories() {
     <SkeletonPage>
       <SkeletonHeader />
       <SkeletonCards count={4} />
-      <SkeletonChart count={5} />
+      <SkeletonChart count={6} />
       <SkeletonSection rows={12} />
     </SkeletonPage>
   );

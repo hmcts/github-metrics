@@ -8,9 +8,16 @@ import { EmptyState } from '@/components/EmptyState';
 import { RAGLabel } from '@/components/RAGCard';
 import { SortHeader } from '@/components/SortHeader';
 import { filterTarget } from '@/lib/filter';
-import { figure } from '@/lib/format';
+import { ABSENT, figure } from '@/lib/format';
 import { RAG_DOT, RAG_LABEL, RAG_STATES, borderClass, severity, type RAGState } from '@/lib/rag';
-import { filterRepositories, orderRepositories, parseState, stateCounts } from '@/lib/rows';
+import {
+  answerOrder,
+  codeownersPresent,
+  filterRepositories,
+  orderRepositories,
+  parseState,
+  stateCounts,
+} from '@/lib/rows';
 import { nextDirection, sorted, type Direction, type SortValue } from '@/lib/sort';
 import type { RepositoryRow } from '@/lib/types';
 import { withWeeks } from '@/lib/weeks';
@@ -45,6 +52,15 @@ const COLUMNS: readonly Column[] = [
   { key: 'direct', label: 'Direct commits', numeric: true, read: (row) => row.direct_commits },
   { key: 'open', label: 'Open', numeric: true, read: (row) => row.currently_open },
   { key: 'stale', label: 'Stale', numeric: true, read: (row) => row.stale_open },
+  // Both governance answers sort on `answerOrder`, the value their own cell prints, so a header
+  // click orders the column a reader is looking at rather than the count behind it: CODEOWNERS is
+  // Yes at one file and at forty alike, and Sonar has no count at all.
+  {
+    key: 'codeowners',
+    label: 'CODEOWNERS',
+    read: (row) => answerOrder(codeownersPresent(row)),
+  },
+  { key: 'sonar', label: 'Sonar', read: (row) => answerOrder(row.sonar_reported) },
   { key: 'findings', label: 'Findings', numeric: true, read: (row) => row.finding_occurrences },
 ];
 
@@ -158,6 +174,8 @@ export function RepositoriesTable({
                   <Figure value={row.direct_commits} />
                   <Figure value={row.currently_open} />
                   <Figure value={row.stale_open} />
+                  <Answer value={codeownersPresent(row)} />
+                  <Answer value={row.sonar_reported} />
                   <Figure value={row.finding_occurrences} />
                 </tr>
               ))}
@@ -172,4 +190,19 @@ export function RepositoriesTable({
 /** One numeric cell: the figure the service observed, or a dash where it observed none. */
 function Figure({ value }: { value?: number }) {
   return <td className="py-2 pr-3 text-right tabular-nums text-slate-300">{figure(value)}</td>;
+}
+
+/**
+ * One yes-or-no cell, dashed where the answer could not be read.
+ *
+ * Untoned, as every cell in this table is: neither answer is a grade. A repository with no
+ * CODEOWNERS file may be owned perfectly well by a rule the collector cannot see, and whether Sonar
+ * reported anything is not itself good or bad news.
+ */
+function Answer({ value }: { value?: boolean }) {
+  return (
+    <td className="py-2 pr-3 text-slate-300">
+      {value === undefined ? ABSENT : value ? 'Yes' : 'No'}
+    </td>
+  );
 }

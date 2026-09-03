@@ -13,7 +13,7 @@
 
 import { matches } from '@/lib/filter';
 import { RAG_STATES, state, type RAGState } from '@/lib/rag';
-import { compare } from '@/lib/sort';
+import { compare, type SortValue } from '@/lib/sort';
 import type { RepositoryRow } from '@/lib/types';
 
 /**
@@ -48,6 +48,27 @@ export function filterRepositories(
     (row) =>
       matchesRepository(row, term) && (label === null || state(row.readiness) === label),
   );
+}
+
+/**
+ * Whether the repository holds a CODEOWNERS file, or nothing where nobody could read its contents.
+ *
+ * Three-valued on purpose. `0` files is a real answer — every location CODEOWNERS is allowed to live
+ * in was looked at and none held one — while an absent count is a repository whose contents the token
+ * could not read, which says nothing about whether ownership is declared there.
+ */
+export function codeownersPresent(row: RepositoryRow): boolean | undefined {
+  return row.codeowners_files === undefined ? undefined : row.codeowners_files >= 1;
+}
+
+/**
+ * Order a Yes/No/dash cell: No below Yes, and an unreadable answer last in either direction.
+ *
+ * `undefined` passes straight through rather than becoming a number, because that is the value
+ * `sorted` holds back from both ends — the same rule the numeric columns sort an unmeasured count by.
+ */
+export function answerOrder(answer: boolean | undefined): SortValue {
+  return answer === undefined ? undefined : Number(answer);
 }
 
 /**

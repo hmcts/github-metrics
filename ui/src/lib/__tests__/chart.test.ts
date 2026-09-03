@@ -6,6 +6,7 @@ import {
   coverageSlices,
   distributionSlices,
   reviewSlices,
+  securitySlices,
   totalValue,
   unreviewedSlices,
   type PieSlice,
@@ -15,12 +16,13 @@ import {
   CHECKS_BANDS,
   COVERAGE_BANDS,
   REVIEW_BANDS,
+  SECURITY_BANDS,
   UNREVIEWED_BANDS,
   STRONG_GOOD_HEX,
   TONE_HEX,
   type Band,
 } from '@/lib/tone';
-import type { RepositoryRow } from '@/lib/types';
+import type { OpenAlertCount, RepositoryRow, SecurityAlertEvidence } from '@/lib/types';
 
 /** A band key of nothing in particular, for the counting `bandSlices` does over any item type. */
 type Side = 'left' | 'middle' | 'right';
@@ -110,7 +112,7 @@ describe('reviewSlices', () => {
       row({ required_approving_reviews: 0 }),
       row({}),
     ]);
-    expect(counts(built)).toEqual({ Multiple: 2, Required: 1, 'Not required': 1, Unknown: 1 });
+    expect(counts(built)).toEqual({ Multiple: 2, Enforced: 1, Unenforced: 1, Unknown: 1 });
   });
 
   it('marks two or more approvals apart from one, deeper green against green', () => {
@@ -139,13 +141,13 @@ describe('checksSlices', () => {
       row({ required_status_checks: 0 }),
       row({}),
     ]);
-    expect(counts(built)).toEqual({ Required: 2, 'Not required': 1, Unknown: 1 });
+    expect(counts(built)).toEqual({ Enforced: 2, Unenforced: 1, Unknown: 1 });
   });
 
   it('keeps a band nothing fell in, so the legend still lists it', () => {
     const built = checksSlices([row({ required_status_checks: 2 })]);
     expect(built).toHaveLength(CHECKS_BANDS.length);
-    expect(counts(built)['Not required']).toBe(0);
+    expect(counts(built).Unenforced).toBe(0);
     expect(counts(built).Unknown).toBe(0);
   });
 
@@ -164,7 +166,7 @@ describe('unreviewedSlices', () => {
       row({}),
     ]);
     expect(counts(built)).toEqual({
-      'None unreviewed': 1,
+      Clear: 1,
       'Within allowance': 2,
       'Above allowance': 1,
       Unknown: 1,
@@ -173,7 +175,7 @@ describe('unreviewedSlices', () => {
 
   it('counts a repository the policy graded nothing for as unknown, never as clean', () => {
     const built = unreviewedSlices([row({}), row({})]);
-    expect(counts(built)['None unreviewed']).toBe(0);
+    expect(counts(built).Clear).toBe(0);
     expect(counts(built).Unknown).toBe(2);
   });
 
@@ -210,6 +212,43 @@ describe('coverageSlices', () => {
   it('returns every band at zero for an empty list', () => {
     const built = coverageSlices([]);
     expect(built).toHaveLength(COVERAGE_BANDS.length);
+    expect(totalValue(built)).toBe(0);
+  });
+});
+
+describe('securitySlices', () => {
+  /** A security block whose three families are all clear, bar the one a case is about. */
+  function security(families: Partial<SecurityAlertEvidence> = {}): SecurityAlertEvidence {
+    const clear: OpenAlertCount = { open: 0, by_severity: {} };
+    return { dependabot: clear, code_scanning: clear, secret_scanning: clear, ...families };
+  }
+
+  it('bands every row on the worst of the six signals it carries', () => {
+    const built = securitySlices([
+      row({ security: security({ secret_scanning: { open: 1, by_severity: {} } }) }),
+      row({ security: security(), sonar_security_rating: { value: 3 } }),
+      row({ security: security(), sonar_security_issues: 2 }),
+      row({ security: security(), sonar_security_issues: 0, sonar_security_hotspots: 0 }),
+      row({}),
+    ]);
+    expect(counts(built)).toEqual({ Clear: 1, Medium: 1, High: 2, Unknown: 1 });
+  });
+
+  it('keeps a band nothing fell in, so the legend still lists it', () => {
+    const built = securitySlices([row({ security: security() })]);
+    expect(built).toHaveLength(SECURITY_BANDS.length);
+    expect(counts(built)).toEqual({ Clear: 1, Medium: 0, High: 0, Unknown: 0 });
+  });
+
+  it('counts a row carrying no security signal unknown rather than dropping it', () => {
+    const built = securitySlices([row({}), row({ security: security() })]);
+    expect(counts(built).Unknown).toBe(1);
+    expect(totalValue(built)).toBe(2);
+  });
+
+  it('returns every band at zero for an empty list', () => {
+    const built = securitySlices([]);
+    expect(built).toHaveLength(SECURITY_BANDS.length);
     expect(totalValue(built)).toBe(0);
   });
 });

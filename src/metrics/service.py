@@ -50,6 +50,8 @@ from metrics.domain import (
     ReportingWindow,
     RepositoryPracticeEvidence,
     RepositoryTrend,
+    SecurityAlertEvidence,
+    SonarRating,
     UnreviewedSubstantialOutcome,
     actor_labels,
 )
@@ -201,13 +203,25 @@ class RepositoryRow(EvidenceModel):
     cache cannot cover must not appear among zeros: "nothing merged" and "nobody collected this
     window" are different answers, and the list is where they would be confused first.
 
-    The last four say what the row's own counts cannot, so a list can distribute the estate without
-    loading every evidence block. Each is UNMEASURED WHEN ABSENT, as every count above it is: the two
-    gate figures where there is no gate to read or its rules were withheld, `unreviewed_substantial`
-    where the policy graded nothing, and `sonar_coverage` where no SonarCloud project resolved, its
-    measures could not be read, or the project sent no coverage metric to read. All four are absent
-    besides on a repository this window could not be reported for at all, which is the branch
-    carrying `detail`. None of the four is zero by default.
+    Everything after `finding_occurrences` says what the row's own counts cannot, so a list can
+    distribute the estate and answer for its governance without loading every evidence block. Each is
+    UNMEASURED WHEN ABSENT, as every count above it is: the two gate figures where there is no gate to
+    read or its rules were withheld, `unreviewed_substantial` where the policy graded nothing,
+    `sonar_coverage` and the three Sonar security measures where no SonarCloud project resolved, its
+    measures could not be read, or the project sent no such metric, `codeowners_files` where nobody
+    could read the repository's contents, and `security` where the whole alert block carries a reason
+    instead of alerts. All of them are absent besides on a repository this window could not be
+    reported for at all, which is the branch carrying `detail`. None of them is zero by default.
+
+    `sonar_reported` is the one exception, and is `False` RATHER THAN ABSENT on a reportable
+    repository whose measures could not be read or whose project never resolved: the column it feeds
+    answers "is there Sonar information here", so "no Sonar" and "no report" have to stay apart, and
+    only the unreportable branch leaves it absent.
+
+    `security` carries `SecurityAlertEvidence` verbatim rather than flattening its three families
+    into scalars, because the per-family `open`/`by_severity`/`detail` is what a band needs — a
+    family with nothing open and one GitHub refused are different answers, and only the block itself
+    keeps them apart.
     """
 
     repository: str
@@ -222,6 +236,12 @@ class RepositoryRow(EvidenceModel):
     required_status_checks: NonNegativeInt | None = None
     unreviewed_substantial: UnreviewedSubstantialOutcome | None = None
     sonar_coverage: NonNegativeFloat | None = None
+    codeowners_files: NonNegativeInt | None = None
+    sonar_reported: bool | None = None
+    security: SecurityAlertEvidence | None = None
+    sonar_security_rating: SonarRating | None = None
+    sonar_security_issues: NonNegativeInt | None = None
+    sonar_security_hotspots: NonNegativeInt | None = None
     detail: str | None = None
 
 
@@ -837,6 +857,7 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
     # anybody can push to is counted as requiring nothing rather than as unknown.
     enforcing = gate is not None and gate.protected
     measures = evidence.sonar.measures
+    codeowners = evidence.codeowners.codeowners
     return RepositoryRow(
         repository=repository,
         team=evidence.team,
@@ -856,6 +877,21 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
         # absent means nothing was graded rather than that nothing was found.
         unreviewed_substantial=evidence.unreviewed_substantial,
         sonar_coverage=None if measures is None else measures.coverage,
+        # 0 where every checked location was looked at and held no file, and absent only where the
+        # block carries a reason: an unreadable repository must not read as one owning nothing. Every
+        # file found is counted, the `.md` variants GitHub does not read included, because the
+        # repository page's card tones on the same total and names each file's recognition in its
+        # detail line — a filtered count here would have the two disagree about one repository.
+        codeowners_files=None if codeowners is None else len(codeowners.files),
+        # False rather than absent on this branch, so the column can tell a repository with no Sonar
+        # information from one this window could not report at all.
+        sonar_reported=measures is not None,
+        # The alert block verbatim, its per-family reasons included, or nothing where the whole block
+        # carries a reason instead of alerts.
+        security=evidence.security.alerts,
+        sonar_security_rating=None if measures is None else measures.security_rating,
+        sonar_security_issues=None if measures is None else measures.security_issues,
+        sonar_security_hotspots=None if measures is None else measures.security_hotspots,
     )
 
 

@@ -33,6 +33,7 @@ import type {
   OpenAlertCount,
   ReadinessCondition,
   ReadinessLabel,
+  SecurityAlertEvidence,
   SonarGateLevel,
   SonarMeasures,
   SonarRating,
@@ -491,8 +492,8 @@ export type ReviewBand = 'multiple' | 'required' | 'none' | 'unknown';
 
 export const REVIEW_BANDS: readonly Band<ReviewBand>[] = [
   { key: 'multiple', name: 'Multiple', mark: STRONG_GOOD_HEX },
-  { key: 'required', name: 'Required', mark: TONE_HEX.good },
-  { key: 'none', name: 'Not required', mark: TONE_HEX.bad },
+  { key: 'required', name: 'Enforced', mark: TONE_HEX.good },
+  { key: 'none', name: 'Unenforced', mark: TONE_HEX.bad },
   { key: 'unknown', name: 'Unknown', mark: TONE_HEX.neutral },
 ];
 
@@ -519,8 +520,8 @@ export function reviewBand(approvals: number | null | undefined): ReviewBand {
 export type ChecksBand = 'required' | 'none' | 'unknown';
 
 export const CHECKS_BANDS: readonly Band<ChecksBand>[] = [
-  { key: 'required', name: 'Required', mark: TONE_HEX.good },
-  { key: 'none', name: 'Not required', mark: TONE_HEX.bad },
+  { key: 'required', name: 'Enforced', mark: TONE_HEX.good },
+  { key: 'none', name: 'Unenforced', mark: TONE_HEX.bad },
   { key: 'unknown', name: 'Unknown', mark: TONE_HEX.neutral },
 ];
 
@@ -543,7 +544,9 @@ export function checksBand(contexts: number | null | undefined): ChecksBand {
 export type UnreviewedBand = UnreviewedSubstantialOutcome | 'unknown';
 
 export const UNREVIEWED_BANDS: readonly Band<UnreviewedBand>[] = [
-  { key: 'none', name: 'None unreviewed', mark: TONE_HEX.good },
+  // `none` stays as the key because `unreviewedBand` matches the policy's own outcome values against
+  // it; only the words the legend reads change.
+  { key: 'none', name: 'Clear', mark: TONE_HEX.good },
   { key: 'within', name: 'Within allowance', mark: TONE_HEX.warn },
   { key: 'above', name: 'Above allowance', mark: TONE_HEX.bad },
   { key: 'unknown', name: 'Unknown', mark: TONE_HEX.neutral },
@@ -597,4 +600,93 @@ const COVERAGE_BAND: Record<Tone, CoverageBand> = {
  */
 export function coverageBand(coverage: number | null | undefined): CoverageBand {
   return COVERAGE_BAND[coverageTone(coverage)];
+}
+
+/** How badly a repository's security signals read, worst signal deciding. */
+export type SecurityBand = 'clear' | 'medium' | 'high' | 'unknown';
+
+export const SECURITY_BANDS: readonly Band<SecurityBand>[] = [
+  { key: 'clear', name: 'Clear', mark: TONE_HEX.good },
+  { key: 'medium', name: 'Medium', mark: TONE_HEX.warn },
+  { key: 'high', name: 'High', mark: TONE_HEX.bad },
+  { key: 'unknown', name: 'Unknown', mark: TONE_HEX.neutral },
+];
+
+/**
+ * The four security fields a row carries, named as the row's own so a row IS one of these.
+ *
+ * Four fields holding six signals between them, `security` carrying three alert families. A shape of
+ * its own rather than a `RepositoryRow` parameter so the banding can be tested — and later read off
+ * some other list — without inventing a repository and a team around four facts.
+ */
+export interface SecuritySignals {
+  security?: SecurityAlertEvidence | null;
+  sonar_security_rating?: SonarRating | null;
+  sonar_security_issues?: number | null;
+  sonar_security_hotspots?: number | null;
+}
+
+/**
+ * The Sonar security rating, banded DELIBERATELY STRICTER than `sonarRatingTone` colours it.
+ *
+ * `sonarRatingTone` puts C at amber, following Sonar's own scale, where this puts C at High — on the
+ * user's instruction, because this donut is read to find the repositories worth looking at and a C
+ * security rating is one of them. The divergence is stated so it is not later "fixed" into agreement:
+ * the two answer different questions about the same letter, and the repository page's card is the one
+ * that reports Sonar's own grading.
+ *
+ * Off the 1-to-5 scale is no data rather than either extreme, for the reason `sonarRatingTone` gives:
+ * a rating this build does not understand is not a verdict it can convert into one.
+ */
+function securityRatingTone(rating: SonarRating | null | undefined): Tone {
+  if (rating == null || !Number.isInteger(rating.value)) {
+    return 'neutral';
+  }
+  if (rating.value === 1) {
+    return 'good';
+  }
+  if (rating.value === 2) {
+    return 'warn';
+  }
+  return rating.value >= 3 && rating.value <= 5 ? 'bad' : 'neutral';
+}
+
+/**
+ * Band a repository by the worst of its security signals, or unmeasured where it has none.
+ *
+ * Six signals, each resolved to a tone or to `neutral` where there is no data, and the worst tone
+ * present decides — so one open critical Dependabot alert bands the repository High however clean the
+ * other five read. The three alert families delegate to `alertTone`, which the repository page
+ * already colours its security cards with, so the donut and the cards cannot disagree about a family.
+ * They are named HERE rather than imported as `ALERT_FAMILIES`: `repository.ts` owns that list and
+ * imports this module for `alertTone`, so reaching back for it would close an import cycle. Sonar's
+ * two counts are worth weighing above zero and never worse: the count is graded by its own rating,
+ * which is a signal here in its own right.
+ *
+ * `unknown` is EVERY signal carrying no data — a row the span could not report, or one whose three
+ * families GitHub all refused and which has no Sonar measures. A repository with readable families
+ * and no Sonar project is Clear: its security was read, and there was nothing open.
+ */
+export function securityBand(signals: SecuritySignals): SecurityBand {
+  const alerts = signals.security;
+  const families: Tone[] = alerts
+    ? [
+        alertTone('dependabot', alerts.dependabot),
+        alertTone('code-scanning', alerts.code_scanning),
+        alertTone('secret-scanning', alerts.secret_scanning),
+      ]
+    : [];
+  const tones = [
+    ...families,
+    securityRatingTone(signals.sonar_security_rating),
+    counted(signals.sonar_security_issues, 'good', 'warn'),
+    counted(signals.sonar_security_hotspots, 'good', 'warn'),
+  ].filter((tone) => tone !== 'neutral');
+  if (tones.includes('bad')) {
+    return 'high';
+  }
+  if (tones.includes('warn')) {
+    return 'medium';
+  }
+  return tones.length > 0 ? 'clear' : 'unknown';
 }
