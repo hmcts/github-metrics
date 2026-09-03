@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useState } from 'react';
 import { RAGLabel } from '@/components/RAGCard';
-import { SortHeader } from '@/components/SortHeader';
+import { SortHeader, type Align } from '@/components/SortHeader';
 import { combinationKey } from '@/lib/rag';
 import { nextDirection, sorted, type Direction, type SortValue } from '@/lib/sort';
 import type { ActorRow, ReadinessLabel } from '@/lib/types';
@@ -12,7 +12,7 @@ import { withWeeks } from '@/lib/weeks';
 interface Column {
   key: string;
   label: string;
-  numeric?: boolean;
+  align?: Align;
   read: (row: ActorRow) => SortValue;
 }
 
@@ -20,13 +20,13 @@ interface Column {
 const READINESS: Column = {
   key: 'readiness',
   label: 'Readiness',
-  numeric: true,
+  align: 'right',
   read: (row) => combinationKey(row.labels),
 };
 
 const COLUMNS: readonly Column[] = [
   { key: 'login', label: 'Login', read: (row) => row.login },
-  { key: 'repositories', label: 'Repositories', numeric: true, read: (row) => row.repositories },
+  { key: 'repositories', label: 'Repositories', align: 'right', read: (row) => row.repositories },
   READINESS,
 ];
 
@@ -73,13 +73,14 @@ export function ActorsTable({
       <table className="w-full text-xs">
         <thead className="text-slate-400 border-b border-slate-800">
           <tr>
-            {COLUMNS.map((entry) => (
+            {COLUMNS.map((entry, index) => (
               <SortHeader
                 key={entry.key}
                 label={entry.label}
                 active={entry === column}
                 direction={direction}
-                numeric={entry.numeric}
+                align={entry.align}
+                first={index === 0}
                 onSort={() => sort(entry)}
               />
             ))}

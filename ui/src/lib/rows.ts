@@ -12,19 +12,22 @@
  */
 
 import { matches } from '@/lib/filter';
-import { RAG_STATES, state, type RAGState } from '@/lib/rag';
+import { RAG_HEX, RAG_LABEL, RAG_STATES, distributionState, state } from '@/lib/rag';
 import { compare, type SortValue } from '@/lib/sort';
+import {
+  CHECKS_BANDS,
+  COVERAGE_BANDS,
+  REVIEW_BANDS,
+  SECURITY_BANDS,
+  UNREVIEWED_BANDS,
+  checksBand,
+  coverageBand,
+  reviewBand,
+  securityBand,
+  unreviewedBand,
+  type Band,
+} from '@/lib/tone';
 import type { RepositoryRow } from '@/lib/types';
-
-/**
- * Read a readiness state from a URL parameter, or nothing when it names none.
- *
- * An unrecognised value resolves to no filter rather than to a state nothing matches: the parameter
- * is typed by hand and shared in links, and a stale one should show the list rather than a blank.
- */
-export function parseState(raw: string | null | undefined): RAGState | null {
-  return RAG_STATES.includes(raw as RAGState) ? (raw as RAGState) : null;
-}
 
 /** The default order: one team's repositories together, alphabetically within the team. */
 export function orderRepositories(rows: readonly RepositoryRow[]): RepositoryRow[] {
@@ -39,14 +42,136 @@ export function matchesRepository(row: RepositoryRow, term: string): boolean {
   return matches(row.repository, term) || matches(row.team, term);
 }
 
+/** The six dimensions the estate can be filtered by, one per donut and one per URL parameter. */
+export type FilterParameter = 'label' | 'review' | 'checks' | 'unreviewed' | 'coverage' | 'security';
+
+/** One value a dimension can be filtered to: the slice a reader clicked, in the slice's own words. */
+export interface FilterOption {
+  /** The value that goes in the URL — a `RAGState` or a band key, never the words beside it. */
+  key: string;
+  name: string;
+  /** A colour value, not a class: the chip's dot is the mark its donut drew the slice with. */
+  color: string;
+}
+
+/**
+ * One filterable dimension: its parameter, the words a chip reads it as, its values, and how a row
+ * is placed in one of them.
+ */
+export interface EstateFilter {
+  parameter: FilterParameter;
+  /** The title a chip prints before the value, and the donut's own heading. */
+  title: string;
+  options: readonly FilterOption[];
+  /** Which option a row falls in, by the same function the donut counted it with. */
+  band: (row: RepositoryRow) => string;
+}
+
+/** Read a band table as filter options, so a legend entry and a chip can never say different words. */
+function bandOptions(bands: readonly Band[]): FilterOption[] {
+  return bands.map((entry) => ({ key: entry.key, name: entry.name, color: entry.mark }));
+}
+
+/**
+ * The six donuts as filters, each classifying a row with the function its own donut counts by.
+ *
+ * The `band` functions are `tone.ts`'s, not copies of them: the filtered row count has to equal the
+ * legend count of the slice that was clicked, and a second definition of "moderate coverage" is how
+ * a table shows nine rows under a wedge that says eleven. Readiness comes from `rag.ts` for the same
+ * reason — the donut is drawn from `RAG_HEX` and the chip's dot is the same hex.
+ *
+ * `label` keeps the parameter name the readiness filter has always used, so links shared before the
+ * other five dimensions existed still filter what they filtered.
+ */
+export const ESTATE_FILTERS: readonly EstateFilter[] = [
+  {
+    parameter: 'label',
+    title: 'Readiness',
+    options: RAG_STATES.map((readiness) => ({
+      key: readiness,
+      name: RAG_LABEL[readiness],
+      color: RAG_HEX[readiness],
+    })),
+    // Folded through `distributionState`, as the donut counts through it: a label this build does
+    // not know is counted under "Not assessed" in the slice, so it has to be selected by that slice
+    // too. Without the fold the row falls in no option and the table shows one row fewer than the
+    // wedge said — the one divergence every other band function here is written to avoid.
+    band: (row) => distributionState(state(row.readiness)),
+  },
+  {
+    parameter: 'review',
+    title: 'Enforces review',
+    options: bandOptions(REVIEW_BANDS),
+    band: (row) => reviewBand(row.required_approving_reviews),
+  },
+  {
+    parameter: 'checks',
+    title: 'Enforces CI',
+    options: bandOptions(CHECKS_BANDS),
+    band: (row) => checksBand(row.required_status_checks),
+  },
+  {
+    parameter: 'unreviewed',
+    title: 'Unreviewed substantial merges',
+    options: bandOptions(UNREVIEWED_BANDS),
+    band: (row) => unreviewedBand(row.unreviewed_substantial),
+  },
+  {
+    parameter: 'coverage',
+    title: 'Test coverage',
+    options: bandOptions(COVERAGE_BANDS),
+    band: (row) => coverageBand(row.sonar_coverage),
+  },
+  {
+    parameter: 'security',
+    title: 'Security issues',
+    options: bandOptions(SECURITY_BANDS),
+    band: (row) => securityBand(row),
+  },
+];
+
+export const FILTER_PARAMETERS: readonly FilterParameter[] = ESTATE_FILTERS.map(
+  (filter) => filter.parameter,
+);
+
+/** Which value each dimension is filtered to, where the dimension is filtered at all. */
+export type RepositoryFilters = Partial<Record<FilterParameter, string>>;
+
+/**
+ * Read every dimension's filter off the URL, keeping only the values that name one of its options.
+ *
+ * A value in no option is dropped rather than kept: six parameters typed by hand and shared in links
+ * is six ways to arrive at a table filtered to a value nothing can carry, and an empty list is a
+ * worse answer than the whole one.
+ */
+export function parseFilters(read: (parameter: string) => string | null): RepositoryFilters {
+  const filters: RepositoryFilters = {};
+  for (const filter of ESTATE_FILTERS) {
+    const raw = read(filter.parameter);
+    if (raw !== null && filter.options.some((option) => option.key === raw)) {
+      filters[filter.parameter] = raw;
+    }
+  }
+  return filters;
+}
+
+/**
+ * The rows a reader is looking at: the term, and every dimension they have filtered, all together.
+ *
+ * Dimensions AND, because that is what clicking a second donut means — the repositories that are
+ * blocked AND enforce no review — and each is checked with its own donut's band function, so the
+ * table under a wedge holds exactly the rows the wedge counted.
+ */
 export function filterRepositories(
   rows: readonly RepositoryRow[],
   term: string,
-  label: RAGState | null,
+  filters: RepositoryFilters,
 ): RepositoryRow[] {
+  const active = ESTATE_FILTERS.filter((filter) => filters[filter.parameter] !== undefined);
   return rows.filter(
     (row) =>
-      matchesRepository(row, term) && (label === null || state(row.readiness) === label),
+      matchesRepository(row, term) &&
+      active.every((filter) => filter.band(row) === filters[filter.parameter]),
   );
 }
 
@@ -69,19 +194,4 @@ export function codeownersPresent(row: RepositoryRow): boolean | undefined {
  */
 export function answerOrder(answer: boolean | undefined): SortValue {
   return answer === undefined ? undefined : Number(answer);
-}
-
-/**
- * Count the rows carrying each readiness state, every state present.
- *
- * Total over the five states so a filter control can show `0` for a state nothing carries — the
- * useful finding that nothing is blocked, which a missing chip would hide.
- */
-export function stateCounts(rows: readonly RepositoryRow[]): Record<RAGState, number> {
-  return Object.fromEntries(
-    RAG_STATES.map((readiness) => [
-      readiness,
-      rows.filter((row) => state(row.readiness) === readiness).length,
-    ]),
-  ) as Record<RAGState, number>;
 }

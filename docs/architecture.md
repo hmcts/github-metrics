@@ -1387,7 +1387,8 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   their own list and nothing else; `/` redirects to `/repositories`, carrying `?weeks=` through so a
   link to the old landing page does not silently change the window. THE NAV BAR'S OWN THREE LINKS
   CANNOT CARRY THE SPAN — the layout renders that bar and a layout is handed no search parameters —
-  so `ui/src/middleware.ts` writes the `weeks` cookie for any request that named a span, and the
+  so `ui/src/proxy.ts` — Next 16's name for what was `middleware.ts` — writes the `weeks` cookie for
+  any request that named a span, and the
   links resolve from it. The selector's write alone was not enough: a reader who arrived on somebody
   else's `?weeks=26` link had no cookie, and their first nav click reset the window silently. Each
   list fetches three
@@ -1465,6 +1466,25 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
     reaches `assessment.py`, and security stays report-only and ungraded in the report. The three
     alert families are the countervailing rule: the donut delegates to the same `alertTone` the cards
     use, so donut and card can never disagree about a family.
+    EVERY DONUT IS ALSO THE FILTER CONTROL FOR THE DIMENSION IT DRAWS (2026-09-03, at the user's
+    instruction). A legend entry or a wedge writes its slice's key to that dimension's query
+    parameter — `label`, `review`, `checks`, `unreviewed`, `coverage`, `security` — clicking the
+    slice already set clears it, and distinct dimensions AND, so the filter state is in the URL and a
+    filtered table is a thing that can be reloaded and shared. `label` keeps the name the readiness
+    filter always used, so links shared before the other five existed still filter what they
+    filtered. `ESTATE_FILTERS` in `ui/src/lib/rows.ts` is the ONE definition of all six — parameter,
+    chip title, options and the `tone.ts` band function that classifies a row — because a filtered
+    table holding a different number from the wedge that was clicked is how a reader stops believing
+    either. The team page's donut works the same way: it sits above the same `RepositoriesTable`, and
+    a donut that filtered on one page but not the other would be one control with two behaviours.
+    THE TABLE OWNS NO FILTER CONTROL OF ITS OWN beyond its search box — the five readiness buttons
+    went the same day — and the row where they sat reports what the donuts are set to, one
+    dismissable chip per filtered dimension. A donut is still counted over the WHOLE estate, never
+    over the filtered rows: a picture that moved with the filter it had just set would report the
+    rows left over as the estate. That is why a donut drawn off a distribution the service builds
+    from the reported repositories alone is handed the unreportable count beside it — both the
+    estate's readiness donut and the team page's — since the table under it holds every configured
+    repository and a slice must select exactly the rows it counted.
   - PER-PERSON COUNTS BESIDE A LOGIN ON A REPOSITORY PAGE ARE IN SCOPE (2026-09-02, at the user's
     instruction). The contributors table on `/repositories/[repository]` carries, per login,
     contributions, pull requests merged, pushes straight onto the default branch, merges that

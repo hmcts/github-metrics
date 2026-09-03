@@ -76,7 +76,10 @@ In `ui/`, the same rules in TypeScript, plus:
   `metrics.render` function for function, down to Python's half-to-even rounding.
 - A figure's colour is decided in `ui/src/lib/tone.ts` and nowhere else: no component holds a threshold and none holds
   a hex literal. Where `assessment.py` already grades a figure the page carries that condition's verdict rather than
-  restating the target, so raising a target in the assessment configuration is what changes a colour.
+  restating the target, so raising a target in the assessment configuration is what changes a colour. Two functions
+  there MAY band the same figure differently where they answer different questions about it — `securityBand` puts a
+  Sonar security rating of C at High where `sonarRatingTone` puts it at amber — and each divergence is stated in a
+  comment beside both. Do not reconcile one without reading it.
 - Every route segment carries a `loading.tsx` drawn from `ui/src/components/Skeleton.tsx`, so a cold bundle shows the
   page's bones rather than a blank screen. A new segment without one is unfinished.
 - Tests default to the `node` environment and render components through `react-dom/server`. A component whose

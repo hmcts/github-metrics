@@ -8,13 +8,25 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  checksSlices,
+  coverageSlices,
+  distributionSlices,
+  reviewSlices,
+  securitySlices,
+  unreviewedSlices,
+  type PieSlice,
+} from '@/lib/chart';
+import { RAG_STATES, state } from '@/lib/rag';
+import {
+  ESTATE_FILTERS,
+  FILTER_PARAMETERS,
   answerOrder,
   codeownersPresent,
   filterRepositories,
   matchesRepository,
   orderRepositories,
-  parseState,
-  stateCounts,
+  parseFilters,
+  type FilterParameter,
 } from '@/lib/rows';
 import type { RepositoryRow } from '@/lib/types';
 
@@ -22,27 +34,72 @@ function row(fields: Partial<RepositoryRow> & { repository: string }): Repositor
   return { team: 'platform', ...fields };
 }
 
+/**
+ * Four repositories spread across every dimension, including one the window could not report.
+ *
+ * The gate figures, the policy's verdict and the Sonar measures are here so a filter can be checked
+ * against the donut that draws the same dimension: an estate where every row is unmeasured would
+ * agree with any classifier at all.
+ */
 const ROWS: RepositoryRow[] = [
-  row({ repository: 'hmcts/web', team: 'delivery', readiness: 'red', finding_occurrences: 6 }),
-  row({ repository: 'hmcts/api', team: 'platform', readiness: 'green', finding_occurrences: 0 }),
-  row({ repository: 'hmcts/tools', team: 'platform', readiness: 'green' }),
+  row({
+    repository: 'hmcts/web',
+    team: 'delivery',
+    readiness: 'red',
+    finding_occurrences: 6,
+    required_approving_reviews: 0,
+    required_status_checks: 0,
+    unreviewed_substantial: 'above',
+    sonar_coverage: 12.5,
+    sonar_security_issues: 4,
+  }),
+  row({
+    repository: 'hmcts/api',
+    team: 'platform',
+    readiness: 'green',
+    finding_occurrences: 0,
+    required_approving_reviews: 2,
+    required_status_checks: 3,
+    unreviewed_substantial: 'none',
+    sonar_coverage: 95,
+    sonar_security_issues: 0,
+    sonar_security_hotspots: 0,
+  }),
+  row({
+    repository: 'hmcts/tools',
+    team: 'platform',
+    readiness: 'green',
+    required_approving_reviews: 1,
+    required_status_checks: 0,
+    unreviewed_substantial: 'within',
+    sonar_coverage: 85,
+    sonar_security_rating: { value: 4 },
+  }),
   row({ repository: 'hmcts/legacy', team: 'platform', detail: 'no window was collected' }),
 ];
 
-describe('parseState', () => {
-  it('reads each of the five presentation states', () => {
-    expect(parseState('green')).toBe('green');
-    expect(parseState('cannot_assess')).toBe('cannot_assess');
-    expect(parseState('none')).toBe('none');
-  });
-
-  it('reads an unrecognised or absent value as no filter, never as a state nothing matches', () => {
-    expect(parseState('purple')).toBeNull();
-    expect(parseState('')).toBeNull();
-    expect(parseState(null)).toBeNull();
-    expect(parseState(undefined)).toBeNull();
-  });
-});
+/**
+ * The donut each dimension is drawn from, so a filter can be held against the slice it came off.
+ *
+ * The readiness donut counts a label DISTRIBUTION rather than rows — that is what the service sends
+ * the pages — so its entry distributes these rows first, by the same `state` the filter bands with.
+ */
+const DONUT: Record<FilterParameter, (rows: readonly RepositoryRow[]) => PieSlice[]> = {
+  label: (rows) =>
+    distributionSlices(
+      Object.fromEntries(
+        RAG_STATES.map((readiness) => [
+          readiness,
+          rows.filter((entry) => state(entry.readiness) === readiness).length,
+        ]),
+      ),
+    ),
+  review: reviewSlices,
+  checks: checksSlices,
+  unreviewed: unreviewedSlices,
+  coverage: coverageSlices,
+  security: securitySlices,
+};
 
 describe('orderRepositories', () => {
   it('groups a team together, alphabetically within it, ordered by no figure', () => {
@@ -74,21 +131,141 @@ describe('matchesRepository', () => {
   });
 });
 
+describe('ESTATE_FILTERS', () => {
+  it('names one dimension per donut, each with the parameter its links are written in', () => {
+    expect(FILTER_PARAMETERS).toEqual([
+      'label',
+      'review',
+      'checks',
+      'unreviewed',
+      'coverage',
+      'security',
+    ]);
+  });
+
+  it('offers exactly the values its donut has slices for, in the same order and colours', () => {
+    for (const filter of ESTATE_FILTERS) {
+      const slices = DONUT[filter.parameter](ROWS);
+      expect(filter.options.map((option) => option.key)).toEqual(slices.map((slice) => slice.key));
+      expect(filter.options.map((option) => option.name)).toEqual(slices.map((slice) => slice.name));
+      expect(filter.options.map((option) => option.color)).toEqual(
+        slices.map((slice) => slice.color),
+      );
+    }
+  });
+});
+
+describe('parseFilters', () => {
+  /** Read parameters off a plain object, which is the shape a `URLSearchParams` reader has. */
+  function reader(query: Record<string, string>) {
+    return (parameter: string) => query[parameter] ?? null;
+  }
+
+  it('reads every dimension at once, each in its own vocabulary', () => {
+    expect(
+      parseFilters(
+        reader({
+          label: 'cannot_assess',
+          review: 'multiple',
+          checks: 'none',
+          unreviewed: 'within',
+          coverage: 'moderate',
+          security: 'high',
+        }),
+      ),
+    ).toEqual({
+      label: 'cannot_assess',
+      review: 'multiple',
+      checks: 'none',
+      unreviewed: 'within',
+      coverage: 'moderate',
+      security: 'high',
+    });
+  });
+
+  it('accepts each value its own dimension offers, and no value from another', () => {
+    for (const filter of ESTATE_FILTERS) {
+      for (const option of filter.options) {
+        expect(parseFilters(reader({ [filter.parameter]: option.key }))).toEqual({
+          [filter.parameter]: option.key,
+        });
+      }
+    }
+    // `multiple` is a review band and nothing else, so it filters no other dimension.
+    expect(parseFilters(reader({ coverage: 'multiple' }))).toEqual({});
+  });
+
+  it('drops a value it does not recognise, so a stale link shows the list rather than a blank', () => {
+    expect(parseFilters(reader({ label: 'purple', review: 'required' }))).toEqual({
+      review: 'required',
+    });
+    expect(parseFilters(reader({ security: '' }))).toEqual({});
+    expect(parseFilters(reader({}))).toEqual({});
+  });
+});
+
 describe('filterRepositories', () => {
   it('applies the term and the readiness together', () => {
-    const found = filterRepositories(ROWS, 'hmcts', 'green');
+    const found = filterRepositories(ROWS, 'hmcts', { label: 'green' });
     expect(found.map((entry) => entry.repository)).toEqual(['hmcts/api', 'hmcts/tools']);
   });
 
   it('keeps an unreportable repository, which carries no label, under the ungraded state', () => {
-    expect(filterRepositories(ROWS, '', 'none').map((entry) => entry.repository)).toEqual([
-      'hmcts/legacy',
-    ]);
+    expect(filterRepositories(ROWS, '', { label: 'none' }).map((entry) => entry.repository)).toEqual(
+      ['hmcts/legacy'],
+    );
   });
 
-  it('filters on the term alone when no readiness was named', () => {
-    expect(filterRepositories(ROWS, 'legacy', null)).toHaveLength(1);
-    expect(filterRepositories(ROWS, '', null)).toHaveLength(ROWS.length);
+  it('selects a label this build does not know under the state its donut counted it in', () => {
+    // A `metrics-serve` newer than these pages can send a fifth label, which `distributionState`
+    // counts under "Not assessed". Selecting that slice has to return the row it counted, or the
+    // table shows one row fewer than the wedge beside it said.
+    const future = row({ repository: 'hmcts/next', readiness: 'purple' as 'green' });
+    expect(
+      filterRepositories([...ROWS, future], '', { label: 'none' }).map((entry) => entry.repository),
+    ).toEqual(['hmcts/legacy', 'hmcts/next']);
+  });
+
+  it('filters on the term alone when no dimension was named', () => {
+    expect(filterRepositories(ROWS, 'legacy', {})).toHaveLength(1);
+    expect(filterRepositories(ROWS, '', {})).toHaveLength(ROWS.length);
+  });
+
+  it('filters on each dimension on its own, by the band its own donut counts with', () => {
+    const named = (filters: Parameters<typeof filterRepositories>[2]) =>
+      filterRepositories(ROWS, '', filters).map((entry) => entry.repository);
+
+    expect(named({ review: 'multiple' })).toEqual(['hmcts/api']);
+    expect(named({ checks: 'none' })).toEqual(['hmcts/web', 'hmcts/tools']);
+    expect(named({ unreviewed: 'above' })).toEqual(['hmcts/web']);
+    expect(named({ coverage: 'moderate' })).toEqual(['hmcts/tools']);
+    expect(named({ security: 'medium' })).toEqual(['hmcts/web']);
+    expect(named({ security: 'high' })).toEqual(['hmcts/tools']);
+    // Every dimension counts the unreportable repository under its own unmeasured band.
+    expect(named({ review: 'unknown' })).toEqual(['hmcts/legacy']);
+  });
+
+  it('holds every named dimension at once, and the term with them', () => {
+    expect(
+      filterRepositories(ROWS, '', { label: 'green', checks: 'none' }).map(
+        (entry) => entry.repository,
+      ),
+    ).toEqual(['hmcts/tools']);
+    // Two dimensions no repository satisfies together is an empty table, which is the honest answer:
+    // the reader asked for something, not for a parameter to be ignored.
+    expect(filterRepositories(ROWS, '', { label: 'red', checks: 'required' })).toEqual([]);
+    expect(filterRepositories(ROWS, 'tools', { label: 'green', checks: 'none' })).toHaveLength(1);
+    expect(filterRepositories(ROWS, 'api', { label: 'green', checks: 'none' })).toHaveLength(0);
+  });
+
+  it('shows exactly the rows the clicked slice counted, for every slice of every donut', () => {
+    for (const filter of ESTATE_FILTERS) {
+      for (const slice of DONUT[filter.parameter](ROWS)) {
+        expect(filterRepositories(ROWS, '', { [filter.parameter]: slice.key })).toHaveLength(
+          slice.value,
+        );
+      }
+    }
   });
 });
 
@@ -112,27 +289,5 @@ describe('answerOrder', () => {
 
   it('leaves an unreadable answer undefined, the value `sorted` holds back from both ends', () => {
     expect(answerOrder(undefined)).toBeUndefined();
-  });
-});
-
-describe('stateCounts', () => {
-  it('counts every state, including the ones nothing carries', () => {
-    expect(stateCounts(ROWS)).toEqual({
-      green: 2,
-      amber: 0,
-      red: 1,
-      cannot_assess: 0,
-      none: 1,
-    });
-  });
-
-  it('counts nothing as zeros rather than as missing keys', () => {
-    expect(stateCounts([])).toEqual({
-      green: 0,
-      amber: 0,
-      red: 0,
-      cannot_assess: 0,
-      none: 0,
-    });
   });
 });

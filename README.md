@@ -152,6 +152,15 @@ a developer already has in their shell, and a run that reads less is better than
 contacts GitHub logs which mode it is in — the App and installation ids, which are identifiers rather than secrets, or
 `a personal access token` — so a report full of refusals is one line away from its explanation.
 
+**`scripts/report_copilot_usage.py` chooses a credential the same way**, through `metrics.credentials`, so the report
+and a collection authenticate as the same identity. It adds two fallbacks the collection has no use for — `GITHUB_TOKEN`
+after `GH_TOKEN`, and whatever `gh` is logged in as — because it is run from a developer's shell rather than from a
+scheduled job. A fully configured App still outranks all three, which is worth knowing if you export the App variables
+and expect the script to keep using your own token. An App is worth configuring for it: the seat list the report names
+each active user's payer from needs a permission an organisation grants an installation, and a fine-grained token can
+only inherit it from its owner. Every run prints which credential it authenticated as, and re-reads the token per
+request so one expiring mid-report is refreshed rather than failing the rest of it.
+
 The installation token is minted **once at startup**, so a wrong key, App id, or installation stops the run while
 someone is still watching it rather than 1850 repositories in, and it is replaced five minutes before GitHub's stated
 expiry, so a collection lasting longer than one token's hour never sends an expired one. Nothing about the key, the JWT,

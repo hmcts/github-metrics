@@ -5,7 +5,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { EntityHeader } from '@/components/EntityHeader';
 import { FilterSearchBox } from '@/components/FilterSearchBox';
 import { NavWeekSelector } from '@/components/NavWeekSelector';
-import { RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTable';
+import { LABEL_PARAMETER, RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTable';
 import { Section } from '@/components/Section';
 import { SummaryPieChart } from '@/components/charts/SummaryPieChart';
 import { TeamActorsTable } from '@/components/TeamActorsTable';
@@ -25,8 +25,8 @@ import { WEEKS_COOKIE, resolveWeeks, type SearchValue } from '@/lib/weeks';
  * carry no label to order by, which is what the `/contributors` list orders on instead.
  *
  * The repositories table is the shared component, handed this team's rows: a team page and the
- * repositories list then agree about what a repository row says, and the filter and readiness chips work here
- * exactly as they do there.
+ * repositories list then agree about what a repository row says, and the search box, the donut's
+ * filter and the chip it raises all work here exactly as they do there.
  */
 export const dynamic = 'force-dynamic';
 
@@ -65,9 +65,17 @@ export default async function TeamPage({
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Clickable here for the same reason it is on the repositories list: the table below is the
+            same component reading the same parameter, and a donut that filters on one page and not
+            the other is one control with two behaviours. Filtering a team's own repositories is
+            still a count per label — it narrows a list, and grades nothing. */}
         <SummaryPieChart
-          title="Readiness labels"
-          data={distributionSlices(detail.labels)}
+          title="Readiness"
+          parameter={LABEL_PARAMETER}
+          // `detail.labels` distributes the reported repositories only while the table below holds
+          // every configured one, so the unreportable ones are added here: without them a reader
+          // clicking "Not assessed" would get rows the legend beside it counted at zero.
+          data={distributionSlices(detail.labels, detail.unavailable)}
           tooltip="How many of this team’s repositories carry each readiness label at this span. The counts are per repository: they are not combined into a label for the team, and no team is ranked against another."
         />
       </div>

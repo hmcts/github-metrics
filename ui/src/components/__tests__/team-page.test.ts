@@ -33,13 +33,16 @@ vi.mock('next/headers', () => ({
     Promise.resolve({ get: () => (cookie === undefined ? undefined : { value: cookie }) }),
 }));
 
+/** What the donut and the table below it read the URL as, which the filtering case sets. */
+let search = new URLSearchParams();
+
 vi.mock('next/navigation', () => ({
   notFound: () => {
     throw new Error('notFound');
   },
   useRouter: () => ({ replace: () => undefined }),
   usePathname: () => '/teams/platform',
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => search,
 }));
 
 const REPOSITORIES: RepositoryRow[] = [
@@ -111,8 +114,42 @@ async function render(weeks?: string): Promise<string> {
   return renderToStaticMarkup(page);
 }
 
+/**
+ * The readiness donut's legend, which is where its figures are.
+ *
+ * Scoped to the legend group rather than read off the page, because the week selector and the chip
+ * row draw pressed buttons and coloured labels of their own — an unscoped read reports those as
+ * slices, and an unscoped `aria-pressed` assertion passes for a donut pressing the wrong entry.
+ */
+function legendOf(markup: string): string {
+  const opened = markup.indexOf('aria-label="Readiness filter"');
+  expect(opened).toBeGreaterThan(-1);
+  return markup.slice(opened, markup.indexOf('</div>', opened));
+}
+
+/** The label words and the count drawn under each of them. */
+function legend(markup: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  const entries = legendOf(markup).matchAll(
+    /text-slate-400[^"]*">([^<]+)<\/span><span class="text-xs text-slate-600 tabular-nums">(\d+)</g,
+  );
+  for (const match of entries) {
+    counts[match[1] ?? ''] = Number(match[2]);
+  }
+  return counts;
+}
+
+/** The labels of the legend entries drawn as pressed, which is what the donut is filtered to. */
+function pressed(markup: string): string[] {
+  return legendOf(markup)
+    .split('<button')
+    .filter((entry) => entry.includes('aria-pressed="true"'))
+    .map((entry) => /text-slate-400[^"]*">([^<]+)</.exec(entry)?.[1] ?? 'unlabelled');
+}
+
 beforeEach(() => {
   cookie = undefined;
+  search = new URLSearchParams();
 });
 
 afterEach(() => {
@@ -169,13 +206,67 @@ describe('the team page', () => {
     stubService();
     const markup = await render();
 
-    expect(markup).toContain('Readiness labels');
+    expect(markup).toContain('>Readiness</h3>');
     expect(markup).toContain('not combined into a label for the team');
     // The header states the team and its counts, and carries no label of its own: a readiness word
     // beside the team's name would be exactly the combined grade the donut's tooltip disclaims.
     const [header] = markup.split('</header>');
     expect(header).toContain('platform');
     expect(header).not.toMatch(/Ready|Caution|Blocked|Not assessed|score|average/i);
+  });
+
+  /**
+   * The donut counts the team the table below it holds, unreportable repositories included.
+   *
+   * `label_counts` distributes the REPORTED repositories only, while `team_detail.repositories`
+   * carries every configured one — so a donut drawn off the distribution alone totals less than the
+   * table it now filters, and its ungraded slice reads zero over rows that are exactly the rows a
+   * click on it selects. The count and the filter have to agree, so the unreported figure is added
+   * into the ungraded slice here as it is on the estate's readiness donut.
+   */
+  it('counts the repositories the span could not report into its ungraded slice', async () => {
+    stubService((detail) => ({
+      ...detail,
+      repositories: [...REPOSITORIES, { repository: 'legacy', team: 'platform' }],
+      unavailable: 1,
+    }));
+    search = new URLSearchParams('label=none');
+    const markup = await render();
+
+    expect(legend(markup)).toEqual({
+      Ready: 1,
+      Caution: 1,
+      Blocked: 0,
+      'Cannot assess': 0,
+      'Not assessed': 1,
+    });
+    // And the slice counted at one selects that one row: the unreportable repository, alone.
+    expect(pressed(markup)).toEqual(['Not assessed']);
+    expect(markup).toContain('href="/repositories/legacy?weeks=4"');
+    expect(markup).not.toContain('href="/repositories/api?weeks=4"');
+  });
+
+  /**
+   * The donut filters this team's table, exactly as the estate's donuts filter the estate's.
+   *
+   * The page renders the shared `RepositoriesTable` under the donut and both read `label` off the
+   * URL, so a slice clicked here narrows the list here. A team page that drew a static donut would
+   * be the same control behaving differently depending on which page a reader found it on.
+   */
+  it('filters its own repositories from the readiness donut', async () => {
+    stubService();
+    search = new URLSearchParams('label=green&weeks=26');
+    const markup = await render('26');
+
+    // The legend is a group of controls, with the filtered slice shown as the pressed one — read as
+    // which entry is pressed rather than that one is, because a donut reading the wrong parameter or
+    // comparing against the slice's words instead of its key still presses something.
+    expect(markup).toContain('aria-label="Readiness filter"');
+    expect(pressed(markup)).toEqual(['Ready']);
+    // And the table under it holds the green repository alone, with a chip saying why.
+    expect(markup).toContain('href="/repositories/api?weeks=26"');
+    expect(markup).not.toContain('href="/repositories/web?weeks=26"');
+    expect(markup).toContain('Remove Readiness filter');
   });
 
   it('says so where the configuration holds no repository for the team', async () => {

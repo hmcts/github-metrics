@@ -28,9 +28,9 @@ import type { OpenAlertCount, RepositoryRow, SecurityAlertEvidence } from '@/lib
 type Side = 'left' | 'middle' | 'right';
 
 const slices: PieSlice[] = [
-  { name: 'Ready', value: 3, color: '#4ade80' },
-  { name: 'Caution', value: 0, color: '#fbbf24' },
-  { name: 'Blocked', value: 1, color: '#f87171' },
+  { key: 'green', name: 'Ready', value: 3, color: '#4ade80' },
+  { key: 'amber', name: 'Caution', value: 0, color: '#fbbf24' },
+  { key: 'red', name: 'Blocked', value: 1, color: '#f87171' },
 ];
 
 function row(fields: Partial<RepositoryRow>): RepositoryRow {
@@ -47,6 +47,11 @@ describe('distributionSlices', () => {
     const built = distributionSlices({ green: 2, amber: 1, red: 0, cannot_assess: 1 });
     expect(built.map((slice) => slice.value)).toEqual([2, 1, 0, 1, 0]);
     expect(built.map((slice) => slice.color)).toEqual(RAG_STATES.map((state) => RAG_HEX[state]));
+  });
+
+  it('keys each slice on its state rather than on the words the legend reads', () => {
+    // The key is what a filtered link carries, so it has to survive the labels being reworded.
+    expect(distributionSlices({}).map((slice) => slice.key)).toEqual([...RAG_STATES]);
   });
 
   it('keeps a zero-count label as a slice, so the legend still lists it', () => {
@@ -85,6 +90,11 @@ describe('bandSlices', () => {
     );
     expect(built.map((slice) => slice.name)).toEqual(REVIEW_BANDS.map((band) => band.name));
     expect(built.map((slice) => slice.color)).toEqual(REVIEW_BANDS.map((band) => band.mark));
+  });
+
+  it("keys each slice on the band's own key, which is what a filter is written in", () => {
+    const built = reviewSlices([row({ required_approving_reviews: 1 })]);
+    expect(built.map((slice) => slice.key)).toEqual(REVIEW_BANDS.map((band) => band.key));
   });
 
   it('counts each item under the band its classifier returns, including the bands nothing fell in', () => {

@@ -87,18 +87,38 @@ The rows are in the order the nav bar puts them, which from 2026-09-02 reads dow
 repositories, the teams that own them, then the people who work in them.
 
 **The donuts on `/repositories` count every configured repository at the span, and the search box does not filter
-them.** They read Readiness labels, Enforces review, Enforces CI, Unreviewed substantial merges, Test coverage, then
+them.** They read Readiness, Enforces review, Enforces CI, Unreviewed substantial merges, Test coverage, then
 Security issues — the label distribution off `/overview` and the other five off the rows' own service fields, added on
 2026-09-03. `/overview`'s distribution covers the repositories the span could REPORT, so `distributionSlices` is handed
 `overview.unavailable` beside it and counts those repositories as not assessed; without that the readiness donut would
 total less than the five next to it and read as a smaller estate. The
-table narrows as a reader types and the pictures above it do not, because a donut that moved with a filter would still
-be read as the estate; the readiness one has always worked that way and the five follow it. Every band is drawn in the
+table narrows as a reader types or clicks a wedge and the pictures above it do not, because a donut that moved with the
+filter it had just set would report the rows left over as the estate. Every band is drawn in the
 legend even where it counted nothing, so a legend states the whole scale while the wedge states only what exists, and a
 span with nothing to count says "No data" rather than drawing an empty ring. An unknown slice is always a repository
 nothing could be read for and never one measured at zero, and each donut's tooltip says which absences its own unknown
 covers — for the two gate donuts, that the gate says a check is required rather than which check it is or whether it
 passed.
+
+**Every donut is also the filter control for the dimension it draws**, from 2026-09-03. Clicking a legend entry or a
+wedge sets that donut's query parameter — `label`, `review`, `checks`, `unreviewed`, `coverage`, `security` — and
+clicking the slice that is already set clears it; different dimensions AND together, so three donuts narrow the table
+three times. `label` keeps the name the readiness filter carried before, so a link shared then still opens filtered.
+`ESTATE_FILTERS` in `rows.ts` is the one definition of all six: each dimension names its parameter, its chip title, its
+options and the `tone.ts` band function that classifies a row, so a filtered table holds the number of rows the clicked
+slice's legend prints rather than a second opinion about the same band. A value the parameter list does not recognise
+resolves to no filter, so a stale link shows the whole estate and never a blank table. The
+team page's donut works the same way, because it sits above the same `RepositoriesTable` and a donut that filtered on
+one page but not the other would be two different controls drawn identically.
+
+**The five readiness buttons above the table are gone, replaced by chips** the same day. The table owns no filter
+control of its own now beyond its search box: the donuts set the filters and the row where the buttons sat reports what
+they are set to, one chip per active dimension reading `{TITLE}: {Label}` with the slice's own colour and an × that
+drops that parameter alone — the span, the search term and the other chips all survive it. Nothing renders there when
+no filter is set. A fixed row of buttons could only offer one dimension; six dimensions that stack need a row that says
+which are on, and a reader who has clicked three donuts can see all three and remove the one they did not mean. The
+chip dot takes its colour as an inline `backgroundColor` from `RAG_HEX` or the band's `mark`, for the reason the wedges
+do: those palettes are hex values a Tailwind class cannot reach.
 
 **Security issues bands on the worst of six signals**, because a repository is worth looking at for its worst one:
 the open Dependabot, code scanning and secret scanning alerts, and the SonarCloud security rating, issues and hotspots.
@@ -123,7 +143,10 @@ card beside it. Sonar reads Yes
 where its measures were read and No where no project resolved or the measures could not be read — it answers "is there
 Sonar information here", so its No is a fact rather than an absence, and only a repository the span could not report at
 all dashes. Both sort on the answer their own cell prints rather than the count behind it, and both put an unreadable
-answer last in either direction, as every column does. Neither is coloured: no figure in this table carries a tone, and
+answer last in either direction, as every column does. Both centre their header and their cells rather than taking the
+right edge the counts use, because Yes, No and a dash are words and a right edge would read them as figures — which is
+what `SortHeader`'s `align` prop is for, and it carries the `pr-3` that stops Open, Stale, CODEOWNERS, Sonar and
+Findings touching each other. Neither is coloured: no figure in this table carries a tone, and
 neither answer is a grade — a repository with no CODEOWNERS file may be owned perfectly well by a rule the collector
 cannot see. `RepositoriesTable` is shared, so both columns appear on `/teams/[team]` as well, and the table there reads
 Team, Repository, Readiness, Merged, Direct commits, Open, Stale, CODEOWNERS, Sonar, Findings exactly as `/repositories`

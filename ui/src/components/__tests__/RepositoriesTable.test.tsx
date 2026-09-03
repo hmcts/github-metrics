@@ -8,8 +8,8 @@
  *
  * Neither is reachable through `react-dom/server`, which is why `tables.test.ts` leaves this
  * component out and tests its decidable half as pure functions in `lib/__tests__/rows.test.ts`
- * instead. The join between them — that a header click reaches the right column's reader, and that
- * the readiness chips navigate rather than filter in place — is only visible from a browser.
+ * instead. The join between them — that a header click reaches the right column's reader, and that a
+ * chip's × navigates rather than filtering in place — is only visible from a browser.
  *
  * The `weeks` in the URL is asserted on every navigation. A filter that dropped the span would
  * silently re-render the page at the default window, showing a different window's figures under the
@@ -52,6 +52,9 @@ const ROWS: RepositoryRow[] = [
     finding_occurrences: 7,
     codeowners_files: 2,
     sonar_reported: false,
+    // A second dimension the donuts filter on, so two parameters in the URL can be seen to AND
+    // rather than to overwrite one another: `web` requires no approval and `docs` requires two.
+    required_approving_reviews: 0,
   },
   {
     repository: 'api',
@@ -71,6 +74,7 @@ const ROWS: RepositoryRow[] = [
     // sorts the rows the other way round and fails rather than agreeing by coincidence.
     codeowners_files: 0,
     sonar_reported: true,
+    required_approving_reviews: 2,
   },
 ];
 
@@ -232,6 +236,20 @@ describe('RepositoriesTable columns', () => {
     expect(answers('api')).toEqual(['-', '-']);
   });
 
+  // Header and cell together: a centred column whose header still read from the left, or the other
+  // way round, would put the title off the answers under it.
+  it('centres both governance answers under centred headers', () => {
+    mount();
+
+    for (const cell of governance()) {
+      expect(cell?.className).toContain('text-center');
+    }
+    for (const label of ['CODEOWNERS', 'Sonar']) {
+      const heading = screen.getByRole('columnheader', { name: new RegExp(label) });
+      expect(heading.className).toContain('text-center');
+    }
+  });
+
   // Read off the whole cell rather than its own class list: the readiness cell three columns to the
   // left is toned by a span INSIDE an uncoloured `<td>`, so a governance answer coloured the same way
   // would slip past an assertion that only looked at the cell element.
@@ -244,42 +262,60 @@ describe('RepositoriesTable columns', () => {
   });
 });
 
-describe('RepositoriesTable readiness filter', () => {
-  it('counts every state over the term-filtered rows, listing the ones with none at zero', () => {
+describe('RepositoriesTable filter chips', () => {
+  it('shows no chip row at all when the URL carries no filter', () => {
     mount();
 
-    expect(chip('Ready').textContent).toContain('1');
-    expect(chip('Blocked').textContent).toContain('1');
-    expect(chip('Caution').textContent).toContain('0');
-    expect(chip('Not assessed').textContent).toContain('1');
+    expect(screen.queryByRole('group', { name: 'Active filters' })).toBeNull();
+    expect(order()).toEqual(['docs', 'web', 'api']);
   });
 
-  it('navigates on a chip, keeping the span and any term already in the URL', () => {
-    url('weeks=26&repository=e');
+  it('reads one chip per filtered dimension, each naming its donut and the slice', () => {
+    url('weeks=12&label=green&review=multiple');
     mount();
 
-    fireEvent.click(chip('Ready'));
-
-    expect(replaced).toEqual(['/repositories?weeks=26&repository=e&label=green']);
+    expect(chips()).toEqual(['Readiness: Ready', 'Enforces review: Multiple']);
   });
 
-  it('clears the filter on the active chip, by dropping the parameter rather than emptying it', () => {
-    url('weeks=12&label=green');
+  it('leaves a parameter naming no slice of its donut off the chips and off the rows', () => {
+    url('weeks=12&label=purple');
     mount();
 
-    expect(chip('Ready').getAttribute('aria-pressed')).toBe('true');
-    fireEvent.click(chip('Ready'));
+    expect(screen.queryByRole('group', { name: 'Active filters' })).toBeNull();
+    expect(order()).toEqual(['docs', 'web', 'api']);
+  });
+
+  it('applies every filter in the URL together, not just the last one read', () => {
+    url('weeks=12&label=green&review=multiple');
+    mount();
+
+    expect(order()).toEqual(['docs']);
+  });
+
+  it('says two dimensions matched nothing rather than ignoring one of them', () => {
+    url('weeks=12&label=red&review=multiple');
+    mount();
+
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(chips()).toHaveLength(2);
+  });
+
+  it('drops only its own parameter on the ×, keeping the span, the term and the other chip', () => {
+    url('weeks=26&repository=e&label=green&review=multiple');
+    mount();
+
+    fireEvent.click(remove('Readiness'));
+
+    expect(replaced).toEqual(['/repositories?weeks=26&repository=e&review=multiple']);
+  });
+
+  it('clears a filter by dropping the parameter rather than by emptying it', () => {
+    url('weeks=12&review=multiple');
+    mount();
+
+    fireEvent.click(remove('Enforces review'));
 
     expect(replaced).toEqual(['/repositories?weeks=12']);
-  });
-
-  it('applies the filter in the URL to the rows, and counts unaffected by it', () => {
-    url('weeks=12&label=red');
-    mount();
-
-    expect(order()).toEqual(['web']);
-    // The counts still describe the whole term-filtered estate, so the chips stay usable.
-    expect(chip('Ready').textContent).toContain('1');
   });
 
   it('applies the term in the URL to both the repository name and its team', () => {
@@ -298,10 +334,17 @@ describe('RepositoriesTable readiness filter', () => {
   });
 });
 
-function chip(label: string): HTMLElement {
-  return within(screen.getByRole('group', { name: 'Readiness filter' })).getByRole('button', {
-    name: new RegExp(label),
-  });
+/** What each chip reads, in the order the row puts them. */
+function chips(): string[] {
+  return Array.from(
+    screen.getByRole('group', { name: 'Active filters' }).children,
+    (chip) => chip.textContent ?? '',
+  );
+}
+
+/** One chip's dismiss control, found by the dimension it drops. */
+function remove(title: string): HTMLElement {
+  return screen.getByRole('button', { name: `Remove ${title} filter` });
 }
 
 /** What a screen reader is told about a column's sort — the property of the `<th>`, not the button. */

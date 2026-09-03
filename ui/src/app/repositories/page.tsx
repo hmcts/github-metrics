@@ -5,7 +5,7 @@ import { FilterSearchBox } from '@/components/FilterSearchBox';
 import { MetricCard } from '@/components/MetricCard';
 import { NavWeekSelector } from '@/components/NavWeekSelector';
 import { OrganisationHeader } from '@/components/OrganisationHeader';
-import { RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTable';
+import { LABEL_PARAMETER, RepositoriesTable, TERM_PARAMETER } from '@/components/RepositoriesTable';
 import { Panel, Section } from '@/components/Section';
 import { SummaryPieChart } from '@/components/charts/SummaryPieChart';
 import { getOverview, getRepositories, getWindows } from '@/lib/api';
@@ -90,10 +90,15 @@ export default async function RepositoriesPage({
       {/* Six donuts over the same estate, so each one's total is the number of repositories
           configured — including the ones nothing could be measured on, which are counted in an
           unknown slice rather than dropped. None of them is filtered by the search box below, for
-          the reason the readiness donut never was: they describe the estate, not the table. */}
+          the reason the readiness donut never was: they describe the estate, not the table.
+
+          Each one is also the filter control for the dimension it draws — its `parameter` is the
+          query parameter the table below reads back, and the names are `rows.ts`'s `ESTATE_FILTERS`
+          so a wedge and the chip it raises are the same dimension. */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <SummaryPieChart
-          title="Readiness labels"
+          title="Readiness"
+          parameter={LABEL_PARAMETER}
           // `overview.labels` distributes the reported repositories only, so the unreportable ones
           // are added here: without them this donut would total less than the five beside it.
           data={distributionSlices(overview.labels, overview.unavailable)}
@@ -101,26 +106,31 @@ export default async function RepositoriesPage({
         />
         <SummaryPieChart
           title="Enforces review"
+          parameter="review"
           data={reviewSlices(repositories)}
           tooltip="How many approving reviews each repository's merge gate requires on its default branch: multiple is two or more, enforced is one. An unprotected branch is counted as unenforced, because its gate was read and it requires nothing. Unknown is a repository whose gate was not collected, whose branch is protected and whose rules GitHub withheld, or that this span could not be reported for at all."
         />
         <SummaryPieChart
           title="Enforces CI"
+          parameter="checks"
           data={checksSlices(repositories)}
           tooltip="Whether each repository's merge gate requires any status check to pass on its default branch. This is the configuration: enforced says a check is required, not which check it is or whether it passed. Unknown is a repository whose gate was not collected, whose branch is protected and whose rules GitHub withheld, or that this span could not be reported for at all."
         />
         <SummaryPieChart
           title="Unreviewed substantial merges"
+          parameter="unreviewed"
           data={unreviewedSlices(repositories)}
           tooltip="How the readiness policy graded each repository's substantial merges that reached the default branch without independent review. Clear means none merged unreviewed; within allowance means some did and the allowance the policy was configured with forgives them. Unknown is a repository with too few merges to grade, a window holding no substantial merge, an assessment that is switched off, or a span that could not be reported for at all."
         />
         <SummaryPieChart
           title="Test coverage"
+          parameter="coverage"
           data={coverageSlices(repositories)}
           tooltip="The line coverage each repository's SonarCloud project reports, banded where the repository's own page bands it. Unknown is a repository that resolved to no SonarCloud project, one whose measures could not be read, one whose project sent no coverage metric, or one this span could not be reported for at all — and never a project reporting 0%."
         />
         <SummaryPieChart
           title="Security issues"
+          parameter="security"
           data={securitySlices(repositories)}
           tooltip="The worst of each repository's security signals: its open Dependabot, code scanning and secret scanning alerts, and its SonarCloud security rating, issues and hotspots. High is a critical or high alert open, any secret scanning alert open, or a security rating of C or worse; medium is any other alert open, a rating of B, or an open Sonar security issue or hotspot. Unknown is a repository with no security data at all — every alert family withheld and no SonarCloud measures, or a span that could not be reported for at all — and never one whose alerts were read and whose only gap is a SonarCloud project."
         />

@@ -435,7 +435,7 @@ describe('SortHeader', () => {
         active: true,
         direction: 'descending',
         onSort: () => undefined,
-        numeric: true,
+        align: 'right',
       }),
     );
     expect(markup).toContain('aria-sort="descending"');
@@ -456,6 +456,44 @@ describe('SortHeader', () => {
     expect(markup).toContain('aria-sort="none"');
     expect(markup).not.toContain('<svg');
     expect(markup).toContain('text-left');
+  });
+
+  it('centres a column that asked for the middle', () => {
+    const markup = renderToStaticMarkup(
+      createElement(SortHeader, {
+        label: 'CODEOWNERS',
+        active: false,
+        direction: 'ascending',
+        onSort: () => undefined,
+        align: 'center',
+      }),
+    );
+    expect(markup).toContain('text-center');
+  });
+
+  /**
+   * The gap between two titles, which is what put this prop here: CODEOWNERS and Sonar rendered
+   * flush against each other, reading as one word. The padding matches the body cells' own, so a
+   * title still sits over its column.
+   */
+  it('pads every header on the right, and the first column on the left as its cells are', () => {
+    function header(first: boolean): string {
+      return renderToStaticMarkup(
+        createElement(SortHeader, {
+          label: 'Team',
+          active: false,
+          direction: 'ascending',
+          onSort: () => undefined,
+          first,
+        }),
+      );
+    }
+
+    expect(header(true)).toContain('pr-3');
+    expect(header(true)).toContain('pl-3');
+    // Only the leading column takes the inset: an interior one would be pushed off its column.
+    expect(header(false)).toContain('pr-3');
+    expect(header(false)).not.toContain('pl-3');
   });
 });
 

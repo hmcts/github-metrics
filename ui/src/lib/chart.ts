@@ -27,6 +27,14 @@ import {
 import type { RepositoryRow } from '@/lib/types';
 
 export interface PieSlice {
+  /**
+   * What the slice is, in the vocabulary its dimension is filtered by: a `RAGState` or a band key.
+   *
+   * Separate from `name` because the words move and the key must not — the legend reads "Within
+   * allowance" over a band keyed `within`, and a link shared with `?unreviewed=within` in it has to
+   * keep working when somebody rewords the legend.
+   */
+  key: string;
   /** The label shown in the legend and in the hover card. */
   name: string;
   value: number;
@@ -49,6 +57,7 @@ export interface PieSlice {
  */
 export function distributionSlices(labels: Record<string, number>, unreportable = 0): PieSlice[] {
   return RAG_STATES.map((readiness) => ({
+    key: readiness,
     name: RAG_LABEL[readiness],
     value:
       Object.entries(labels)
@@ -75,6 +84,7 @@ export function bandSlices<Key extends string, Item>(
   band: (item: Item) => Key,
 ): PieSlice[] {
   return bands.map((entry) => ({
+    key: entry.key,
     name: entry.name,
     value: items.filter((item) => band(item) === entry.key).length,
     color: entry.mark,

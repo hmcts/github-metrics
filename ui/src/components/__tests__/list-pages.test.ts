@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import ContributorsPage from '@/app/contributors/page';
 import RepositoriesPage from '@/app/repositories/page';
 import TeamsPage from '@/app/teams/page';
+import { ESTATE_FILTERS } from '@/lib/rows';
 import type {
   ActorRow,
   OverviewSummary,
@@ -107,10 +108,13 @@ vi.mock('next/headers', () => ({
   cookies: () => Promise.resolve({ get: () => undefined }),
 }));
 
+/** What the client components on the page read the URL as, which a test about filtering sets. */
+let search = new URLSearchParams();
+
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ replace: () => undefined }),
   usePathname: () => '/repositories',
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => search,
 }));
 
 /** Answer each list endpoint from the fixtures above, recording the path it was asked for. */
@@ -141,6 +145,7 @@ function spans(): string[] {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  search = new URLSearchParams();
 });
 
 describe('the three list routes', () => {
@@ -279,7 +284,7 @@ describe('the three list routes', () => {
 
   /** The six donut titles, in the order they are drawn in. */
   const DONUTS = [
-    'Readiness labels',
+    'Readiness',
     'Enforces review',
     'Enforces CI',
     'Unreviewed substantial merges',
@@ -294,13 +299,12 @@ describe('the three list routes', () => {
    * figures are — which is also where a reader finds them for a band drawn at zero.
    */
   function legend(markup: string, title: string): Record<string, number> {
-    const opened = markup.indexOf(`>${title}</h3>`);
-    expect(opened).toBeGreaterThan(-1);
-    const next = markup.indexOf('<h3', opened + 1);
-    const panel = markup.slice(opened, next === -1 ? undefined : next);
+    const panel = panelOf(markup, title);
     const bands: Record<string, number> = {};
+    // `text-slate-400[^"]*` because every legend here is interactive now and its label carries the
+    // hover class beside that one — the words and the count are what is being read either way.
     const entries = panel.matchAll(
-      /text-slate-400">([^<]+)<\/span><span class="text-xs text-slate-600 tabular-nums">(\d+)</g,
+      /text-slate-400[^"]*">([^<]+)<\/span><span class="text-xs text-slate-600 tabular-nums">(\d+)</g,
     );
     for (const match of entries) {
       bands[match[1] ?? ''] = Number(match[2]);
@@ -356,7 +360,7 @@ describe('the three list routes', () => {
       High: 1,
       Unknown: 1,
     });
-    expect(legend(markup, 'Readiness labels')).toEqual({
+    expect(legend(markup, 'Readiness')).toEqual({
       Ready: 1,
       Caution: 1,
       Blocked: 0,
@@ -370,6 +374,115 @@ describe('the three list routes', () => {
     for (const title of DONUTS) {
       const counts = Object.values(legend(markup, title));
       expect(counts.reduce((total, value) => total + value, 0)).toBe(REPOSITORIES.length);
+    }
+  });
+
+  /** The panel of one donut, from its heading to the next one's. */
+  function panelOf(markup: string, title: string): string {
+    const opened = markup.indexOf(`>${title}</h3>`);
+    expect(opened).toBeGreaterThan(-1);
+    const next = markup.indexOf('<h3', opened + 1);
+    return markup.slice(opened, next === -1 ? undefined : next);
+  }
+
+  /** The labels of one donut's legend entries drawn as pressed, which is what it is filtered to. */
+  function pressed(markup: string, title: string): string[] {
+    return panelOf(markup, title)
+      .split('<button')
+      .filter((entry) => entry.includes('aria-pressed="true"'))
+      .map((entry) => /text-slate-400[^"]*">([^<]+)</.exec(entry)?.[1] ?? 'unlabelled');
+  }
+
+  /**
+   * The chips the table reports its filters with, as the words a reader sees on each one.
+   *
+   * Read out of the chip group alone rather than off the page, because every word a chip prints is
+   * also in the donut heading and the legend entry it came from — an assertion against the whole
+   * markup passes just as well when no chip was rendered at all.
+   */
+  function chips(markup: string): string[] {
+    const opened = markup.indexOf('aria-label="Active filters"');
+    if (opened === -1) {
+      return [];
+    }
+    const group = markup.slice(opened, markup.indexOf('</div>', opened));
+    return [
+      ...group.matchAll(
+        /<span class="text-slate-400 uppercase tracking-wide">([^<]*)<\/span>([^<]*)</g,
+      ),
+    ].map((match) => `${match[1] ?? ''}${match[2] ?? ''}`.trim());
+  }
+
+  /** Every donut is a filter control, so each legend is a labelled group of buttons. */
+  it('makes each donut the filter control for its own dimension', async () => {
+    stubService();
+    const markup = renderToStaticMarkup(await RepositoriesPage({ searchParams: Promise.resolve({}) }));
+
+    for (const title of DONUTS) {
+      expect(panelOf(markup, title)).toContain(`aria-label="${title} filter"`);
+      expect(pressed(markup, title)).toEqual([]);
+    }
+  });
+
+  /**
+   * Which parameter each donut was wired to, read back off a URL that filters on one of them.
+   *
+   * Six donuts and six parameter names is six chances to hand a donut the parameter beside it, and
+   * the page renders identically either way — the mistake only shows in what a click filters. So the
+   * URL is set to a coverage band and the coverage donut has to be the one showing it: `high` is a
+   * key in the security bands too, so a coverage donut wired to `security` would light up there
+   * instead. The table below reads the same parameter, which is why the chip and the rows say so.
+   */
+  it('wires each donut to its own parameter, and the table reads them back', async () => {
+    search = new URLSearchParams('coverage=high');
+    stubService();
+    const markup = renderToStaticMarkup(await RepositoriesPage({ searchParams: Promise.resolve({}) }));
+
+    expect(pressed(markup, 'Test coverage')).toEqual(['90% or more']);
+    for (const title of DONUTS.filter((each) => each !== 'Test coverage')) {
+      expect(pressed(markup, title)).toEqual([]);
+    }
+    // The chip names the dimension the donut drew, read off the chip row rather than off the page:
+    // both of its words are in the donut's own heading and legend whatever the chips hold, so
+    // asserting them against the whole markup would pass with no chip row rendered at all.
+    expect(chips(markup)).toEqual(['Test coverage: 90% or more']);
+    expect(markup).toContain('Remove Test coverage filter');
+    // And the table holds only the row in that band.
+    expect(markup).toContain('href="/repositories/api?weeks=4"');
+    expect(markup).not.toContain('href="/repositories/web?weeks=4"');
+
+    // While every donut still counts the whole estate: they describe the estate, not the table, and
+    // a donut fed the filtered rows would shrink to one as the reader clicked it.
+    for (const title of DONUTS) {
+      const counts = Object.values(legend(markup, title));
+      expect(counts.reduce((total, value) => total + value, 0)).toBe(REPOSITORIES.length);
+    }
+  });
+
+  /**
+   * Every dimension round-tripped: the URL its donut writes is the URL that donut reads back.
+   *
+   * The case above proves the join on one parameter. This one walks all six, because five donuts
+   * handed a neighbour's parameter render identically to five wired correctly — the mistake shows
+   * only when a value is put in the URL and the wrong legend lights up, or none of them does.
+   */
+  it('reads every dimension back on the donut that writes it', async () => {
+    for (const filter of ESTATE_FILTERS) {
+      const option = filter.options[0];
+      if (option === undefined) {
+        throw new Error(`${filter.parameter} offers no option to filter on`);
+      }
+      search = new URLSearchParams(`${filter.parameter}=${option.key}`);
+      stubService();
+      const markup = renderToStaticMarkup(
+        await RepositoriesPage({ searchParams: Promise.resolve({}) }),
+      );
+
+      expect(pressed(markup, filter.title)).toEqual([option.name]);
+      for (const title of DONUTS.filter((each) => each !== filter.title)) {
+        expect(pressed(markup, title)).toEqual([]);
+      }
+      expect(chips(markup)).toEqual([`${filter.title}: ${option.name}`]);
     }
   });
 });
