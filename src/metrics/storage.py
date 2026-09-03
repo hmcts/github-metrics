@@ -36,6 +36,41 @@ class StorageError(RuntimeError):
     """Report a metrics storage failure."""
 
 
+JOURNAL_MODE = "delete"
+"""The journal mode both files are held in, set on every connection that opens either of them.
+
+Set here because the mode belongs to the FILE and not to the code that opens it. SQLite records it
+in the header, so whatever sets it once — a database browser, an older build, a library compiled
+with a different default — is what every later run inherits, however long ago that was and whoever
+did it. Leaving the mode to the default therefore leaves it to history.
+
+WAL is the mode this excludes. A WAL database keeps its wal-index in a `-shm` file mapped into
+memory, and that mapping is only as sound as the filesystem under it: where the kernel cannot fault
+one of its pages in, the process takes SIGBUS inside `walIndexAppend` part-way through a commit and
+dies without a Python traceback. Three collection runs over the HMCTS estate died exactly that way,
+on a cache file that had been left in WAL mode, on a directory shared out to a VM. A rollback
+journal maps nothing and cannot fail that way.
+
+The cost is concurrency, and it is small here. A collection is a single process, and a
+`metrics-serve` read taken while one is writing waits on the five-second busy timeout instead of
+proceeding beside the writer as it would under WAL.
+"""
+
+
+def pin_journal_mode(connection: Connection) -> None:
+    """Hold one connection's database in `JOURNAL_MODE`, converting a file that arrived in another.
+
+    Read before writing, because this runs on every connection a collection opens and a collection
+    opens thousands: a file already in the right mode costs one pragma and no write. A conversion
+    another connection holds the file against raises `sqlite3.Error`, which every caller in this
+    module already turns into a `StorageError` naming the file.
+    """
+    if connection.execute("PRAGMA journal_mode").fetchone()[0] != JOURNAL_MODE:
+        # Interpolated because PRAGMA takes no bound parameter. The value is this module's constant
+        # and no caller can reach it.
+        connection.execute(f"PRAGMA journal_mode = {JOURNAL_MODE}")
+
+
 def observation_database(database: Path) -> Path:
     """Return the observation history file that sits beside one configured cache.
 
@@ -91,7 +126,12 @@ def initialize(connection: Connection) -> None:
 
 
 def initialize_observations(connection: Connection) -> None:
-    """Create the observation history schema when needed.
+    """Hold the journal mode and create the observation history schema when needed.
+
+    The mode is held here for the reason `JOURNAL_MODE` gives, and it matters more on this file than
+    on the cache: a commit lost to a SIGBUS takes a month of alert history with it that GitHub cannot
+    be asked for again. `prepare` is the cache's equivalent, and this file does not use it — foreign
+    keys buy nothing across two tables that reference neither.
 
     Its own database and its own initializer, so the cache's "no migrations, delete it and refetch"
     rule keeps applying to the cache alone. `alert_observations` is keyed on the observed instant as
@@ -120,6 +160,7 @@ def initialize_observations(connection: Connection) -> None:
     why. It is stored deliberately: a never-analysed project answers the same way every run, and
     remembering the answer is what stops the next run paying the search quota to learn it again.
     """
+    pin_journal_mode(connection)
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS alert_observations (
@@ -147,8 +188,9 @@ def initialize_observations(connection: Connection) -> None:
 
 
 def prepare(connection: Connection) -> None:
-    """Enable relational integrity and initialize the current schema."""
+    """Enable relational integrity, hold the journal mode, and initialize the current schema."""
     connection.execute("PRAGMA foreign_keys = ON")
+    pin_journal_mode(connection)
     initialize(connection)
 
 

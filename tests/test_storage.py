@@ -56,6 +56,8 @@ from metrics.storage import (
     load_repository_state,
     load_sonar_mapping,
     observation_database,
+    pin_journal_mode,
+    prepare,
     prevailing_cached_coverage,
     prune_cache,
     record_alert_observations,
@@ -138,6 +140,40 @@ def inventory() -> RepositoryInventory:
             ),
         ),
     )
+
+
+def journal_mode(path: Path) -> str:
+    """Read one database file's journal mode without preparing it."""
+    with closing(connect(path)) as connection:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+
+
+def test_pin_journal_mode_converts_a_database_left_in_write_ahead_log_mode(tmp_path: Path) -> None:
+    """Take a cache file out of the mode whose mapped wal-index killed three collection runs."""
+    path = tmp_path / "metrics.sqlite3"
+    with closing(connect(path)) as connection:
+        connection.execute("PRAGMA journal_mode = wal")
+    assert journal_mode(path) == "wal"
+
+    with closing(connect(path)) as connection:
+        pin_journal_mode(connection)
+
+    assert journal_mode(path) == "delete"
+    assert not (tmp_path / "metrics.sqlite3-shm").exists()
+
+
+def test_pin_journal_mode_leaves_a_database_already_in_the_pinned_mode_alone(tmp_path: Path) -> None:
+    """Cost a file in the right mode one pragma read and no write."""
+    path = tmp_path / "metrics.sqlite3"
+    with closing(connect(path)) as connection, connection:
+        prepare(connection)
+    before = path.stat().st_mtime_ns
+
+    with closing(connect(path)) as connection:
+        pin_journal_mode(connection)
+
+    assert journal_mode(path) == "delete"
+    assert path.stat().st_mtime_ns == before
 
 
 def test_record_repository_state_stores_current_state_without_run_provenance(
