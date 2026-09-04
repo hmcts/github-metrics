@@ -627,31 +627,6 @@ export interface SecuritySignals {
 }
 
 /**
- * The Sonar security rating, banded DELIBERATELY STRICTER than `sonarRatingTone` colours it.
- *
- * `sonarRatingTone` puts C at amber, following Sonar's own scale, where this puts C at High — on the
- * user's instruction, because this donut is read to find the repositories worth looking at and a C
- * security rating is one of them. The divergence is stated so it is not later "fixed" into agreement:
- * the two answer different questions about the same letter, and the repository page's card is the one
- * that reports Sonar's own grading.
- *
- * Off the 1-to-5 scale is no data rather than either extreme, for the reason `sonarRatingTone` gives:
- * a rating this build does not understand is not a verdict it can convert into one.
- */
-function securityRatingTone(rating: SonarRating | null | undefined): Tone {
-  if (rating == null || !Number.isInteger(rating.value)) {
-    return 'neutral';
-  }
-  if (rating.value === 1) {
-    return 'good';
-  }
-  if (rating.value === 2) {
-    return 'warn';
-  }
-  return rating.value >= 3 && rating.value <= 5 ? 'bad' : 'neutral';
-}
-
-/**
  * Band a repository by the worst of its security signals, or unmeasured where it has none.
  *
  * Six signals, each resolved to a tone or to `neutral` where there is no data, and the worst tone
@@ -666,6 +641,15 @@ function securityRatingTone(rating: SonarRating | null | undefined): Tone {
  * `unknown` is EVERY signal carrying no data — a row the span could not report, or one whose three
  * families GitHub all refused and which has no Sonar measures. A repository with readable families
  * and no Sonar project is Clear: its security was read, and there was nothing open.
+ *
+ * The rating goes through `sonarRatingTone`, so the donut and the repository page's card grade the
+ * letter IDENTICALLY. This donut banded C at High until 2026-09-04, deliberately stricter than the
+ * card; that is reversed, and the reason is a measurement rather than a preference — a C-at-High
+ * boundary put 78 of the estate's 266 rated repositories in the red band and left 7 in amber, so the
+ * middle band named the one letter almost nothing holds. Sonar has already weighed the finding
+ * against the project, and a scale that reports A or nothing is not reporting a scale. Alerts are
+ * untouched by that reversal: a critical or high alert is still red however the rating reads, so a
+ * repository only moves to Medium when its alert families are clean.
  */
 export function securityBand(signals: SecuritySignals): SecurityBand {
   const alerts = signals.security;
@@ -678,7 +662,7 @@ export function securityBand(signals: SecuritySignals): SecurityBand {
     : [];
   const tones = [
     ...families,
-    securityRatingTone(signals.sonar_security_rating),
+    sonarRatingTone(signals.sonar_security_rating),
     counted(signals.sonar_security_issues, 'good', 'warn'),
     counted(signals.sonar_security_hotspots, 'good', 'warn'),
   ].filter((tone) => tone !== 'neutral');

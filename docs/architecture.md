@@ -1499,16 +1499,32 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
     satisfied check from one that bears on the label in neither state. It adds no line to the text
     report and changes no label.
     A DONUT MAY BAND A FIGURE STRICTER THAN THE CARD BESIDE IT (2026-09-03, at the user's
-    instruction). `securityBand` bands the estate's security donut on the worst of six signals — the
-    three alert families through `alertTone`, and SonarCloud's security rating, issues and hotspots —
-    and puts a security rating of C at High where `sonarRatingTone` puts the same letter at amber,
-    following Sonar's own scale. This is the first case of TWO UI THRESHOLDS GRADING ONE FIGURE
-    DIFFERENTLY, and it is allowed because the two answer different questions about the letter: the
-    repository page's card reports Sonar's grading, and the donut answers which repositories are
-    worth opening. Both boundaries stay in `tone.ts` with the divergence stated beside each, neither
-    reaches `assessment.py`, and security stays report-only and ungraded in the report. The three
-    alert families are the countervailing rule: the donut delegates to the same `alertTone` the cards
-    use, so donut and card can never disagree about a family.
+    instruction). REVERSED 2026-09-04 AT THE USER'S INSTRUCTION — see below. `securityBand` bands the
+    estate's security donut on the worst of six signals — the three alert families through
+    `alertTone`, and SonarCloud's security rating, issues and hotspots — and put a security rating of
+    C at High where `sonarRatingTone` puts the same letter at amber, following Sonar's own scale.
+    That was the first case of TWO UI THRESHOLDS GRADING ONE FIGURE DIFFERENTLY, allowed because the
+    two answered different questions about the letter: the repository page's card reports Sonar's
+    grading, and the donut answers which repositories are worth opening. Either way both boundaries
+    stay in `tone.ts`, neither reaches `assessment.py`, and security stays report-only and ungraded
+    in the report. The three alert families were the countervailing rule and still are: the donut
+    delegates to the same `alertTone` the cards use, so donut and card can never disagree about a
+    family.
+    What reversed it is a MEASUREMENT rather than a change of taste. Sonar's security rating is
+    bimodal across this estate — of 266 rated repositories, 138 hold A, 7 hold B, and 121 hold C or
+    worse — so a C-at-High boundary defined amber as the one letter almost nothing holds, and the
+    donut it produced was 1245 clear against 490 High with 46 in between. Banding C at amber, which
+    is simply Sonar's own scale, moves 54 repositories to Medium for 100 against 436. The intent
+    behind the 2026-09-03 ruling was a band that finds the repositories worth opening; a middle band
+    that is empty by construction does not serve it, and the rating was never the signal painting the
+    estate red anyway — 386 of the 490 were red on Dependabot, 352 on Dependabot alone.
+    The reversal is DELIBERATELY NARROW: it moves the RATING BOUNDARY ONLY. A critical or high alert
+    is still High however the letter reads, on the user's instruction that a high alert is work to be
+    addressed and must not be recoloured — so the 54 that moved are exactly those whose alert
+    families were already clean, and 24 C-rated repositories stayed High on an alert (17 Dependabot,
+    5 code scanning, 2 both). Do not "fix" the remaining asymmetry by softening `alertTone`.
+    `securityRatingTone` is gone rather than edited: with C at amber it was identical to
+    `sonarRatingTone`, and two names for one boundary is how they drift apart again.
     EVERY DONUT IS ALSO THE FILTER CONTROL FOR THE DIMENSION IT DRAWS (2026-09-03, at the user's
     instruction). A legend entry or a wedge writes its slice's key to that dimension's query
     parameter — `label`, `review`, `checks`, `unreviewed`, `coverage`, `security` — clicking the

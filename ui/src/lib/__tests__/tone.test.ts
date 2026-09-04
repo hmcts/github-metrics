@@ -431,14 +431,28 @@ describe('the security band', () => {
     expect(securityBand({ security: refusedSecurity() })).toBe('unknown');
   });
 
-  it('puts a C security rating at High, stricter than the repository page colours the letter', () => {
-    // Deliberate divergence: `sonarRatingTone` follows Sonar's scale and puts C at amber.
+  it('grades the security rating exactly as the repository page colours the letter', () => {
+    // No divergence since 2026-09-04: the donut reads `sonarRatingTone`, so C is amber in both.
     expect(securityBand({ sonar_security_rating: { value: 1 } })).toBe('clear');
     expect(securityBand({ sonar_security_rating: { value: 2 } })).toBe('medium');
-    expect(securityBand({ sonar_security_rating: { value: 3 } })).toBe('high');
+    expect(securityBand({ sonar_security_rating: { value: 3 } })).toBe('medium');
     expect(sonarRatingTone({ value: 3 })).toBe('warn');
     expect(securityBand({ sonar_security_rating: { value: 4 } })).toBe('high');
     expect(securityBand({ sonar_security_rating: { value: 5 } })).toBe('high');
+  });
+
+  it('keeps a severe alert red under a C rating, so only clean families reach Medium', () => {
+    // The reason the C reversal cannot quietly downgrade a repository with work outstanding.
+    const rating = { value: 3 } as const;
+    const severe = alerts({ open: 2, by_severity: { high: 1, low: 1 } });
+    const mild = alerts({ open: 2, by_severity: { medium: 1, low: 1 } });
+    expect(securityBand({ sonar_security_rating: rating, security: security({ dependabot: severe }) })).toBe(
+      'high',
+    );
+    expect(securityBand({ sonar_security_rating: rating, security: security({ dependabot: mild }) })).toBe(
+      'medium',
+    );
+    expect(securityBand({ sonar_security_rating: rating, security: security() })).toBe('medium');
   });
 
   it('reads a rating off the 1-to-5 scale as no data, not as the worst there is', () => {

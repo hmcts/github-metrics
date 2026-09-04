@@ -123,17 +123,19 @@ do: those palettes are hex values a Tailwind class cannot reach.
 
 **Security issues bands on the worst of six signals**, because a repository is worth looking at for its worst one:
 the open Dependabot, code scanning and secret scanning alerts, and the SonarCloud security rating, issues and hotspots.
-High is a critical or high alert open, any secret scanning alert open at all, or a security rating of C or worse;
-Medium is any other alert open, a rating of B, or a Sonar security issue or hotspot above zero. The three alert
+High is a critical or high alert open, any secret scanning alert open at all, or a security rating of D or worse;
+Medium is any other alert open, a rating of B or C, or a Sonar security issue or hotspot above zero. The three alert
 families delegate to `alertTone`, which the repository page already colours its security cards with, so a donut and a
 card cannot disagree about one family. Unknown here is stricter than the word looks: it is a repository with **no**
 security data at all — every alert family withheld and no Sonar measures, or a span that could not report it — so a
 repository whose alerts were read clean and whose only gap is a SonarCloud project counts Clear.
 
-The rating threshold is the one place the UI is **deliberately stricter than the repository page**. `sonarRatingTone`
-puts C at amber, following Sonar's own scale; `securityBand` puts C at High, on the user's instruction, because this
-donut is read to find the repositories worth looking at. The divergence is stated in `tone.ts` beside both functions so
-it is not later "fixed" into agreement — the card reports Sonar's grading, the donut answers which repositories to open.
+The rating threshold **agrees with the repository page**: `securityBand` reads the same `sonarRatingTone` the card
+does, so C is amber in both. It banded C at High until 2026-09-04, deliberately stricter, and the reversal was measured
+rather than preferred — a C-at-High boundary put 78 of the estate's 266 rated repositories in the red band and left 7
+in amber, so the middle band named the one letter almost nothing holds. Alerts did **not** move with it: a critical or
+high alert stays High whatever the rating says, so the 54 repositories this reversal moved to Medium are the ones whose
+alert families were already clean, and no repository with severe work outstanding was downgraded.
 
 **The estate table gained two governance columns between Stale and Findings** on 2026-09-03: CODEOWNERS and Sonar,
 both yes-or-no. CODEOWNERS reads Yes where the repository holds at least one CODEOWNERS file, No where every checked
@@ -308,8 +310,8 @@ place:
   be checked against each other by reading them side by side. The five donut band tables are there for that reason
   too — the key, the word and the mark per band, best first, with `lib/chart.ts` only counting rows into them — and
   `coverageTone` is one function the repository page's Sonar measure and the coverage donut both read, so moving the
-  90/80 boundary moves both. Where a donut deliberately grades a figure differently from the page, as `securityBand`
-  does a Sonar security rating of C, the divergence and the instruction behind it are stated in the comment.
+  90/80 boundary moves both. `securityBand` reads `sonarRatingTone` for the same reason: no donut currently grades a
+  figure differently from the page, and one that did would have to state the divergence in the comment.
 - **A chart mark comes from `TONE_HEX`**, which derives from `RAG_HEX` rather than restating the four hexes: recharts
   takes a fill as a string, so a donut cannot reach a Tailwind class, and a second copy of the palette is how a wedge
   and the row it counts drift into two greens nobody chose. `STRONG_GOOD_HEX` is the single mark that is not a tone.

@@ -241,7 +241,9 @@ describe('securitySlices', () => {
       row({ security: security(), sonar_security_issues: 0, sonar_security_hotspots: 0 }),
       row({}),
     ]);
-    expect(counts(built)).toEqual({ Clear: 1, Medium: 1, High: 2, Unknown: 1 });
+    // The C-rated row is Medium, not High, since the 2026-09-04 reversal; the secret scanning row is
+    // the one that reaches High here. `tone.test.ts` covers the rating boundary letter by letter.
+    expect(counts(built)).toEqual({ Clear: 1, Medium: 2, High: 1, Unknown: 1 });
   });
 
   it('keeps a band nothing fell in, so the legend still lists it', () => {
