@@ -708,27 +708,25 @@ def test_pull_request_size_at_or_below_the_green_boundary_is_clear() -> None:
     )
 
 
-def test_pull_request_size_above_green_and_at_or_below_amber_is_amber() -> None:
-    """Grade a p75 above the green target but within the amber ceiling as amber, not red."""
+def test_pull_request_size_above_its_maximum_is_a_caution_carrying_its_numbers() -> None:
+    """Report a p75 above the maximum as a caution, with the measurement a reader argues with."""
     cohort = facts(*(pull_request(number, reviewed=True, lines=800) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "pull-request-size-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    condition = next(item for item in assessment.caution if item.condition == "pull-request-size-above-target")
+    assert condition.label is None
     assert condition.detail == "pull-request-size 75th percentile is 800 lines, above the 400 lines target"
 
 
-def test_pull_request_size_far_above_its_maximum_is_still_only_amber() -> None:
-    """Hold a flow signal at amber whatever it costs, because a cost is not a governance failure."""
-    cohort = facts(*(pull_request(number, reviewed=True, lines=801) for number in range(1, 11)))
+def test_pull_request_size_far_above_its_maximum_is_still_only_a_caution() -> None:
+    """Keep a flow signal out of the blocking list whatever it costs: a cost is not a failure."""
+    cohort = facts(*(pull_request(number, reviewed=True, lines=90000) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "pull-request-size-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    assert "pull-request-size-above-target" in tuple(item.condition for item in assessment.caution)
+    assert "pull-request-size-above-target" not in tuple(item.condition for item in assessment.blocking)
 
 
 def test_merge_cycle_time_at_or_below_the_green_boundary_is_clear() -> None:
@@ -742,26 +740,25 @@ def test_merge_cycle_time_at_or_below_the_green_boundary_is_clear() -> None:
     )
 
 
-def test_merge_cycle_time_above_green_and_at_or_below_amber_is_amber() -> None:
-    """Grade a median cycle time above the green target but within the amber ceiling as amber."""
+def test_merge_cycle_time_above_its_maximum_is_a_caution_carrying_its_numbers() -> None:
+    """Report a median cycle time above the maximum as a caution, with what was measured."""
     cohort = facts(*(pull_request(number, reviewed=True, cycle_hours=48) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "merge-cycle-time-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    condition = next(item for item in assessment.caution if item.condition == "merge-cycle-time-above-target")
+    assert condition.label is None
+    assert condition.detail == "merge-cycle-time median is 48 hours, above the 24 hours target"
 
 
-def test_merge_cycle_time_far_above_its_maximum_is_still_only_amber() -> None:
-    """Hold a flow signal at amber whatever it costs, because a cost is not a governance failure."""
-    cohort = facts(*(pull_request(number, reviewed=True, cycle_hours=49) for number in range(1, 11)))
+def test_merge_cycle_time_far_above_its_maximum_is_still_only_a_caution() -> None:
+    """Keep a slow repository out of the blocking list however long each merge takes it."""
+    cohort = facts(*(pull_request(number, reviewed=True, cycle_hours=2400) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "merge-cycle-time-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    assert "merge-cycle-time-above-target" in tuple(item.condition for item in assessment.caution)
+    assert "merge-cycle-time-above-target" not in tuple(item.condition for item in assessment.blocking)
 
 
 def test_time_to_first_review_at_or_below_the_green_boundary_is_clear() -> None:
@@ -775,26 +772,27 @@ def test_time_to_first_review_at_or_below_the_green_boundary_is_clear() -> None:
     )
 
 
-def test_time_to_first_review_above_green_and_at_or_below_amber_is_amber() -> None:
-    """Grade a median waiting time above the green target but within the amber ceiling as amber."""
+def test_time_to_first_review_above_its_maximum_is_a_caution_carrying_its_numbers() -> None:
+    """Report a median waiting time above the maximum as a caution, with what was measured."""
     cohort = facts(*(pull_request(number, reviewed=True, review_wait_hours=16) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "time-to-first-review-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    condition = next(item for item in assessment.caution if item.condition == "time-to-first-review-above-target")
+    assert condition.label is None
+    assert condition.detail == "time-to-first-review median is 16 hours, above the 8 hours target"
 
 
-def test_time_to_first_review_far_above_its_maximum_is_still_only_amber() -> None:
-    """Hold a flow signal at amber whatever it costs, because a cost is not a governance failure."""
-    cohort = facts(*(pull_request(number, reviewed=True, review_wait_hours=17) for number in range(1, 11)))
+def test_time_to_first_review_far_above_its_maximum_is_still_only_a_caution() -> None:
+    """Keep a team that waits weeks for a first review out of the blocking list all the same."""
+    cohort = facts(
+        *(pull_request(number, reviewed=True, cycle_hours=2400, review_wait_hours=1200) for number in range(1, 11)),
+    )
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    condition = next(item for item in assessment.blocking if item.condition == "time-to-first-review-above-target")
-    assert condition.label is ReadinessLabel.AMBER
+    assert "time-to-first-review-above-target" in tuple(item.condition for item in assessment.caution)
+    assert "time-to-first-review-above-target" not in tuple(item.condition for item in assessment.blocking)
 
 
 def test_flow_metrics_are_not_observed_when_the_cohort_has_no_pull_requests() -> None:
@@ -824,14 +822,18 @@ def test_pull_request_size_is_not_observed_when_github_never_sized_any_change() 
 
 
 def test_flow_metric_thresholds_are_configurable() -> None:
-    """Let configuration decide each flow signal's boundary rather than a fixed default."""
+    """Let configuration decide each flow signal's boundary rather than a fixed default.
+
+    Read off the condition rather than the label, since neither side of the boundary moves a label
+    any more: the same 500-line cohort is at target under one maximum and cautioned under the other.
+    """
     cohort = facts(*(pull_request(number, reviewed=True, lines=500) for number in range(1, 11)))
     lenient = AssessmentConfiguration.model_validate(
         {"pull-request-size": {"maximum": 500}},
     )
 
-    assert policy(lenient).assess(cohort, gate()).label is ReadinessLabel.GREEN
-    assert policy().assess(cohort, gate()).label is ReadinessLabel.AMBER
+    assert "pull-request-size-at-target" in reported(policy(lenient).assess(cohort, gate()))
+    assert "pull-request-size-above-target" in reported(policy().assess(cohort, gate()))
 
 
 def test_each_distribution_metric_is_graded_on_the_percentile_its_policy_names() -> None:
@@ -887,21 +889,48 @@ def test_an_unobserved_distribution_is_reported_as_ungraded_rather_than_as_a_sho
     assert judgement.condition.label is None
 
 
-def test_a_flow_signal_caps_at_amber_however_far_above_its_maximum_it_sits() -> None:
-    """Keep red for what is ungoverned, never for what is merely slow or large.
+def test_a_slow_repository_with_a_compliant_gate_and_full_review_coverage_is_green() -> None:
+    """Keep the label for what is governed, never for what is merely slow or large.
 
     A repository reviewing every merge but taking a fortnight over each one is a different finding
-    from one merging unreviewed, and grading a cost to red made the two indistinguishable.
+    from one merging unreviewed, and letting a cost impose a ceiling made the two indistinguishable.
+    This is the case the demotion exists to fix: nothing here reached the default branch ungoverned,
+    so nothing blocks, and the flow signals still say what the way of working costs.
     """
     cohort = facts(*(pull_request(number, reviewed=True, cycle_hours=2400, lines=90000) for number in range(1, 11)))
 
     assessment = policy().assess(cohort, gate())
 
-    assert assessment.label is ReadinessLabel.AMBER
-    assert {condition.label for condition in assessment.blocking} == {ReadinessLabel.AMBER}
+    assert assessment.label is ReadinessLabel.GREEN
+    assert assessment.blocking == ()
     assert detail(assessment, "merge-cycle-time-above-target") == (
         "merge-cycle-time median is 2400 hours, above the 24 hours target"
     )
+
+
+def test_all_three_flow_signals_above_their_maximum_land_in_caution_together() -> None:
+    """Demote the three as one, so a later change cannot quietly re-promote one of them.
+
+    Each is graded by the same `distribution()`, so they are one ruling rather than three: asserting
+    the full caution section catches a signal that slipped back into blocking as readily as one that
+    stopped being reported at all.
+    """
+    cohort = facts(
+        *(
+            pull_request(number, reviewed=True, lines=800, cycle_hours=48, review_wait_hours=16)
+            for number in range(1, 11)
+        ),
+    )
+
+    assessment = policy().assess(cohort, gate())
+
+    assert assessment.label is ReadinessLabel.GREEN
+    assert tuple(condition.condition for condition in assessment.caution) == (
+        "pull-request-size-above-target",
+        "merge-cycle-time-above-target",
+        "time-to-first-review-above-target",
+    )
+    assert all(condition.label is None for condition in assessment.caution)
 
 
 def test_unreviewed_substantial_merges_are_counted_against_every_substantial_merge() -> None:

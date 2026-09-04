@@ -96,6 +96,15 @@ Decisions taken by the user on 2026-08-13, now settled:
    from an ungoverned one — on this estate the sub-hour merge-cycle-time medians all belonged to
    repositories with almost no review coverage. The `amber_maximum` half of the pair is gone with it:
    it was set to double the green boundary, arithmetic standing in for a policy nobody had made.
+   CAUTION-ONLY (2026-09-03, user ruling): the amber cap went the rest of the way. All three flow
+   signals now report as CAUTIONS and impose no ceiling at all. The 2026-08-16 reasoning was right
+   and did not go far enough: if a cost is not evidence that anything ungoverned merged, it is not
+   grounds for withholding enablement either, so it cannot gate the label at amber any more than at
+   red. `am-role-assignment-batch-service` was the case — held below ready by
+   `merge-cycle-time-above-target` and `time-to-first-review-above-target` for being slow, with a
+   compliant gate and reviewed merges. Nothing else changes: each is still graded against its
+   configured `maximum`, still reported with its numbers under its `-above-target` name, and still
+   amber on its metric card. `review_depth` is the precedent — graded, reported, never blocking.
 5. **Per repository.** Team-level aggregation was not asked for and is not built; repositories are
    what the gate, the cohort and every existing report are keyed on.
    REAFFIRMED AND CLOSED on 2026-08-13, when team-level readiness was offered as the next iteration
@@ -193,8 +202,8 @@ the label. That was REVERSED by the user's ruling of 2026-08-13 recorded under d
 are graded conditions with configurable distribution boundaries, repository-level, never attributed to
 an actor. SHIPPED: each grades a single fixed percentile (the 75th for size, the median for the two
 waiting times — a policy choice living in `assessment.py`, not in configuration) against its own
-`DistributionThreshold` (`config.py`). The defaults match the reference tool. Each caps at amber; see
-decision 4 above.
+`DistributionThreshold` (`config.py`). The defaults match the reference tool. None of them imposes a
+ceiling on the label — each reports as a caution above its maximum; see decision 4 above.
 
 Both waiting times are anchored on `analysis.review_started_at` — the earliest ready-for-review event,
 falling back to creation — so time a change spent in draft is not counted as time it waited. Anchoring

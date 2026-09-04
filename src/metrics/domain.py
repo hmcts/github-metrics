@@ -1031,7 +1031,8 @@ class ReadinessAssessment(EvidenceModel):
 
     - `blocking` held the label below green, each condition carrying the ceiling it imposed.
     - `caution` is not disqualifying but should be weighed — a gate requiring no status check is the
-      standing example, being the condition closest to a veto without being one.
+      standing example, being the condition closest to a veto without being one, and a flow signal
+      above its maximum or with nothing to measure reports here rather than against the label.
     - `clear` was checked and imposes no ceiling, with its numbers, so a green is as auditable as a
       red. Usually that means satisfied; it also holds the three merge-gate rules that bear on the
       readiness label in neither state, which sit here whether configured or absent, each saying so

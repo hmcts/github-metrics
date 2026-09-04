@@ -84,10 +84,17 @@ describe('metricTone', () => {
   const GRADED = assessment(
     [
       { condition: 'independent-review-coverage-below-target', label: 'red', detail: '41.2%, below the 95% target' },
-      { condition: 'merge-cycle-time-above-target', label: 'amber', detail: 'p75 is 96 hours, above the 48 hour target' },
+      // The rates are the only graded conditions that still block: `assessment.rate` labels a
+      // shortfall amber above its amber boundary and red below it.
+      { condition: 'approval-coverage-below-target', label: 'amber', detail: '88.4%, below the 95% target' },
     ],
     [
       { condition: 'review-depth-below-target', detail: '12%, below the 30% boundary' },
+      // A flow signal, graded against its maximum and reported as a caution since 2026-09-03.
+      {
+        condition: 'merge-cycle-time-above-target',
+        detail: 'merge-cycle-time median is 96 hours, above the 24 hours target',
+      },
       { condition: 'time-to-first-review-not-observed', detail: 'no observations in this window' },
     ],
     [
@@ -101,14 +108,20 @@ describe('metricTone', () => {
   });
 
   it('takes the ceiling a blocking condition imposed, red and amber alike', () => {
-    // The card can never contradict the block above it: red there is red here, and a distribution
-    // capped at amber by `assessment.distribution` is amber here rather than the worse colour.
+    // The card can never contradict the block above it: red there is red here, and a rate the
+    // policy capped at amber is amber here rather than the worse colour.
     expect(metricTone(card('independent-review-coverage'), GRADED)).toBe('bad');
-    expect(metricTone(card('merge-cycle-time'), GRADED)).toBe('warn');
+    expect(metricTone(card('approval-coverage'), GRADED)).toBe('warn');
   });
 
   it('reads a caution as worth weighing — `review-depth` imposes nothing and never reads badly', () => {
     expect(metricTone(card('review-depth'), GRADED)).toBe('warn');
+  });
+
+  it('keeps a flow signal above its target amber, now that it releases the label', () => {
+    // `merge-cycle-time-above-target` is a caution rather than a block: the card still says the
+    // median cost more than the target allows, and the label above it is decided without the cost.
+    expect(metricTone(card('merge-cycle-time'), GRADED)).toBe('warn');
   });
 
   it('reads a metric with nothing to grade as the caution the policy raised for it', () => {

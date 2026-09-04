@@ -622,7 +622,8 @@ than only what failed:
   distinguishable inside the list. Green is only reachable with an empty `blocking`, so the label is never a bare
   assertion a reader has to trust.
 - **`caution`** is not disqualifying but is worth weighing — a gate requiring no status check is the standing example,
-  being the condition closest to a veto without being one.
+  being the condition closest to a veto without being one, and a flow signal above its maximum or with nothing to
+  measure sits here too, reporting what a team's way of working costs it without gating enablement on it.
 - **`clear`** was checked and **did not hold the label back**, with its numbers where a number exists, so a green is as
   auditable as a red. That is wider than "checked and satisfied": it also carries the three merge-gate rules that impose
   no ceiling in either state, including ones observed to be **absent**. A `clear` entry has never implied approval, only
@@ -744,20 +745,22 @@ still `amber` at most, whichever allowance it exceeds. This block replaces the e
 Flow signals — `pull-request-size`, `merge-cycle-time`, `time-to-first-review` — live with the repository the same way
 the merge gate and CI quality do: they describe how a team works, not one person's failing, so they are never
 attributed to an actor. Each is graded against its own `maximum`, the opposite comparison
-from a rate's thresholds because these measure cost rather than compliance — a green result sits **at or below** its
-maximum. `pull-request-size` grades its 75th percentile, since a long tail of large changes is the risk a median would
+from a rate's thresholds because these measure cost rather than compliance — a value **at or below** its maximum is
+`clear`, and one above it a caution. `pull-request-size` grades its 75th percentile, since a long tail of large changes is the risk a median would
 hide; `merge-cycle-time` and `time-to-first-review` grade their median. The defaults (400 changed lines, 24
 hours, 8 hours) match the reference tool.
 
-**A flow signal caps at `amber`, however far above its maximum it sits.** It says what a team's way of working costs
-them, never that anything ungoverned reached the default branch, and `red` is the label for the latter. Grading a cost
-to red made the two indistinguishable: across the HMCTS estate the fastest merge-cycle-time medians all belonged to
-repositories that merge almost nothing through review — 0.003 hours on one with 0% review coverage — while a
-repository reviewing 99.3% of 294 merges was held at red for taking four days over each. This replaced a
-`green_maximum`/`amber_maximum` pair whose amber boundary was simply double the green one, which was arithmetic
-standing in for a policy nobody had made. A cohort with nothing to measure — a repository
-merging only by direct commit, or one GitHub never sized — reports `-not-observed` as a caution, exactly like a rate
-with no denominator, rather than a manufactured shortfall. Flow distributions stay pull-request-only even when
+**A flow signal is a caution and never decides the label, however far above its maximum it sits.** It says what a
+team's way of working costs them, never that anything ungoverned reached the default branch, and the label answers the
+second question. Letting a cost hold the label back made the two indistinguishable: across the HMCTS estate the
+fastest merge-cycle-time medians all belonged to repositories that merge almost nothing through review — 0.003 hours
+on one with 0% review coverage — while a repository reviewing 99.3% of 294 merges was held below ready for taking four
+days over each. So both outcomes land in `caution`: `-above-target` where the percentile sits above its maximum, and
+`-not-observed` where a cohort had nothing to measure — a repository merging only by direct commit, or one GitHub
+never sized — exactly like a rate with no denominator rather than a manufactured shortfall. The grading itself is
+unchanged: the maximum still applies, the numbers are still reported, and the metric card still reads amber. The
+single `maximum` replaced a `green_maximum`/`amber_maximum` pair whose amber boundary was simply double the green one,
+which was arithmetic standing in for a policy nobody had made. Flow distributions stay pull-request-only even when
 graded: a direct commit has no cycle and no review to wait for, so the samples are never padded to include it.
 
 **Both waiting times start when a change entered review, not when its branch was opened.** `merge-cycle-time` and

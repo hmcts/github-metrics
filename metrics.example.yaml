@@ -22,7 +22,8 @@ assessment:
     green_percentage: 90
     amber_percentage: 70
   # Flow signals are graded by cost rather than compliance, so the boundary is a maximum, not a
-  # minimum — and each caps at amber, because a cost is never evidence that anything ungoverned merged.
+  # minimum — and each is reported as a caution, never allowed to hold the readiness label down,
+  # because a cost is never evidence that anything ungoverned merged.
   pull-request-size:
     maximum: 400
   merge-cycle-time:

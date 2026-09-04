@@ -65,8 +65,13 @@ export function percentile(observation: Observation): string | null {
  * metric added to the report is graded here the day it is added, with nothing to keep in step.
  *
  * `above-target` is the distribution form — a median above its maximum costs more than the target
- * allows, where a rate below its target falls short of it — and both are blocking. `not-observed`
- * is the caution the policy raises for a metric it had no denominator or no sample to grade.
+ * allows, where a rate below its target falls short of it. NEITHER SUFFIX DECIDES THE OUTCOME: which
+ * of the three sections a condition arrives in does, and `graded` reads the section rather than the
+ * name. A rate below its target blocks; a shortfall on `review-depth` or on any of the three flow
+ * distributions is a CAUTION instead — measured against its configured boundary, reported with its
+ * numbers, warm on the card, and imposing no ceiling on the label. At target each of the four is
+ * `clear` and its card reads green. `not-observed` is the caution the policy raises for a metric it
+ * had no denominator or no sample to grade.
  */
 const GRADED_SUFFIXES = ['at-target', 'below-target', 'above-target', 'not-observed'] as const;
 

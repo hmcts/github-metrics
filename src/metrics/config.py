@@ -115,18 +115,19 @@ class ReadinessThresholds(ConfigurationModel):
 
 
 class DistributionThreshold(ConfigurationModel):
-    """Define where one observed percentile stops being green.
+    """Define where one observed percentile stops being at target.
 
     A distribution measures cost, not compliance, so the comparison runs the opposite way from
     `ReadinessThresholds`: smaller is better, and the boundary is a maximum a value must stay at or
     below rather than a minimum it must reach.
 
-    ONE boundary, not a green/amber pair, because a flow signal can never impose red. How long a
-    change waited and how large it was are costs a team carries, not evidence that anything
-    ungoverned reached the default branch, and red is reserved for the latter — a repository merging
-    without review must not be indistinguishable from one that reviews everything slowly. The pair
-    this replaced set each amber boundary at exactly double its green one, which was arithmetic
-    standing in for a policy nobody had made.
+    ONE boundary, not a green/amber pair, because a flow signal decides no label at all: a value
+    above the maximum is reported as a caution and imposes no ceiling. How long a change waited and
+    how large it was are costs a team carries, not evidence that anything ungoverned reached the
+    default branch, and the label answers the second question — a repository merging without review
+    must not be indistinguishable from one that reviews everything slowly. The pair this replaced
+    set each amber boundary at exactly double its green one, which was arithmetic standing in for a
+    policy nobody had made.
     """
 
     maximum: Annotated[float, Field(gt=0)]
@@ -185,8 +186,8 @@ class AssessmentConfiguration(ConfigurationModel):
     # a long tail of large changes is the failure mode; the median for the two waiting times), a
     # policy choice that lives in `assessment.py` rather than in configuration, since which
     # percentile answers the question does not vary by organisation the way the boundary does. The
-    # maxima match the reference tool. Each caps at amber whatever the shortfall — see
-    # `DistributionThreshold` — so no flow signal can hold a repository at red on its own.
+    # maxima match the reference tool. Each is reported as a caution whatever the shortfall — see
+    # `DistributionThreshold` — so no flow signal can hold a repository below ready on its own.
     pull_request_size: DistributionThreshold = Field(
         default=DistributionThreshold(maximum=400),
         alias="pull-request-size",

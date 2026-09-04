@@ -396,23 +396,26 @@ class ReadinessPolicy:
         threshold: DistributionThreshold,
         observation: DistributionObservation,
     ) -> Judgement:
-        """Compare one observed percentile against its configured maximum, capping the cost at amber.
+        """Compare one observed percentile against its configured maximum, as a caution only.
 
         Which percentile is read comes from the metric class, so the assessment and a trend compare
         the same number: a series measuring movement in the median while the label graded the 75th
         percentile would be two reports describing one window differently.
 
-        Lower is better here, the opposite direction from `rate()`: a green result sits at or below
-        its maximum rather than at or above a minimum, since the metric measures cost, not compliance.
+        Lower is better here, the opposite direction from `rate()`: a value at or below its maximum
+        is `clear` and one above it a caution, rather than a rate's at or above a minimum, since the
+        metric measures cost, not compliance.
 
-        AMBER however far above the maximum a value sits, and deliberately so. A flow signal says
-        what a team's way of working costs it, never that anything ungoverned reached the default
-        branch, and red is the label for the latter. Grading these to red made the two
-        indistinguishable: on the HMCTS estate the fastest merge-cycle-time medians all belonged to
-        repositories that merge almost nothing through review — 0.003 hours on a repository with 0%
-        review coverage — while a repository reviewing 99.3% of 294 merges was held at red for
-        taking four days. A slow, well-reviewed repository and an ungoverned one are not the same
-        finding and must not carry the same label.
+        A cost never decides the label, however far above the maximum a value sits. A flow signal
+        says what a team's way of working costs it, never that anything ungoverned reached the
+        default branch, and the label answers the second question. Letting a cost impose a ceiling
+        made the two indistinguishable: on the HMCTS estate the fastest merge-cycle-time medians all
+        belonged to repositories that merge almost nothing through review — 0.003 hours on a
+        repository with 0% review coverage — while a repository reviewing 99.3% of 294 merges was
+        held below ready for taking four days. A slow, well-reviewed repository and an ungoverned
+        one are not the same finding and must not be graded on one scale. `review_depth` is the
+        precedent: graded against its configured boundary, reported with its numbers, imposing no
+        ceiling.
         """
         identifier = metric.identifier
         graded_value = metric.percentile.of(observation)
@@ -427,22 +430,21 @@ class ReadinessPolicy:
                 f"{identifier}-at-target",
                 f"{measured}, at or below the {threshold.maximum:g} {observation.unit} target",
             )
-        return self.blocking(
+        return self.caution(
             f"{identifier}-above-target",
-            ReadinessLabel.AMBER,
             f"{measured}, above the {threshold.maximum:g} {observation.unit} target",
         )
 
     def pull_request_size(self, observation: DistributionObservation) -> Judgement:
-        """Grade pull-request size at the percentile the metric declares."""
+        """Grade pull-request size at the percentile the metric declares, as a caution only."""
         return self.distribution(PullRequestSize, self.configuration.pull_request_size, observation)
 
     def merge_cycle_time(self, observation: DistributionObservation) -> Judgement:
-        """Grade merge cycle time, repository-level and never attributed to an actor."""
+        """Grade merge cycle time as a caution, repository-level and never attributed to an actor."""
         return self.distribution(MergeCycleTime, self.configuration.merge_cycle_time, observation)
 
     def time_to_first_review(self, observation: DistributionObservation) -> Judgement:
-        """Grade waiting time for a first review, a property of how a team works."""
+        """Grade waiting time for a first review as a caution, a property of how a team works."""
         return self.distribution(TimeToFirstReview, self.configuration.time_to_first_review, observation)
 
     def substantial(self, change: Merge) -> bool:
@@ -543,7 +545,8 @@ class ReadinessPolicy:
         The flow signals — pull-request size, merge cycle time, time to first review — are graded
         too, repository-level and never attributed to an actor: a slow first review is a property of
         how a team works, not one person's failing. They stay pull-request-only, since a direct
-        commit has no cycle and no review to wait for.
+        commit has no cycle and no review to wait for, and they are reported as cautions: none of
+        the three can hold the label back, however far above its maximum it sits.
         """
         sample = self.sample(cached)
         if sample.outcome is Outcome.BLOCKING:

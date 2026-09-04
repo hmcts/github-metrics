@@ -5,6 +5,8 @@ from itertools import combinations
 
 import pytest
 
+from metrics.assessment import ReadinessPolicy
+from metrics.config import AssessmentConfiguration, TrivialityConfiguration
 from metrics.domain import (
     ActorReadiness,
     ActorRepositoryReadiness,
@@ -14,6 +16,9 @@ from metrics.domain import (
     BehaviourEvidenceCollection,
     BehaviourEvidenceReport,
     BehaviourMetricSummary,
+    CachedBehaviourFacts,
+    CheckConclusion,
+    CheckFact,
     CodeownersEvidence,
     CodeownersFile,
     CodeownersReport,
@@ -34,6 +39,7 @@ from metrics.domain import (
     Percentile,
     PracticeEvidenceReport,
     PracticeFinding,
+    PullRequestFact,
     PullRequestRule,
     RateObservation,
     ReadinessAssessment,
@@ -41,6 +47,8 @@ from metrics.domain import (
     ReadinessLabel,
     RepositoryPracticeEvidence,
     RepositoryTrend,
+    ReviewFact,
+    ReviewState,
     SecurityAlertEvidence,
     SecurityAlertReport,
     SonarGateLevel,
@@ -438,6 +446,115 @@ def test_a_caution_imposes_no_ceiling_and_shows_no_label(report: str) -> None:
         "    status-checks-not-required\n"
         "      status checks required before merging to master: 0, so CI cannot block a merge\n"
     ) in report
+
+
+def slow_large_cohort() -> CachedBehaviourFacts:
+    """Build a governed window whose every merge is oversized, slow to merge, and slow to review.
+
+    Each merge is reviewed, approved and green on its checks, so the gate has nothing to report
+    against it and the three flow signals are the only conditions the policy raises.
+    """
+    merges = []
+    for number in range(1, 11):
+        merged_at = datetime(2026, 7, 1, tzinfo=UTC) + timedelta(days=number)
+        created_at = merged_at - timedelta(hours=48)
+        merges.append(
+            PullRequestFact(
+                identifier=number,
+                repository="cath-service",
+                number=number,
+                created_at=created_at,
+                merged_at=merged_at,
+                draft=False,
+                author_login="author",
+                author_type="User",
+                reviews=(
+                    ReviewFact(
+                        identifier=number,
+                        submitted_at=created_at + timedelta(hours=16),
+                        state=ReviewState.APPROVED,
+                        author_login="reviewer",
+                        author_type="User",
+                        comment_count=1,
+                    ),
+                ),
+                additions=800,
+                deletions=0,
+                changed_files=5,
+                checks=(
+                    CheckFact(
+                        name="build",
+                        conclusion=CheckConclusion.SUCCESS,
+                        completed_at=merged_at - timedelta(hours=1),
+                    ),
+                ),
+            ),
+        )
+    return CachedBehaviourFacts(
+        organization="hmcts",
+        repository="cath-service",
+        starts_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 8, 1, tzinfo=UTC),
+        pull_requests=tuple(merges),
+        direct_commits=(),
+    )
+
+
+def compliant_gate() -> MergeGateReport:
+    """Build a merge gate with nothing for the policy to raise a condition about."""
+    return MergeGateReport(
+        fetched_at=datetime(2026, 8, 2, 9, 30, tzinfo=UTC),
+        gate=MergeGateEvidence(
+            branch="master",
+            protected=True,
+            pull_requests=(
+                PullRequestRule(
+                    dismiss_stale_reviews_on_push=True,
+                    require_code_owner_review=False,
+                    require_last_push_approval=False,
+                    required_approving_review_count=1,
+                    required_review_thread_resolution=False,
+                ),
+            ),
+            status_checks=(
+                StatusChecksRule(
+                    strict_required_status_checks_policy=True,
+                    required_status_checks=(StatusCheck(context="build"),),
+                ),
+            ),
+            restricts_deletions=True,
+            blocks_force_pushes=True,
+            applies_to_administrators=True,
+            rules_observed=True,
+            requires_linear_history=True,
+            restricts_branch_names=True,
+        ),
+    )
+
+
+def test_the_flow_signals_print_under_caution_with_nothing_blocking_above_them() -> None:
+    """Show the caution-only ruling as a reader of the report sees it, not just as a data structure.
+
+    The assessment is built by the policy rather than written out by hand, so the section each flow
+    condition prints under is the one `distribution()` actually files it in: a repository reviewing
+    every one of its oversized, fortnight-long merges reads GREEN with an empty blocking list, and
+    the costs are still printed with the numbers behind them.
+    """
+    policy = ReadinessPolicy(AssessmentConfiguration(), TrivialityConfiguration())
+
+    rendered = "\n".join(render_assessment(policy.assess(slow_large_cohort(), compliant_gate())))
+
+    assert "Readiness: GREEN" in rendered
+    assert "  Blocking: none" in rendered
+    assert (
+        "  Caution\n"
+        "    pull-request-size-above-target\n"
+        "      pull-request-size 75th percentile is 800 lines, above the 400 lines target\n"
+        "    merge-cycle-time-above-target\n"
+        "      merge-cycle-time median is 48 hours, above the 24 hours target\n"
+        "    time-to-first-review-above-target\n"
+        "      time-to-first-review median is 16 hours, above the 8 hours target\n"
+    ) in rendered
 
 
 def test_an_informational_condition_adds_no_line_to_the_text_report() -> None:
