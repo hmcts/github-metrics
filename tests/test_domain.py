@@ -753,6 +753,23 @@ def test_a_listed_project_that_was_never_analysed_measures_nothing_rather_than_z
     assert "coverage" not in measures.model_dump(exclude_none=True)
 
 
+def test_measures_stored_before_the_hotspot_metrics_were_retired_still_parse() -> None:
+    """Accept a payload carrying the two retired hotspot keys, and read their values back.
+
+    `SonarMeasures` is validated `extra="forbid"` inside the stored `repository_state` payload, so
+    the fields stay on the model after their retirement on 2026-09-04 purely so every row written
+    before that date still loads. This pins that guarantee against a later tidy-up: dropping the
+    fields fails here rather than at the moment a cached row is read.
+    """
+    measures = SonarMeasures.model_validate(
+        sonar_measures().model_dump() | {"security_hotspots": 4, "security_review_rating": {"value": 5.0}},
+    )
+
+    assert measures.security_hotspots == 4
+    assert measures.security_review_rating is not None
+    assert measures.security_review_rating.letter == "E"
+
+
 @pytest.mark.parametrize(
     "fields",
     [

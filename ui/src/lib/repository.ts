@@ -461,7 +461,7 @@ export function ratingLetter(rating: SonarRating | undefined): string {
 /**
  * Every measure the project reported, each unreported one left visibly absent.
  *
- * The eight counts are toned against the whole measure set rather than against their own value,
+ * The seven counts are toned against the whole measure set rather than against their own value,
  * because an issue count borrows its severity from the rating that covers it — `lib/tone.ts` reads
  * both, and a count with no rating beside it is worth weighing and never worse.
  */
@@ -499,11 +499,6 @@ export function sonarRows(measures: SonarMeasures): LabelledValue[] {
       tone: sonarMeasureTone('security_issues', measures),
     },
     {
-      label: 'Security hotspots',
-      value: quantity(measures.security_hotspots),
-      tone: sonarMeasureTone('security_hotspots', measures),
-    },
-    {
       label: 'Reliability rating',
       value: ratingLetter(measures.reliability_rating),
       tone: sonarRatingTone(measures.reliability_rating),
@@ -517,11 +512,6 @@ export function sonarRows(measures: SonarMeasures): LabelledValue[] {
       label: 'Security rating',
       value: ratingLetter(measures.security_rating),
       tone: sonarRatingTone(measures.security_rating),
-    },
-    {
-      label: 'Security review rating',
-      value: ratingLetter(measures.security_review_rating),
-      tone: sonarRatingTone(measures.security_review_rating),
     },
   ];
 }

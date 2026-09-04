@@ -231,7 +231,7 @@ class RepositoryRow(EvidenceModel):
     distribute the estate and answer for its governance without loading every evidence block. Each is
     UNMEASURED WHEN ABSENT, as every count above it is: the two gate figures where there is no gate to
     read or its rules were withheld, `unreviewed_substantial` where the policy graded nothing,
-    `sonar_coverage` and the three Sonar security measures where no SonarCloud project resolved, its
+    `sonar_coverage` and the two Sonar security measures where no SonarCloud project resolved, its
     measures could not be read, or the project sent no such metric, `codeowners_files` where nobody
     could read the repository's contents, and `security` where the whole alert block carries a reason
     instead of alerts. All of them are absent besides on a repository this window could not be
@@ -272,7 +272,6 @@ class RepositoryRow(EvidenceModel):
     security: SecurityAlertEvidence | None = None
     sonar_security_rating: SonarRating | None = None
     sonar_security_issues: NonNegativeInt | None = None
-    sonar_security_hotspots: NonNegativeInt | None = None
     production: bool | None = None
     detail: str | None = None
 
@@ -1058,7 +1057,6 @@ def repository_row(
         security=evidence.security.alerts,
         sonar_security_rating=None if measures is None else measures.security_rating,
         sonar_security_issues=None if measures is None else measures.security_issues,
-        sonar_security_hotspots=None if measures is None else measures.security_hotspots,
         production=deploys_to_production(bundle, repository, production),
     )
 

@@ -522,9 +522,12 @@ describe('SonarCloud', () => {
 
   it('draws every measure, leaving an unreported one visibly absent', () => {
     const rows = sonarRows(measures);
-    expect(rows).toHaveLength(12);
+    expect(rows).toHaveLength(10);
     expect(rows[0]).toEqual({ label: 'Coverage', value: '62.1%', tone: 'bad' });
     expect(rows[1]).toEqual({ label: 'Duplicated lines', value: '-', tone: 'neutral' });
+    // Retired on 2026-09-04 with the metrics Sonar deprecated: neither card is drawn any more.
+    expect(rows.map((row) => row.label)).not.toContain('Security hotspots');
+    expect(rows.map((row) => row.label)).not.toContain('Security review rating');
   });
 
   it('prints a million lines of code as a million, not in exponent form', () => {
@@ -555,11 +558,9 @@ describe('SonarCloud', () => {
       reliability_issues: 71,
       maintainability_issues: 1358,
       security_issues: 0,
-      security_hotspots: 2,
       reliability_rating: { value: 4 },
       maintainability_rating: { value: 1 },
       security_rating: { value: 1 },
-      security_review_rating: { value: 2 },
     });
     const tone = (label: string) => rows.find((row) => row.label === label)?.tone;
     expect(tone('Coverage')).toBe('good');
@@ -568,11 +569,9 @@ describe('SonarCloud', () => {
     expect(tone('Reliability issues')).toBe('bad');
     expect(tone('Maintainability issues')).toBe('warn');
     expect(tone('Security issues')).toBe('good');
-    expect(tone('Security hotspots')).toBe('warn');
     // The one count with no rating of its own: above zero it is amber and never red.
     expect(tone('Violations')).toBe('warn');
     expect(tone('Reliability rating')).toBe('bad');
-    expect(tone('Security review rating')).toBe('warn');
   });
 
   it('states the gate beside the project the verdict is about', () => {

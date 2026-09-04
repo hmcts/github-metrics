@@ -292,11 +292,7 @@ def sonar_report(coverage: float | None) -> SonarReport:
     )
 
 
-def sonar_security_report(
-    rating: SonarRating | None = None,
-    issues: int | None = None,
-    hotspots: int | None = None,
-) -> SonarReport:
+def sonar_security_report(rating: SonarRating | None = None, issues: int | None = None) -> SonarReport:
     """Return a Sonar block whose measures carry the given security figures and nothing else."""
     return SonarReport(
         fetched_at=ends_at(),
@@ -304,7 +300,6 @@ def sonar_security_report(
             project_key="hmcts_cath-service",
             security_rating=rating,
             security_issues=issues,
-            security_hotspots=hotspots,
         ),
     )
 
@@ -1713,38 +1708,63 @@ def test_a_repository_with_no_readable_measures_reports_no_sonar_rather_than_no_
     assert row["sonar_reported"] is False
 
 
-def test_a_listed_repository_carries_the_three_sonar_security_measures(listed: Listing) -> None:
-    row = listed(sonar=sonar_security_report(rating=SonarRating(value=3.0), issues=7, hotspots=2))
+def test_a_listed_repository_carries_the_two_sonar_security_measures(listed: Listing) -> None:
+    row = listed(sonar=sonar_security_report(rating=SonarRating(value=3.0), issues=7))
 
     assert row["sonar_security_rating"] == {"value": 3.0}
     assert row["sonar_security_issues"] == 7
-    assert row["sonar_security_hotspots"] == 2
 
 
-def test_measures_reporting_no_security_metrics_leave_all_three_absent(listed: Listing) -> None:
+def test_the_retired_hotspot_count_is_absent_from_a_fully_reported_row(listed: Listing) -> None:
+    """Serve no hotspot count at all, on the row that carries every other Sonar security measure.
+
+    Sonar is transitioning hotspots into vulnerabilities, so the count left the served row rather
+    than being served as a permanent zero.
+
+    The measures here carry BOTH retired figures, as every payload cached before 2026-09-04 does and
+    as `SonarMeasures` still parses. Feeding them absent would prove nothing: every route is served
+    `response_model_exclude_none`, so a re-added row field reading `None` would drop out of the JSON
+    anyway and leave this green.
+    """
+    row = listed(
+        sonar=SonarReport(
+            fetched_at=ends_at(),
+            measures=SonarMeasures(
+                project_key="hmcts_cath-service",
+                security_rating=SonarRating(value=3.0),
+                security_issues=7,
+                security_hotspots=4,
+                security_review_rating=SonarRating(value=5.0),
+            ),
+        ),
+    )
+
+    assert row["sonar_security_issues"] == 7
+    assert row["sonar_security_rating"] == {"value": 3.0}
+    assert "sonar_security_hotspots" not in row
+
+
+def test_measures_reporting_no_security_metrics_leave_both_absent(listed: Listing) -> None:
     """Distinguish a project measuring nothing about security from one measuring none of it."""
     row = listed(sonar=sonar_report(81.5))
 
     assert row["sonar_reported"] is True
     assert "sonar_security_rating" not in row
     assert "sonar_security_issues" not in row
-    assert "sonar_security_hotspots" not in row
 
 
 def test_a_project_with_nothing_open_reports_zeros_rather_than_omitting_them(listed: Listing) -> None:
     """Keep a clean project a measurement: the security donut bands it clear."""
-    row = listed(sonar=sonar_security_report(issues=0, hotspots=0))
+    row = listed(sonar=sonar_security_report(issues=0))
 
     assert row["sonar_security_issues"] == 0
-    assert row["sonar_security_hotspots"] == 0
 
 
-def test_an_unreadable_sonar_block_leaves_all_three_security_measures_absent(listed: Listing) -> None:
+def test_an_unreadable_sonar_block_leaves_both_security_measures_absent(listed: Listing) -> None:
     row = listed(sonar=SonarReport(detail="no SonarCloud project resolved for this repository"))
 
     assert "sonar_security_rating" not in row
     assert "sonar_security_issues" not in row
-    assert "sonar_security_hotspots" not in row
 
 
 def test_a_listed_repository_carries_its_open_alerts_family_by_family(listed: Listing) -> None:
@@ -1763,8 +1783,8 @@ def test_a_security_block_carrying_a_reason_leaves_the_alerts_absent(listed: Lis
     assert "security" not in row
 
 
-def test_a_repository_the_window_cannot_cover_states_none_of_the_six_security_facts(client: TestClient) -> None:
-    """Leave all six absent where there is no evidence block, `sonar_reported` included.
+def test_a_repository_the_window_cannot_cover_states_none_of_the_five_security_facts(client: TestClient) -> None:
+    """Leave all five absent where there is no evidence block, `sonar_reported` included.
 
     `sonar_reported` is the one field that answers False rather than absent on a reportable
     repository, so this is where "no report" has to stay apart from "no Sonar".
@@ -1776,7 +1796,6 @@ def test_a_repository_the_window_cannot_cover_states_none_of_the_six_security_fa
     assert "security" not in row
     assert "sonar_security_rating" not in row
     assert "sonar_security_issues" not in row
-    assert "sonar_security_hotspots" not in row
 
 
 def test_a_listed_repository_says_whether_it_deploys_to_production(client: TestClient) -> None:

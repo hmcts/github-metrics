@@ -1100,11 +1100,9 @@ def collected_measures(project_key: str = "hmcts.cath") -> SonarMeasures:
         reliability_issues=3,
         maintainability_issues=41,
         security_issues=1,
-        security_hotspots=4,
         reliability_rating=SonarRating(value=2.0),
         maintainability_rating=SonarRating(value=1.0),
         security_rating=SonarRating(value=3.0),
-        security_review_rating=SonarRating(value=5.0),
     )
 
 
@@ -1152,8 +1150,8 @@ def test_stored_sonar_survives_the_storage_round_trip(tmp_path: Path) -> None:
         "new_duplicated_lines_density",
     )
     assert measures.gate.conditions[0].actual == "61.4"
-    assert measures.security_review_rating is not None
-    assert measures.security_review_rating.letter == "E"
+    assert measures.security_rating is not None
+    assert measures.security_rating.letter == "C"
     # Absent stays absent: SonarCloud measured no duplication, which is not the same as none.
     assert measures.duplicated_lines_density is None
 

@@ -77,7 +77,6 @@ const REPOSITORIES: RepositoryRow[] = [
     security: CLEAR_ALERTS,
     sonar_security_rating: { value: 1 },
     sonar_security_issues: 0,
-    sonar_security_hotspots: 0,
   },
   {
     repository: 'web',
@@ -90,7 +89,6 @@ const REPOSITORIES: RepositoryRow[] = [
     security: { ...CLEAR_ALERTS, dependabot: { open: 2, by_severity: { critical: 1, low: 1 } } },
     sonar_security_rating: { value: 2 },
     sonar_security_issues: 3,
-    sonar_security_hotspots: 1,
   },
   { repository: 'batch', team: 'platform', detail: 'no window could be reported for this repository' },
 ];
@@ -375,6 +373,28 @@ describe('the three list routes', () => {
       const counts = Object.values(legend(markup, title));
       expect(counts.reduce((total, value) => total + value, 0)).toBe(REPOSITORIES.length);
     }
+  });
+
+  /**
+   * The security donut's own explanation of its band, pinned to what `securityBand` actually reads.
+   *
+   * The tooltip is the only place a reader learns what the band means, and stale prose is the one
+   * thing a coverage gate cannot see: a sentence naming a signal the row no longer carries renders
+   * exactly as well as a correct one. Both halves are asserted — the signal list, which lost the
+   * hotspot count when Sonar retired it on 2026-09-04, and the rating boundary, which puts C at
+   * Medium since the same day's reversal. `tone.test.ts` grades the letters; this says the page
+   * tells the reader the same thing.
+   */
+  it('explains the security band with the signals and the boundary the code applies', async () => {
+    stubService();
+    const markup = renderToStaticMarkup(await RepositoriesPage({ searchParams: Promise.resolve({}) }));
+
+    const panel = panelOf(markup, 'Security issues');
+    expect(panel).toContain('security rating and issues');
+    expect(panel).toContain('a security rating of D or worse');
+    expect(panel).toContain('a rating of B or C');
+    expect(panel).not.toContain('hotspot');
+    expect(panel).not.toContain('C or worse');
   });
 
   /** The panel of one donut, from its heading to the next one's. */

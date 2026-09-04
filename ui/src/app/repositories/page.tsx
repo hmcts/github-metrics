@@ -132,7 +132,7 @@ export default async function RepositoriesPage({
           title="Security issues"
           parameter="security"
           data={securitySlices(repositories)}
-          tooltip="The worst of each repository's security signals: its open Dependabot, code scanning and secret scanning alerts, and its SonarCloud security rating, issues and hotspots. High is a critical or high alert open, any secret scanning alert open, or a security rating of C or worse; medium is any other alert open, a rating of B, or an open Sonar security issue or hotspot. Unknown is a repository with no security data at all — every alert family withheld and no SonarCloud measures, or a span that could not be reported for at all — and never one whose alerts were read and whose only gap is a SonarCloud project."
+          tooltip="The worst of each repository's security signals: its open Dependabot, code scanning and secret scanning alerts, and its SonarCloud security rating and issues. High is a critical or high alert open, any secret scanning alert open, or a security rating of D or worse; medium is any other alert open, a rating of B or C, or an open Sonar security issue. Unknown is a repository with no security data at all — every alert family withheld and no SonarCloud measures, or a span that could not be reported for at all — and never one whose alerts were read and whose only gap is a SonarCloud project."
         />
       </div>
 

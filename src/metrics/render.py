@@ -397,11 +397,9 @@ def sonar_measure_rows(measures: SonarMeasures) -> tuple[tuple[str, str], ...]:
         ("Reliability issues", quantity(measures.reliability_issues)),
         ("Maintainability issues", quantity(measures.maintainability_issues)),
         ("Security issues", quantity(measures.security_issues)),
-        ("Security hotspots", quantity(measures.security_hotspots)),
         ("Reliability rating", rating_letter(measures.reliability_rating)),
         ("Maintainability rating", rating_letter(measures.maintainability_rating)),
         ("Security rating", rating_letter(measures.security_rating)),
-        ("Security review rating", rating_letter(measures.security_review_rating)),
     )
 
 

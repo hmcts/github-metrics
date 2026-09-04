@@ -115,11 +115,9 @@ SONAR_METRIC_KEYS = (
     "software_quality_reliability_issues",
     "software_quality_maintainability_issues",
     "software_quality_security_issues",
-    "security_hotspots",
     "reliability_rating",
     "sqale_rating",
     "security_rating",
-    "security_review_rating",
 )
 """The metric keys `component_measures` asks for, in one guarded constant.
 
@@ -503,11 +501,9 @@ def parse_measures(project: str, component: MeasuredComponent, analysis_at: date
         reliability_issues=measured_count(values, "software_quality_reliability_issues"),
         maintainability_issues=measured_count(values, "software_quality_maintainability_issues"),
         security_issues=measured_count(values, "software_quality_security_issues"),
-        security_hotspots=measured_count(values, "security_hotspots"),
         reliability_rating=measured_rating(values, "reliability_rating"),
         maintainability_rating=measured_rating(values, "sqale_rating"),
         security_rating=measured_rating(values, "security_rating"),
-        security_review_rating=measured_rating(values, "security_review_rating"),
     )
 
 

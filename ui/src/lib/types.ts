@@ -233,11 +233,9 @@ export interface SonarMeasures {
   reliability_issues?: number;
   maintainability_issues?: number;
   security_issues?: number;
-  security_hotspots?: number;
   reliability_rating?: SonarRating;
   maintainability_rating?: SonarRating;
   security_rating?: SonarRating;
-  security_review_rating?: SonarRating;
 }
 
 export interface SonarReport {
@@ -422,7 +420,7 @@ export interface OverviewSummary {
  * can distribute the estate and answer for its governance without loading every evidence block. Each
  * is UNMEASURED WHEN ABSENT, as every count above it is: the two gate figures where there is no gate
  * to read or its rules were withheld, `unreviewed_substantial` where the policy graded nothing,
- * `sonar_coverage` and the three Sonar security measures where no SonarCloud project resolved, its
+ * `sonar_coverage` and the two Sonar security measures where no SonarCloud project resolved, its
  * measures could not be read, or it sent no such metric, `codeowners_files` where nobody could read
  * the repository's contents, and `security` where the whole alert block carries a reason instead of
  * alerts. All of them are absent besides on a repository the window could not be reported for at all,
@@ -455,7 +453,6 @@ export interface RepositoryRow {
   security?: SecurityAlertEvidence;
   sonar_security_rating?: SonarRating;
   sonar_security_issues?: number;
-  sonar_security_hotspots?: number;
   detail?: string;
   /**
    * Whether the organisation's production approvals list holds this repository.

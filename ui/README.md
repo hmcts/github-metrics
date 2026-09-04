@@ -121,10 +121,10 @@ which are on, and a reader who has clicked three donuts can see all three and re
 chip dot takes its colour as an inline `backgroundColor` from `RAG_HEX` or the band's `mark`, for the reason the wedges
 do: those palettes are hex values a Tailwind class cannot reach.
 
-**Security issues bands on the worst of six signals**, because a repository is worth looking at for its worst one:
-the open Dependabot, code scanning and secret scanning alerts, and the SonarCloud security rating, issues and hotspots.
+**Security issues bands on the worst of five signals**, because a repository is worth looking at for its worst one:
+the open Dependabot, code scanning and secret scanning alerts, and the SonarCloud security rating and issues.
 High is a critical or high alert open, any secret scanning alert open at all, or a security rating of D or worse;
-Medium is any other alert open, a rating of B or C, or a Sonar security issue or hotspot above zero. The three alert
+Medium is any other alert open, a rating of B or C, or a Sonar security issue above zero. The three alert
 families delegate to `alertTone`, which the repository page already colours its security cards with, so a donut and a
 card cannot disagree about one family. Unknown here is stricter than the word looks: it is a repository with **no**
 security data at all — every alert family withheld and no Sonar measures, or a span that could not report it — so a

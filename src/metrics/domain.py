@@ -826,6 +826,15 @@ class SonarMeasures(EvidenceModel):
     `measures: null` for the whole call, discarding every other metric silently. The key set is a
     single guarded constant in `metrics.sonar` for exactly that reason; this field name never reaches
     the API.
+
+    `security_hotspots` and `security_review_rating` were RETIRED on 2026-09-04, because Sonar is
+    transitioning the rules that raised security hotspots into ones that raise vulnerabilities.
+    Neither is requested any more and NO READER consumes them — not the text report, not the served
+    row, not the SonarCloud tab, not the security donut — so anything collected after that date
+    carries `None` for both. They are retained ONLY so a `repository_state` payload written before it
+    still parses: this model is validated `extra="forbid"`, and every payload already stored carries
+    both keys. Deleting the fields is therefore not a tidy-up but a cache invalidation, and whoever
+    wants to must first accept recollecting every row on the estate.
     """
 
     project_key: str

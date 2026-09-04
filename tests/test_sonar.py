@@ -59,11 +59,9 @@ VERIFIED_METRIC_KEYS = frozenset(
         "software_quality_reliability_issues",
         "software_quality_maintainability_issues",
         "software_quality_security_issues",
-        "security_hotspots",
         "reliability_rating",
         "sqale_rating",
         "security_rating",
-        "security_review_rating",
     },
 )
 
@@ -241,11 +239,9 @@ def test_component_measures_parses_a_full_response() -> None:
             {"metric": "software_quality_reliability_issues", "value": "28"},
             {"metric": "software_quality_maintainability_issues", "value": "365"},
             {"metric": "software_quality_security_issues", "value": "18"},
-            {"metric": "security_hotspots", "value": "0"},
             {"metric": "reliability_rating", "value": "4.0"},
             {"metric": "sqale_rating", "value": "1.0"},
             {"metric": "security_rating", "value": "3.0"},
-            {"metric": "security_review_rating", "value": "1.0"},
             {"metric": "alert_status", "value": "ERROR"},
             {"metric": "quality_gate_details", "value": GATE_DETAILS},
         ],
@@ -268,15 +264,12 @@ def test_component_measures_parses_a_full_response() -> None:
     assert measures.reliability_issues == 28
     assert measures.maintainability_issues == 365
     assert measures.security_issues == 18
-    assert measures.security_hotspots == 0
     assert measures.reliability_rating is not None
     assert measures.reliability_rating.letter == "D"
     assert measures.maintainability_rating is not None
     assert measures.maintainability_rating.letter == "A"
     assert measures.security_rating is not None
     assert measures.security_rating.letter == "C"
-    assert measures.security_review_rating is not None
-    assert measures.security_review_rating.letter == "A"
     assert measures.gate is not None
     assert measures.gate.level is SonarGateLevel.ERROR
     assert [
@@ -300,7 +293,7 @@ def test_component_measures_leaves_absent_metrics_absent() -> None:
     assert measures.analysis_at is None
     assert measures.coverage is None
     assert measures.violations is None
-    assert measures.security_hotspots is None
+    assert measures.security_rating is None
     assert measures.reliability_rating is None
     assert measures.maintainability_rating is None
     assert measures.gate is not None
@@ -318,6 +311,30 @@ def test_component_measures_accepts_a_project_that_was_never_analysed() -> None:
     assert measures.project_key == "never-analysed"
     assert measures.gate is None
     assert measures.coverage is None
+
+
+def test_component_measures_no_longer_collects_the_retired_hotspot_metrics() -> None:
+    """Leave both retired hotspot fields absent even when SonarCloud still reports the metrics.
+
+    The fields stay on `SonarMeasures` so a payload stored before their retirement on 2026-09-04
+    still parses, which is a separate claim from this one: nothing collected from now on carries a
+    value for them, whatever the response holds.
+    """
+    session = Session()
+    payload = measures_payload(
+        [
+            {"metric": "security_hotspots", "value": "4"},
+            {"metric": "security_review_rating", "value": "5.0"},
+            {"metric": "ncloc", "value": "12"},
+        ],
+    )
+    client = SonarClient(session, {})
+    with patch.object(session, "get", return_value=answer(payload)):
+        measures = client.component_measures("hmcts.cath")
+
+    assert measures.lines_of_code == 12
+    assert measures.security_hotspots is None
+    assert measures.security_review_rating is None
 
 
 def test_component_measures_survives_a_null_measure_list() -> None:

@@ -575,7 +575,7 @@ Each repository also carries a `sonar` block: the quality state of the SonarClou
 reports the project key, **how the project was resolved**, when it was last analysed, the quality gate level with
 **every condition behind it** — metric, comparator, threshold, actual value and level — and the measures beside them:
 coverage, duplicated lines, lines of code, total violations, the reliability, maintainability and security issue counts,
-security hotspots, and the four ratings as `A`–`E` letters. Like the merge gate it is **current state**, stored
+and the three ratings as `A`–`E` letters. Like the merge gate it is **current state**, stored
 latest-only by `collect` and served with the `fetched_at` instant it was read, so `evidence` shows the last
 collection's answer. SonarCloud is read anonymously; setting `SONAR_TOKEN` or `SONARCLOUD_TOKEN` widens the project
 listing to private projects.
@@ -1083,11 +1083,9 @@ SonarCloud, read 2026-08-02T09:30Z
   Reliability issues      12
   Maintainability issues  280
   Security issues         3
-  Security hotspots       7
   Reliability rating      C
   Maintainability rating  A
   Security rating         B
-  Security review rating  E
 
 Open pull requests, read 2026-08-02T09:30Z
 ------------------------------------------
@@ -1458,7 +1456,7 @@ block's field of the same name, and `sonar_coverage` off `sonar.measures.coverag
 means unmeasured, as every other count on the row does — none of them defaults to zero, so a repository with no
 SonarCloud project resolved reads as unknown rather than as a project reporting no coverage.
 
-Six more landed the same day, for the security donut and the two governance columns beside Stale:
+Five more landed the same day, for the security donut and the two governance columns beside Stale:
 
 | Field | Read from | Absent when |
 | --- | --- | --- |
@@ -1467,7 +1465,6 @@ Six more landed the same day, for the security donut and the two governance colu
 | `security` | the security block's `alerts`, verbatim | the whole block carries a reason instead |
 | `sonar_security_rating` | `sonar.measures.security_rating` | no measures, or the project sent no rating |
 | `sonar_security_issues` | `sonar.measures.security_issues` | the same two cases |
-| `sonar_security_hotspots` | `sonar.measures.security_hotspots` | the same two cases |
 
 `sonar_reported` is the one field on the row that is **`False` rather than absent** where there is nothing to report: a
 reportable repository whose project never resolved, or whose measures could not be read, reads `False`, because the
@@ -1479,7 +1476,7 @@ below).
 `security` carries `SecurityAlertEvidence` whole rather than flattening its three alert families into scalars. The
 per-family `open`/`by_severity`/`detail` is what a band needs: a family with nothing open and one GitHub refused are
 different answers, and only the block itself keeps them apart. Security stays report-only and ungraded here — no
-readiness condition reads any of these six — so the band the donut draws is decided in the UI's own threshold table
+readiness condition reads any of these five — so the band the donut draws is decided in the UI's own threshold table
 (see [`ui/README.md`](ui/README.md#colour)).
 
 The two gate fields are read in the precedence `ReadinessPolicy.governance` reads a gate in, which is what decides

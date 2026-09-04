@@ -72,7 +72,6 @@ const ROWS: RepositoryRow[] = [
     unreviewed_substantial: 'none',
     sonar_coverage: 95,
     sonar_security_issues: 0,
-    sonar_security_hotspots: 0,
     production: true,
   }),
   row({

@@ -77,9 +77,11 @@ In `ui/`, the same rules in TypeScript, plus:
 - A figure's colour is decided in `ui/src/lib/tone.ts` and nowhere else: no component holds a threshold and none holds
   a hex literal. Where `assessment.py` already grades a figure the page carries that condition's verdict rather than
   restating the target, so raising a target in the assessment configuration is what changes a colour. Two functions
-  there MAY band the same figure differently where they answer different questions about it — `securityBand` puts a
-  Sonar security rating of C at High where `sonarRatingTone` puts it at amber — and each divergence is stated in a
-  comment beside both. Do not reconcile one without reading it.
+  there MAY band the same figure differently where they answer different questions about it, but none currently does:
+  `securityBand` graded a Sonar security rating of C stricter than `sonarRatingTone` until 2026-09-04, and that was
+  reversed — the donut now delegates to the same function the card uses. Before putting a second boundary on one
+  figure, read the ruling in [`docs/architecture.md`](docs/architecture.md), and state any divergence you do introduce
+  in a comment beside both functions.
 - Colour splits three ways, and each module answers a different question: `rag.ts` the report's own verdict, `tone.ts`
   a FIGURE's colour from a threshold table, and `production.ts` an ungraded attribute of a repository. An attribute
   that is not a figure and carries no judgement gets a module of its own beside them rather than a fifth tone — see

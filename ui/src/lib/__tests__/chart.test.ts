@@ -233,12 +233,12 @@ describe('securitySlices', () => {
     return { dependabot: clear, code_scanning: clear, secret_scanning: clear, ...families };
   }
 
-  it('bands every row on the worst of the six signals it carries', () => {
+  it('bands every row on the worst of the five signals it carries', () => {
     const built = securitySlices([
       row({ security: security({ secret_scanning: { open: 1, by_severity: {} } }) }),
       row({ security: security(), sonar_security_rating: { value: 3 } }),
       row({ security: security(), sonar_security_issues: 2 }),
-      row({ security: security(), sonar_security_issues: 0, sonar_security_hotspots: 0 }),
+      row({ security: security(), sonar_security_issues: 0 }),
       row({}),
     ]);
     // The C-rated row is Medium, not High, since the 2026-09-04 reversal; the secret scanning row is

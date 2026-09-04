@@ -388,7 +388,7 @@ export function sonarRatingTone(rating: SonarRating | null | undefined): Tone {
   return rating.value === 4 || rating.value === 5 ? 'bad' : 'neutral';
 }
 
-/** The eight numeric Sonar measures, keyed as the fields `SonarMeasures` carries them in. */
+/** The seven numeric Sonar measures, keyed as the fields `SonarMeasures` carries them in. */
 export type SonarMeasure =
   | 'coverage'
   | 'duplicated_lines_density'
@@ -396,8 +396,7 @@ export type SonarMeasure =
   | 'violations'
   | 'reliability_issues'
   | 'maintainability_issues'
-  | 'security_issues'
-  | 'security_hotspots';
+  | 'security_issues';
 
 /**
  * Grade one issue COUNT by the rating that covers it, never by the count on its own.
@@ -463,8 +462,6 @@ const SONAR_MEASURE_TONE: Record<SonarMeasure, (measures: SonarMeasures) => Tone
   maintainability_issues: (measures) =>
     issueTone(measures.maintainability_issues, measures.maintainability_rating),
   security_issues: (measures) => issueTone(measures.security_issues, measures.security_rating),
-  // Reviewed against the security REVIEW rating, which is the one Sonar grades hotspots with.
-  security_hotspots: (measures) => issueTone(measures.security_hotspots, measures.security_review_rating),
 };
 
 export function sonarMeasureTone(measure: SonarMeasure, measures: SonarMeasures): Tone {
@@ -613,30 +610,36 @@ export const SECURITY_BANDS: readonly Band<SecurityBand>[] = [
 ];
 
 /**
- * The four security fields a row carries, named as the row's own so a row IS one of these.
+ * The three security fields a row carries, named as the row's own so a row IS one of these.
  *
- * Four fields holding six signals between them, `security` carrying three alert families. A shape of
- * its own rather than a `RepositoryRow` parameter so the banding can be tested — and later read off
- * some other list — without inventing a repository and a team around four facts.
+ * Three fields holding five signals between them, `security` carrying three alert families. A shape
+ * of its own rather than a `RepositoryRow` parameter so the banding can be tested — and later read
+ * off some other list — without inventing a repository and a team around three facts.
  */
 export interface SecuritySignals {
   security?: SecurityAlertEvidence | null;
   sonar_security_rating?: SonarRating | null;
   sonar_security_issues?: number | null;
-  sonar_security_hotspots?: number | null;
 }
 
 /**
  * Band a repository by the worst of its security signals, or unmeasured where it has none.
  *
- * Six signals, each resolved to a tone or to `neutral` where there is no data, and the worst tone
+ * Five signals, each resolved to a tone or to `neutral` where there is no data, and the worst tone
  * present decides — so one open critical Dependabot alert bands the repository High however clean the
- * other five read. The three alert families delegate to `alertTone`, which the repository page
+ * other four read. The three alert families delegate to `alertTone`, which the repository page
  * already colours its security cards with, so the donut and the cards cannot disagree about a family.
  * They are named HERE rather than imported as `ALERT_FAMILIES`: `repository.ts` owns that list and
  * imports this module for `alertTone`, so reaching back for it would close an import cycle. Sonar's
- * two counts are worth weighing above zero and never worse: the count is graded by its own rating,
- * which is a signal here in its own right.
+ * one remaining count is worth weighing above zero and never worse: the count is graded by its own
+ * rating, which is a signal here in its own right.
+ *
+ * The security hotspot count was a sixth signal until 2026-09-04, when Sonar's transition of hotspots
+ * into vulnerabilities retired it. Dropping it moved NO repository to a WORSE band: all 266 reporting
+ * the metric reported zero, so the signal could only ever resolve `good`. It could in principle move
+ * a row the other way — one whose ONLY signal was that zero would now read Unknown rather than Clear
+ * — but that needs Sonar measures with no rating and no issue count and all three alert families
+ * withheld, and the snapshot held no such row.
  *
  * `unknown` is EVERY signal carrying no data — a row the span could not report, or one whose three
  * families GitHub all refused and which has no Sonar measures. A repository with readable families
@@ -664,7 +667,6 @@ export function securityBand(signals: SecuritySignals): SecurityBand {
     ...families,
     sonarRatingTone(signals.sonar_security_rating),
     counted(signals.sonar_security_issues, 'good', 'warn'),
-    counted(signals.sonar_security_hotspots, 'good', 'warn'),
   ].filter((tone) => tone !== 'neutral');
   if (tones.includes('bad')) {
     return 'high';

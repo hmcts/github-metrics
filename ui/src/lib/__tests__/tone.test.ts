@@ -408,7 +408,6 @@ describe('the security band', () => {
         security: security({ dependabot: alerts({ open: 1, by_severity: { critical: 1 } }) }),
         sonar_security_rating: { value: 1 },
         sonar_security_issues: 0,
-        sonar_security_hotspots: 0,
       }),
     ).toBe('high');
   });
@@ -462,11 +461,9 @@ describe('the security band', () => {
     expect(securityBand({ sonar_security_rating: null })).toBe('unknown');
   });
 
-  it('cautions on a Sonar issue or hotspot above zero, and clears one at zero', () => {
+  it('cautions on a Sonar issue above zero, and clears one at zero', () => {
     expect(securityBand({ sonar_security_issues: 0 })).toBe('clear');
     expect(securityBand({ sonar_security_issues: 1 })).toBe('medium');
-    expect(securityBand({ sonar_security_hotspots: 0 })).toBe('clear');
-    expect(securityBand({ sonar_security_hotspots: 12 })).toBe('medium');
   });
 
   it('counts a repository with no signal at all as unmeasured', () => {
@@ -476,7 +473,6 @@ describe('the security band', () => {
         security: null,
         sonar_security_rating: null,
         sonar_security_issues: null,
-        sonar_security_hotspots: null,
       }),
     ).toBe('unknown');
   });
@@ -484,6 +480,12 @@ describe('the security band', () => {
   it('reads clear alerts and no Sonar project as Clear rather than as unmeasured', () => {
     // Its security WAS read, and there was nothing open; the absent Sonar measures add no doubt.
     expect(securityBand({ security: security() })).toBe('clear');
+  });
+
+  it('still bands a clean repository Clear now the hotspot signal has gone', () => {
+    // Removing a signal on 2026-09-04 must not turn a measured repository Unknown: clear families
+    // and an A rating are enough on their own, with no Sonar count present at all.
+    expect(securityBand({ security: security(), sonar_security_rating: { value: 1 } })).toBe('clear');
   });
 });
 
@@ -561,7 +563,7 @@ describe('Sonar measures', () => {
 
   it('takes an issue count’s severity from its own rating', () => {
     // The estate figures the tone table was written from: 71 reliability issues under a D read red,
-    // 1,358 maintainability issues under an A read amber, and 0 hotspots read green either way.
+    // and 1,358 maintainability issues under an A read amber.
     const reported = measures({
       reliability_issues: 71,
       reliability_rating: { value: 4 },
@@ -569,27 +571,14 @@ describe('Sonar measures', () => {
       maintainability_rating: { value: 1 },
       security_issues: 13,
       security_rating: { value: 5 },
-      security_hotspots: 0,
-      security_review_rating: { value: 5 },
     });
     expect(sonarMeasureTone('reliability_issues', reported)).toBe('bad');
     expect(sonarMeasureTone('maintainability_issues', reported)).toBe('warn');
     expect(sonarMeasureTone('security_issues', reported)).toBe('bad');
-    expect(sonarMeasureTone('security_hotspots', reported)).toBe('good');
   });
 
   it('cautions on an issue count whose rating was never reported', () => {
     expect(sonarMeasureTone('security_issues', measures({ security_issues: 4 }))).toBe('warn');
-  });
-
-  it('reads each issue count against its own rating and no other', () => {
-    // security_hotspots reads the security REVIEW rating, which is the one Sonar grades it with.
-    const mixed = measures({
-      security_hotspots: 6,
-      security_rating: { value: 5 },
-      security_review_rating: { value: 1 },
-    });
-    expect(sonarMeasureTone('security_hotspots', mixed)).toBe('warn');
   });
 
   it('grades a measure the project never reported not at all', () => {
@@ -602,7 +591,6 @@ describe('Sonar measures', () => {
       'reliability_issues',
       'maintainability_issues',
       'security_issues',
-      'security_hotspots',
     ];
     for (const measure of every) {
       expect(sonarMeasureTone(measure, nothing)).toBe('neutral');

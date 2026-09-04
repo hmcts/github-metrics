@@ -292,6 +292,41 @@ def test_load_repository_state_reads_a_row_stored_before_the_standards_checks(
     assert stored.state.maintenance is None
 
 
+def test_load_repository_state_reads_a_row_stored_before_the_hotspot_metrics_were_retired(
+    tmp_path: Path,
+    inventory: RepositoryInventory,
+) -> None:
+    """Load a row whose stored Sonar block still carries the two keys retired on 2026-09-04.
+
+    `SonarMeasures` is validated `extra="forbid"` INSIDE this payload, which is the whole reason
+    `security_hotspots` and `security_review_rating` were retained on the model rather than deleted:
+    every row written before that date carries both. The guard belongs on this path and not only on
+    the bare model, because this is the path a cached row actually takes — deleting the fields shows
+    up here, as a `StorageError` on every repository on the estate, rather than as a tidy-up.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    record_repository_state(path, inventory)
+    with closing(connect(path)) as connection, connection:
+        (payload,) = connection.execute("SELECT payload FROM repository_state").fetchone()
+        aged = {
+            **json.loads(payload),
+            "sonar": {
+                "project_key": "hmcts_nfdiv-case-api",
+                "security_hotspots": 4,
+                "security_review_rating": {"value": 5.0},
+            },
+        }
+        connection.execute("UPDATE repository_state SET payload = ?", (json.dumps(aged),))
+
+    stored = load_repository_state(path, "hmcts", "nfdiv-case-api")
+
+    assert stored is not None
+    assert stored.state.sonar is not None
+    assert stored.state.sonar.security_hotspots == 4
+    assert stored.state.sonar.security_review_rating is not None
+    assert stored.state.sonar.security_review_rating.letter == "E"
+
+
 def test_load_repository_state_reports_a_repository_that_was_never_collected(tmp_path: Path) -> None:
     """Return nothing rather than inventing an unprotected gate for an uncollected repository."""
     assert load_repository_state(tmp_path / "metrics.sqlite3", "hmcts", "cath-service") is None

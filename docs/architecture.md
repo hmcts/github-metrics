@@ -709,7 +709,7 @@ measurement" below is pinned against.
 
 Each repository reports the quality state of the SonarCloud project it maps to — gate level with
 every condition behind it, coverage, duplication, lines of code, violations, the three
-software-quality issue counts, security hotspots and the four ratings — as a current-state block
+software-quality issue counts and the three ratings — as a current-state block
 beside the merge gate. SonarCloud is read anonymously over `requests`; `SONAR_TOKEN` then
 `SONARCLOUD_TOKEN` widen the listing to private projects when set, and a bad token is worse than no
 token (`401` where anonymous gets `200`), so the header is sent only when one is present.
@@ -869,6 +869,44 @@ TWO KNOWN LIMITATIONS, both consequences of the above rather than defects to fix
 - `map-sonar` MUST BE RUN PERIODICALLY. A project that moves to a different repository keeps
   reporting its old repository until the command runs again, because the map is the only thing that
   knows and nothing in `collect` refreshes it.
+
+### The security hotspot metrics are retired, and A RETIRED EVIDENCE FIELD IS KEPT RATHER THAN DELETED (decided 2026-09-04)
+
+`security_hotspots` and `security_review_rating` are no longer requested, and no reader consumes
+them: not the text report, not the served row, not the SonarCloud tab, not the estate's security
+donut. Sonar is transitioning the rules that raised security hotspots into ones that raise
+vulnerabilities and security issues, which is A GRADUAL TRANSITION RATHER THAN A DATED REMOVAL — the
+deprecations page names no removal date, does not list either metric key as dead, and both keys still
+resolve today. THIS WAS THEREFORE OUR CHOICE, so it carries no fallback, no shim and no deprecation
+warning; the two keys simply left `SONAR_METRIC_KEYS`, which is safe in that direction because one
+key that does not exist empties the whole response and REMOVING keys cannot.
+
+NOTHING WAS LOST, and that is measured rather than assumed. Of the 266 repositories reporting
+`security_hotspots` against the collected snapshot on 2026-09-04, all 266 reported ZERO, so the
+donut's sixth signal could only ever resolve `good` and dropping it moved no repository between
+bands. `securityBand` now reads five signals, and the removed card could only ever have read `0`.
+`RepositoryRow` lost `sonar_security_hotspots` along with its mirror in `types.ts` — absent means
+unmeasured there, as it does for every other optional field on the row.
+
+THE TWO FIELDS STAY ON `SonarMeasures`, unread and never populated again. This is the ruling worth
+reusing. `SonarMeasures` is an `EvidenceModel` validated `extra="forbid"`, nested inside the
+`RepositoryInventoryItem` that `collect` serialises into `repository_state.payload`, and every
+payload already written carries both keys — so DELETING the fields makes every one of those rows fail
+validation, measured on the real nested model on the same day. Retaining them costs two declarations
+that are `None` for anything collected from 2026-09-04 onward and invalidates no cached row. It is
+the mirror of a rule the code already states: `RepositoryInventoryItem`'s docstring records that its
+optional fields "default to None so a row stored before they existed still parses", and a field
+retained so an OLDER row still parses is that same rule pointing backwards. Two tests pin the pair —
+one that a stored payload carrying both keys still parses and reads back their values, one that
+measures built from a response still carrying both metrics come back `None` — because the guarantee
+is what a later tidy-up would break.
+
+Two alternatives were rejected. Setting `extra="ignore"` on `SonarMeasures` weakens a guard the
+codebase leans on deliberately, since `load_repository_state` depends on it to catch a payload from a
+newer build, and it would silently accept genuine typos. Deleting the fields and repairing the cache
+with `collect --refresh` works, but it turns a metric removal into an estate-wide recollection.
+THIS IS THE PRECEDENT FOR RETIRING ANY FUTURE EVIDENCE FIELD: stop collecting it, drop every reader,
+and leave the field declared.
 
 ## Storage rule (decided 2026-08-11)
 
@@ -1500,8 +1538,8 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
     report and changes no label.
     A DONUT MAY BAND A FIGURE STRICTER THAN THE CARD BESIDE IT (2026-09-03, at the user's
     instruction). REVERSED 2026-09-04 AT THE USER'S INSTRUCTION — see below. `securityBand` bands the
-    estate's security donut on the worst of six signals — the three alert families through
-    `alertTone`, and SonarCloud's security rating, issues and hotspots — and put a security rating of
+    estate's security donut on the worst of five signals — the three alert families through
+    `alertTone`, and SonarCloud's security rating and issues — and put a security rating of
     C at High where `sonarRatingTone` puts the same letter at amber, following Sonar's own scale.
     That was the first case of TWO UI THRESHOLDS GRADING ONE FIGURE DIFFERENTLY, allowed because the
     two answered different questions about the letter: the repository page's card reports Sonar's

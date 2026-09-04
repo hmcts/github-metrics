@@ -115,8 +115,8 @@ export function coverageSlices(rows: readonly RepositoryRow[]): PieSlice[] {
 }
 
 /**
- * The security donut, banded off the row itself: `RepositoryRow` carries the four fields
- * `SecuritySignals` names — six signals between them — so the row is passed through whole rather
+ * The security donut, banded off the row itself: `RepositoryRow` carries the three fields
+ * `SecuritySignals` names — five signals between them — so the row is passed through whole rather
  * than picked apart here.
  */
 export function securitySlices(rows: readonly RepositoryRow[]): PieSlice[] {

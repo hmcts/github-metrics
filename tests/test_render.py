@@ -339,11 +339,9 @@ def sonar_measures(**overrides: object) -> SonarMeasures:
         reliability_issues=12,
         maintainability_issues=280,
         security_issues=3,
-        security_hotspots=7,
         reliability_rating=SonarRating(value=3.0),
         maintainability_rating=SonarRating(value=1.0),
         security_rating=SonarRating(value=2.0),
-        security_review_rating=SonarRating(value=5.0),
     )
     return measures.model_copy(update=overrides)
 
@@ -1009,18 +1007,25 @@ def test_sonar_reports_the_project_it_resolved_its_gate_and_every_measure() -> N
     assert block[10].split(maxsplit=2) == ["Reliability", "issues", "12"]
     assert block[11].split(maxsplit=2) == ["Maintainability", "issues", "280"]
     assert block[12].split(maxsplit=2) == ["Security", "issues", "3"]
-    assert block[13].split(maxsplit=2) == ["Security", "hotspots", "7"]
 
 
-def test_the_four_ratings_render_as_the_letters_they_name() -> None:
+def test_the_retired_hotspot_measures_are_absent_from_the_block() -> None:
+    """Print neither retired row, so the block asks for nothing Sonar has stopped standing behind."""
+    rendered = sonar_rendering(mapped_sonar_report())
+
+    block = "\n".join(block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z"))
+    assert "Security hotspots" not in block
+    assert "Security review rating" not in block
+
+
+def test_the_three_ratings_render_as_the_letters_they_name() -> None:
     """Render each 1-to-5 rating as the `A`-to-`E` letter every SonarCloud reader knows it by."""
     rendered = sonar_rendering(mapped_sonar_report())
 
     block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
-    assert block[14].split(maxsplit=2) == ["Reliability", "rating", "C"]
-    assert block[15].split(maxsplit=2) == ["Maintainability", "rating", "A"]
-    assert block[16].split(maxsplit=2) == ["Security", "rating", "B"]
-    assert block[17].split(maxsplit=3) == ["Security", "review", "rating", "E"]
+    assert block[13].split(maxsplit=2) == ["Reliability", "rating", "C"]
+    assert block[14].split(maxsplit=2) == ["Maintainability", "rating", "A"]
+    assert block[15].split(maxsplit=2) == ["Security", "rating", "B"]
 
 
 def test_a_rating_off_the_scale_is_not_reported_as_a_letter() -> None:
@@ -1033,7 +1038,7 @@ def test_a_rating_off_the_scale_is_not_reported_as_a_letter() -> None:
     rendered = sonar_rendering(mapped_sonar_report(measures=measures))
 
     block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
-    assert block[14].split(maxsplit=2) == ["Reliability", "rating", "unknown (7)"]
+    assert block[13].split(maxsplit=2) == ["Reliability", "rating", "unknown (7)"]
 
 
 def test_a_failing_gate_condition_is_shown_beside_the_threshold_it_missed() -> None:
@@ -1105,7 +1110,7 @@ def test_every_absent_measure_renders_as_a_dash_rather_than_a_zero() -> None:
     block = block_lines(rendered, "SonarCloud, read 2026-08-02T09:30Z")
     assert block[3].split(maxsplit=2) == ["Quality", "gate", "not reported"]
     assert [line.split()[-1] for line in block[4:]] == ["-"] * len(block[4:])
-    assert len(block[4:]) == 12
+    assert len(block[4:]) == 10
 
 
 @pytest.mark.parametrize(
