@@ -238,6 +238,10 @@ history was `fetched`, `partially_reused`, or `fully_reused`, how many stable in
 mutable boundary, and the pull-request, review, and direct-commit fact counts the window holds. Identical counts across
 runs are expected when the underlying evidence has not changed.
 
+`collect` also takes `--hold-anchor`, which collects and stores exactly as a scheduled run does but leaves the reported
+window where the last completed run left it. Use it for an ad-hoc run over a handful of repositories — one team being
+chased, one repository being debugged. The reporting anchor it holds is described under [Run](#run) below.
+
 **Repositories are reported in one fixed order — team identifier, then repository name — by both commands and both
 `evidence` formats**, whatever order the configuration file happens to list them in. Ordering follows the configuration
 only in the sense that it is derived from it: moving a `teams:` block no longer reorders a report, so two runs stay
@@ -420,9 +424,22 @@ The cache exists only to avoid repeating GitHub calls; it is not a separate data
 stored as JSON payloads beside the few columns needed to query them, so recording an additional field needs no schema
 change. Coverage is keyed on a hash of the GraphQL documents, so widening a query automatically invalidates the affected
 intervals and they are collected again rather than served incomplete. `metrics prune --config ... --days N` deletes
-intervals no collection has touched for N days, together with any facts they leave behind. Collection is what counts as
+intervals no collection has touched for N days, together with any facts and coverage confirmations they leave behind —
+the confirmations go with them so a retired query signature cannot go on voting for its old reporting anchor, and the
+reported count is of intervals only. Collection is what counts as
 touching one: reporting from the cache deliberately leaves the interval's timestamp alone, so an interval the current
 queries no longer ask for ages out even while the service is serving reports from its neighbours.
+
+**Scheduled collection runs `metrics collect --config ... --days N`, 14 in live service.** `--days N` resolves to
+`[midnight(now) - N days, midnight(now))`, so the window ends at the most recent UTC midnight and a run repeated later
+the same day asks for the window the earlier run already covered. `--from`/`--to` names an explicit span and is what a
+backfill uses: the first collection after enablement, and the refetch a widened query forces.
+
+**A 14-day top-up keeps the 12-week spans reportable.** A collecting run stamps every coverage interval the repository
+holds under the current query signature — the fortnight it fetched and the months behind it alike — so
+`prune --days 30` sees each of them as touched today and keeps them. Two weeks of collection therefore maintains a span
+reaching back as far as collection has been running, and the twelve-week reports read from intervals no recent window
+asked GitHub for.
 
 This release widened the pull-request query three times — a review's comment count and its summary body, for
 `review-depth`, and the pull-request body, for `description-quality` and `traceability-reference` — so **every
@@ -918,18 +935,35 @@ bypasses it could not see — a silently truncated window is more dangerous than
 cached without recording coverage, a cached report also refuses any window overlapping the last `mutable_hours`. That is
 intended: it means settled, cached evidence or nothing.
 
-Which is why a cached report anchors its window where the caches end rather than where today does. A collection records
+Which is why a cached report anchors its window at the edge the last completed collection confirmed rather than where
+today does — the **reporting anchor**, and what `--hold-anchor` holds. A collection records
 coverage only up to the stable edge of the run that wrote it, so the morning after a run a window ending at today's
 midnight is short of coverage by that edge alone and every repository reports as not reported. Wherever the end is not
 named outright — no options at all, `--days` on its own, `--from` on its own — `evidence` without `--refresh` and
-`trend --offline` therefore end at the most recent midnight the caches actually cover to: the last whole run's edge,
-taking the earlier of the two sources, and never later than today's midnight. The same command run the day after a
+`trend --offline` therefore end at the most recent midnight the caches actually cover to: the edge the last completed
+collection confirmed, taking the earlier of the two sources, and never later than today's midnight. The same command run the day after a
 collection prints the figures that collection supports, rather than nothing. An explicit `--to` is still honoured
 exactly as given. A repository off that edge is still reported as unavailable at that window: the anchor is the instant
 most of the estate is covered to, so neither one repository missed for a month nor one repository refreshed on its own
-this morning moves the whole estate's window. The run says where it landed — an INFO line naming the collected
-instant whenever the anchor is behind today's midnight, and a WARNING when the last collection is older than
-`lookback.stale_collection_days`. `collect` and `evidence --refresh` are unaffected and still anchor at now: they are
+this morning moves the whole estate's window.
+
+**A `collect` run confirms that edge once, at the end, after everything it collected is stored**, and the anchor moves
+only there. So starting a collection leaves the dashboard reporting the same repositories at the same spans throughout
+the run, and the anchor stays put for a `collect` that dies part way, an `evidence --refresh --repository x` and a
+collecting `trend`. `collect --hold-anchor` collects and stores exactly as a scheduled run does and skips the
+confirmation, which is how an ad-hoc collection over a handful of repositories keeps the reported window where the
+schedule put it. Only `collect` takes the flag, since only `collect` confirms.
+
+**A finished run that covers most of the estate still moves the anchor**, because the anchor is the edge most of the
+estate is confirmed to. So a cohort collected in parts — as `scripts/split_team_configuration.py` splits it — moves the
+anchor part way through the sequence, once the parts already collected are the majority, and the repositories in the
+parts still to run report as unavailable until theirs lands. Run the parts back to back and in order, and do not reach
+for `--hold-anchor`: a held part leaves its repositories on the confirmations they already had, so holding most of the
+estate freezes the anchor rather than deferring it. The flag is for an ad-hoc run over a handful of repositories.
+
+The run says where it landed — an INFO line naming the collected instant whenever the anchor is behind today's
+midnight, a line from `collect` naming the edge it confirmed or the edge it held, and a WARNING when the last
+collection is older than `lookback.stale_collection_days`. `collect` and `evidence --refresh` are unaffected and still anchor at now: they are
 the runs that reach GitHub, and an anchor behind now would ask them to collect less than they can.
 
 Merge-gate collection first uses effective repository rulesets. If none apply, it requests detailed classic branch
@@ -1548,11 +1582,17 @@ and the row is still served: a person with no label is a person the labels say n
 dashboard shows that row as `CANNOT ASSESS` — the repositories behind it were graded and came back unreadable — and
 sorts it last in either direction, since an unreadable gate has no place in a green-amber-red ordering.
 
-Every one of those spans ends where the caches end, not at today's midnight — the same anchor `metrics evidence` uses
-offline, and for the same reason: a service reading a cache written on Monday would otherwise report the whole estate
-as not reported from Tuesday onwards. So a span served the day after a collection shows the figures that collection
-supports, and a repository off that edge is reported as unavailable at that window rather than pulling everyone else's
-window back to meet it or dragging it forward. The instant a window is anchored to is published as `collected_through` on
+Every one of those spans ends at the edge the last completed collection confirmed, not at today's midnight — the same
+anchor `metrics evidence` uses offline, and for the same reason: a service reading a cache written on Monday would
+otherwise report the whole estate as not reported from Tuesday onwards. So a span served the day after a collection
+shows the figures that collection supports, and a repository off that edge is reported as unavailable at that window
+rather than pulling everyone else's window back to meet it or dragging it forward. **A collection in flight moves
+nothing once the estate has been confirmed**: the anchor is written once, at the end of a `collect` run, so the pages
+report the same repositories at the same spans throughout a collection rather than blanking the estate the moment one
+starts, and a run that dies part way or is given `--hold-anchor` leaves them exactly where they were. A repository no
+completed run has confirmed yet votes with its own live coverage instead, so on a cache written before confirmations
+existed a run does carry the anchor forward as it works, from the point where the repositories it has re-collected are
+the majority; each repository stops voting live at the first completed run that reaches it. The instant a window is anchored to is published as `collected_through` on
 `/windows` and on `/overview`, and `/windows` also carries `collection_stale`, set when the last collection is older
 than `lookback.stale_collection_days`. The UI prints `Collected through 2026-09-01` in each estate list's header beside
 the span, and shows an amber warning bar on every page — the three lists, repository, team and contributor — while the

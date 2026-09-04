@@ -919,8 +919,9 @@ and leave the field declared.
 - Current state: stored as latest-only, because it is irrecoverable after the fact.
 
 This removed the `runs` table's reason to exist: run history held dated observation and merge-gate
-snapshots, and neither is wanted. The schema is pull-request facts + source coverage + one
-current-state row per repository.
+snapshots, and neither is wanted. The cache schema is pull-request facts, direct-commit facts, source
+coverage, the confirmed coverage the anchor is counted over, the SonarCloud project map, and one
+current-state row per repository; the appended observation series lives in the second file.
 
 ### Extension: open-alert counts are appended as an observation series (decided 2026-08-15)
 
@@ -987,6 +988,12 @@ series for ever, and the tool cannot fill it in later.
   else is rejected with the accepted forms listed.
 - Both commands resolve windows through `metrics/window.py`, so a coverage interval and a report
   window have the same edges.
+- SCHEDULED COLLECTION USES `--days N`, 14 in live service: `collect --config ... --days 14`. The
+  window ends at the most recent UTC midnight, so a run repeated inside the same day asks for the
+  window the earlier run covered, and the fortnight is a top-up over intervals the cache already
+  holds. A collecting run stamps every interval the repository holds under the current signature, so
+  `prune --days 30` keeps the older ones and the 12-week spans stay reportable. `--from`/`--to` is
+  for a backfill: the first collection after enablement, and the refetch a widened query forces.
 
 ## Trend measurement (decided 2026-08-15)
 
@@ -1228,6 +1235,61 @@ recorded at a new edge against 850 at the old one carries the mode forward, and 
 knowingly — the mode narrows the exposure from "any one repository blanks the estate" to "a run that
 died past halfway blanks the part it never reached", and inferring completeness from a row count
 cannot do better. A run's own completion marker could, and is where to look if this ever bites.
+
+AMENDED 2026-09-04 — THE COMPLETION MARKER IS BUILT, AND THE ANCHOR IS TAKEN OVER IT. `collect` writes
+one `confirmed_coverage` row per repository at the END of a run, holding that repository's ACTUAL
+`MAX(ends_at)` from `source_coverage`, and `prevailing_cached_coverage` takes the mode over that
+table. It confirms BOTH SPELLINGS of every name, the one `hmcts.yml` holds and the one GitHub
+answered with, because the window phase writes coverage under GitHub's name: a repository renamed or
+recased since the configuration was written is followed by the API, and confirming the configured
+spelling alone would leave its coverage voting live for ever. So the anchor is the edge the last COMPLETED run confirmed. This closes the residual case above
+at both ends, for every repository a completed run has confirmed: a `collect` that dies past halfway
+confirms nothing and leaves the estate reporting where it was, and a repository the run never reached
+re-confirms the edge it already had, so a run cannot vouch for a repository it failed to collect. The mode still guards the rest — one repository ahead or
+behind moves nothing — and `prune_cache` deletes a confirmed row whose `source_coverage` row has gone,
+so a dead signature and a de-configured repository cannot win the mode with an old edge.
+
+EVERY COVERED REPOSITORY VOTES, AND THE `source_coverage` FALLBACK IS PER REPOSITORY. A repository with
+a confirmation votes with it; one with none votes with the edge its own coverage reaches. That keeps two
+cases reporting rather than going dark — the cache in service when this shipped, which holds coverage
+and no confirmations, and a signature whose first run has yet to finish — and it self-heals repository
+by repository as runs reach them. Reading the whole table for the fallback instead, and preferring
+confirmations once a signature held any at all, would make the FIRST run to finish the entire
+electorate: one repository of a thousand confirmed at a new edge would be 100% of the confirmed rows and
+would carry the anchor there, taking the other 999 out of every span. That is the failure this ruling
+exists to close, so the fallback cannot be all-or-nothing per signature.
+
+`--hold-anchor` IS FOR THE AD-HOC RUN. A run given it collects and stores exactly as usual and skips
+the confirmation, so a collection over a handful of repositories — one team being chased, one
+repository being debugged — leaves the reported window where the scheduled run put it. Only `collect`
+takes it: `evidence --refresh` and a collecting `trend` write coverage without confirming, and moved
+the anchor under neither the old rule nor this one.
+
+WHAT REMAINS: a run over a SUBSET of the estate that FINISHES, without the flag, still carries the mode
+forward when its subset is the majority of the covered estate, and the repositories outside it then
+report `unavailable` at every span until a run reaches them. Confirming only the collected repositories
+cannot help, since the majority is what the mode counts. The flag is the mechanism for that case, which
+makes it the operator's call rather than an inference from a row count.
+
+THE FLAG DOES NOT SOLVE SPLIT COLLECTION, and must not be reached for there.
+`scripts/split_team_configuration.py` turns the estate into five parts collected on five runs, and once
+three have landed their edge is the majority, so parts four and five report `unavailable` until they
+land. Holding the first four makes it worse rather than better: a held part leaves its repositories on
+the confirmations they already had, so the final part's 400 confirmations cannot outvote the 1463 the
+held runs left behind — and the next cycle cannot either, which freezes the anchor for good rather than
+deferring it to the end of the sequence. The guidance is therefore to run the parts back to back and in
+order, without the flag, and to keep the sequence tight; the gap is the time between the majority
+landing and the last part finishing. Nothing can confirm an estate it did not collect, so closing it
+properly needs a confirm-only pass over the whole cohort, which does not exist yet.
+
+THE GUARANTEE IS EXACT ONCE A REPOSITORY HAS BEEN CONFIRMED, and one case short of exact before that —
+for the anchor as a whole and not only for the flag. Where a repository holds no confirmation there is
+nothing recording where it was, so it votes with its own live coverage, and a run that re-stamps the
+MAJORITY of the covered estate carries the anchor forward on those live rows: as the run works, on a run
+that dies past halfway, and under `--hold-anchor` alike. That is the state the cache in service was in
+when this shipped, so the first full run after the deploy does blank the repositories it has yet to
+reach for the rest of that run. It holds for the ad-hoc runs the flag is for, since those are a handful
+of repositories, and each repository becomes exact at the first completed run that reaches it.
 
 A repository BEHIND the anchor stays `unavailable` there, which is the existing meaning of that field
 and the honest answer. One AHEAD of it still reports: `record_source_coverage` coalesces the newer

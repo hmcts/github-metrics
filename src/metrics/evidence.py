@@ -48,6 +48,7 @@ from metrics.rules import configured_rules
 from metrics.rules.base import PracticeRule
 from metrics.storage import (
     StorageError,
+    confirm_collection_coverage,
     find_missing_cached_coverage,
     load_cached_direct_commit_facts,
     load_cached_pull_request_facts,
@@ -570,6 +571,36 @@ def open_pull_request_report(
     )
 
 
+def cached_source_signatures() -> dict[EvidenceSource, str]:
+    """Return the signature each independently cached source's coverage is written under.
+
+    The two sources and their signatures named in ONE place, so that the run confirming an edge and
+    the report reading it cannot disagree about which rows are this build's.
+    """
+    return {source: source_signature(source) for source in (EvidenceSource.PULL_REQUEST, EvidenceSource.COMMIT)}
+
+
+def confirm_collection(configuration: Configuration, repositories: Iterable[str], reference: datetime) -> None:
+    """Record what a completed collection run confirms about the repositories it was asked for.
+
+    Called at the END of a run and nowhere else, because a confirmation is what tells a finished run
+    from one still going. What it stores is each repository's ACTUAL cached edge, not the window the
+    run asked for — see `confirm_collection_coverage` — and `collected_through` reads the estate's
+    anchor back out of it.
+
+    A `StorageError` is left to the caller rather than logged away as `collected_through` does with
+    one: this is the writing path, where a cache that cannot be written to is a run that did not do
+    what it reported doing.
+    """
+    confirm_collection_coverage(
+        configuration.database,
+        configuration.organization,
+        repositories,
+        cached_source_signatures(),
+        reference,
+    )
+
+
 def collected_through(configuration: Configuration) -> datetime | None:
     """Return the instant the caches can report a whole window up to for most of the estate.
 
@@ -581,16 +612,21 @@ def collected_through(configuration: Configuration) -> datetime | None:
     instant only one source reaches is not an instant a window can end at. `None` when either source
     has no coverage at all under the current signature, which is what a cold cache looks like.
 
+    Each edge is the one the last COMPLETED run confirmed for that source, so a collection in flight
+    leaves the reported window exactly where it was until it finishes. `prevailing_cached_coverage`
+    holds that rule, and `confirm_collection` is what writes the rows it counts.
+
     An unreadable cache reports as nothing collected rather than raising: the service is offline
     always, and a page saying nothing has been collected is a better answer than a failed request.
     """
+    signatures = cached_source_signatures()
 
     def edge(source: EvidenceSource) -> datetime | None:
         return prevailing_cached_coverage(
             configuration.database,
             configuration.organization,
             source,
-            source_signature(source),
+            signatures[source],
         )
 
     try:

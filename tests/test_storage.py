@@ -1,6 +1,7 @@
 """Test SQLite collection snapshot persistence."""
 
 import json
+from collections.abc import Iterable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,7 @@ from metrics.storage import (
     StorageError,
     cache_direct_commit_facts,
     cache_pull_request_facts,
+    confirm_collection_coverage,
     find_missing_cached_coverage,
     find_missing_coverage,
     get_pull_request_facts,
@@ -1199,6 +1201,321 @@ def test_reading_the_collected_edge_translates_an_unparseable_instant(tmp_path: 
         prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash")
 
 
+def confirmed_rows(path: Path) -> list[tuple[str, str, str, str]]:
+    """Read every confirmed edge the cache holds as (repository, source, ends_at, confirmed_at)."""
+    with closing(connect(path)) as connection:
+        rows: list[tuple[str, str, str, str]] = connection.execute(
+            "SELECT repository, source, ends_at, confirmed_at FROM confirmed_coverage ORDER BY repository, source",
+        ).fetchall()
+        return rows
+
+
+def test_a_finished_run_confirms_the_edge_each_repository_is_actually_covered_to(tmp_path: Path) -> None:
+    """Snapshot each named repository's own cached edge, which is what the run really collected."""
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "pcs-frontend", datetime(2026, 8, 1, tzinfo=UTC))
+
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("cath-service", "pcs-frontend"),
+        {EvidenceSource.PULL_REQUEST: "testhash"},
+        datetime(2026, 9, 4, 6, 30, tzinfo=UTC),
+    )
+
+    assert confirmed_rows(path) == [
+        ("cath-service", "pull_request", "2026-09-01T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+        ("pcs-frontend", "pull_request", "2026-08-01T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+    ]
+
+
+def test_a_confirmation_stores_nothing_for_a_repository_the_cache_has_never_covered(tmp_path: Path) -> None:
+    """Leave a repository with no coverage rows out, rather than confirming it at a null edge.
+
+    A repository configured but never collected — added this morning, or refused on every run — has
+    no edge to confirm, and a null one would be a claim that it is covered up to nowhere. A
+    repository the cache DOES cover but the run was not asked about is left alone for the same
+    reason: only the named repositories were collected.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "not-in-this-run", datetime(2026, 7, 1, tzinfo=UTC))
+
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("cath-service", "never-collected"),
+        {EvidenceSource.PULL_REQUEST: "testhash"},
+        datetime(2026, 9, 4, 6, 30, tzinfo=UTC),
+    )
+
+    assert confirmed_rows(path) == [
+        ("cath-service", "pull_request", "2026-09-01T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+    ]
+
+
+def test_a_later_run_moves_a_repository_confirmation_rather_than_adding_a_second(tmp_path: Path) -> None:
+    """Hold one row per repository per signature, updated in place by every later run.
+
+    The row is a repository's current confirmed edge and not a history of them, so the anchor is
+    counted over one row per repository and no run's confirmation can be counted twice.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 8, 1, tzinfo=UTC))
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("cath-service",),
+        {EvidenceSource.PULL_REQUEST: "testhash"},
+        datetime(2026, 8, 1, 6, 30, tzinfo=UTC),
+    )
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("cath-service",),
+        {EvidenceSource.PULL_REQUEST: "testhash"},
+        datetime(2026, 9, 4, 6, 30, tzinfo=UTC),
+    )
+
+    assert confirmed_rows(path) == [
+        ("cath-service", "pull_request", "2026-09-01T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+    ]
+
+
+def test_a_confirmation_snapshots_every_source_signature_it_is_given(tmp_path: Path) -> None:
+    """Confirm both independently cached sources, each under its own signature.
+
+    A window needs merged pull requests and direct commits both, so one source confirmed without the
+    other would leave the reported anchor at whichever the last run happened to write.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    cache_direct_commit_facts(
+        path,
+        SourceCoverage(
+            organization="hmcts",
+            repository="cath-service",
+            source=EvidenceSource.COMMIT,
+            query_hash="commithash",
+            starts_at=datetime(2026, 6, 1, tzinfo=UTC),
+            ends_at=datetime(2026, 8, 20, tzinfo=UTC),
+        ),
+        (),
+        complete=True,
+    )
+
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("cath-service",),
+        {EvidenceSource.PULL_REQUEST: "testhash", EvidenceSource.COMMIT: "commithash"},
+        datetime(2026, 9, 4, 6, 30, tzinfo=UTC),
+    )
+
+    assert confirmed_rows(path) == [
+        ("cath-service", "commit", "2026-08-20T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+        ("cath-service", "pull_request", "2026-09-01T00:00:00+00:00", "2026-09-04T06:30:00+00:00"),
+    ]
+
+
+def test_confirming_the_collected_edge_translates_sqlite_failures(tmp_path: Path) -> None:
+    """Expose a cache the confirmation cannot be written to through the storage boundary."""
+    with (
+        patch("metrics.storage.connect", side_effect=Error("unavailable")),
+        pytest.raises(StorageError, match="could not update collection cache"),
+    ):
+        confirm_collection_coverage(
+            tmp_path / "metrics.sqlite3",
+            "hmcts",
+            ("cath-service",),
+            {EvidenceSource.PULL_REQUEST: "testhash"},
+            datetime(2026, 9, 4, 6, 30, tzinfo=UTC),
+        )
+
+
+def confirmed_to(path: Path, repositories: Iterable[str], confirmed_at: datetime) -> None:
+    """Confirm the pull-request coverage the named repositories currently hold, as a finished run."""
+    confirm_collection_coverage(path, "hmcts", repositories, {EvidenceSource.PULL_REQUEST: "testhash"}, confirmed_at)
+
+
+def test_the_anchor_ignores_coverage_a_run_in_flight_has_written(tmp_path: Path) -> None:
+    """Answer at the last confirmed edge, however far the run now collecting has already got.
+
+    The whole point of confirming: a `collect` writes `source_coverage` for each repository as it
+    reaches it, so most of the estate can be at today's edge while the run is still working. Anchoring
+    there would take every repository it has not reached yet out of the reported window for as long as
+    the run lasts, which is the failure this table exists to close.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    for repository in ("cath-service", "pcs-frontend", "sscs-api"):
+        collected_to(path, repository, datetime(2026, 8, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service", "pcs-frontend", "sscs-api"), datetime(2026, 8, 1, 6, 30, tzinfo=UTC))
+    for repository in ("cath-service", "pcs-frontend"):
+        collected_to(path, repository, datetime(2026, 9, 1, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_anchor_takes_the_later_of_two_equally_common_confirmed_edges(tmp_path: Path) -> None:
+    """With no confirmed edge in the majority, take the later one.
+
+    Half the estate confirmed at one edge and half at another says nothing about which is the cohort
+    and which is the exception, and the repositories behind the later edge report as unavailable
+    there — the existing meaning of that field and the honest answer.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "pcs-frontend", datetime(2026, 8, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service", "pcs-frontend"), datetime(2026, 9, 4, 6, 30, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_anchor_falls_back_to_live_coverage_for_a_repository_no_run_has_confirmed(tmp_path: Path) -> None:
+    """Answer from `source_coverage` for a repository with no confirmation, so a cache reports at all.
+
+    The existing working cache was written before confirmations existed, and a signature's first run
+    has not finished yet — both must keep reporting rather than going dark. The fallback is per
+    repository, so it self-heals repository by repository as runs reach them rather than all at once.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    collected_to(path, "pcs-frontend", datetime(2026, 8, 1, tzinfo=UTC))
+    collected_to(path, "sscs-api", datetime(2026, 8, 1, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+
+    confirmed_to(path, ("pcs-frontend", "sscs-api"), datetime(2026, 9, 4, 6, 30, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_a_run_in_flight_over_an_unconfirmed_majority_does_carry_the_anchor_forward(tmp_path: Path) -> None:
+    """Move the anchor mid-run where the repositories re-stamped so far hold no confirmation.
+
+    THE RESIDUAL THE PER-REPOSITORY FALLBACK LEAVES, pinned here so the docstrings stay honest about
+    it. A run in flight re-stamps each repository's coverage as it reaches it, and a repository with
+    no confirmation votes with that live edge — so on the cache in service when confirmations shipped
+    the anchor steps forward from the point where the re-collected repositories are the majority, and
+    the two this run has yet to reach report as unavailable for the rest of it. Nothing records where
+    they were, which is the whole reason a confirmation exists; it holds for the ad-hoc runs
+    `--hold-anchor` is for, and each repository becomes exact at the first completed run.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    for repository in ("pcs-frontend", "sscs-api", "et-hearings", "ccd-definitions", "cath-service"):
+        collected_to(path, repository, datetime(2026, 8, 1, tzinfo=UTC))
+    for reached in ("pcs-frontend", "sscs-api", "et-hearings"):
+        collected_to(path, reached, datetime(2026, 9, 1, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        9,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_one_confirmed_repository_does_not_carry_an_unconfirmed_estate_forward(tmp_path: Path) -> None:
+    """Keep the anchor where the estate is when a single repository is all that has been confirmed.
+
+    THE REGRESSION THE PER-REPOSITORY FALLBACK CLOSES. Preferring confirmations as soon as a signature
+    holds any at all would make the first run to finish the entire electorate: on the cache in service
+    when this shipped, which holds coverage and no confirmations, one ad-hoc `collect` over a single
+    repository would be 100% of the confirmed rows and would carry the anchor to its own edge, taking
+    every other repository out of every span. Every covered repository votes for that reason.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    for repository in ("pcs-frontend", "sscs-api", "et-hearings", "ccd-definitions"):
+        collected_to(path, repository, datetime(2026, 8, 1, tzinfo=UTC))
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service",), datetime(2026, 9, 4, 6, 30, tzinfo=UTC))
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_anchor_stops_counting_a_confirmation_whose_coverage_has_gone(tmp_path: Path) -> None:
+    """Drop a confirmation with no surviving coverage row from the count.
+
+    `prune_cache` deletes the two together, so this is belt and braces — but the query drives off
+    covered repositories, which makes "coverage this build still holds" the rule the count obeys
+    rather than a rule only the prune enforces.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 8, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service",), datetime(2026, 8, 1, 6, 30, tzinfo=UTC))
+    with closing(connect(path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO confirmed_coverage VALUES ('hmcts', 'retired-service', 'pull_request', 'testhash', ?, ?)
+            """,
+            (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), datetime(2026, 9, 4, tzinfo=UTC).isoformat()),
+        )
+        connection.commit()
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+
+
+def test_the_anchor_ignores_a_superseded_signatures_confirmation(tmp_path: Path) -> None:
+    """Count confirmations under the asked-for signature alone.
+
+    `confirmed_coverage` accumulates a row set per signature exactly as `source_coverage` does. An
+    older build's confirmation is not coverage this build can report from, and one reaching further
+    ahead would anchor a report at an instant nothing current covers. A signature with no rows in
+    either table reports as nothing collected rather than borrowing another's.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 8, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service",), datetime(2026, 8, 1, 6, 30, tzinfo=UTC))
+    with closing(connect(path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO confirmed_coverage VALUES ('hmcts', 'cath-service', 'pull_request', 'superseded', ?, ?)
+            """,
+            (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), datetime(2026, 9, 4, tzinfo=UTC).isoformat()),
+        )
+        connection.commit()
+
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.PULL_REQUEST, "testhash") == datetime(
+        2026,
+        8,
+        1,
+        tzinfo=UTC,
+    )
+    assert prevailing_cached_coverage(path, "hmcts", EvidenceSource.COMMIT, "testhash") is None
+
+
 def test_prune_cache_removes_unused_intervals_and_orphaned_facts(tmp_path: Path) -> None:
     """Delete intervals unused since an instant together with the facts they leave behind."""
     path = tmp_path / "metrics.sqlite3"
@@ -1231,6 +1548,48 @@ def test_prune_cache_removes_unused_intervals_and_orphaned_facts(tmp_path: Path)
     with closing(connect(path)) as connection:
         assert connection.execute("SELECT count(*) FROM source_coverage").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM pull_request_facts").fetchone() == (0,)
+
+
+def test_prune_cache_clears_confirmations_whose_coverage_has_gone(tmp_path: Path) -> None:
+    """Take a confirmation with the coverage it vouched for, and leave a live one alone.
+
+    `prevailing_cached_coverage` counts every confirmed row it finds, so a retired signature or a
+    de-configured repository left behind here would go on voting for its old edge, and enough of them
+    would win the mode against the estate. The returned count is of intervals: the confirmation goes
+    as a consequence of one, not as another thing pruned.
+    """
+    path = tmp_path / "metrics.sqlite3"
+    collected_to(path, "cath-service", datetime(2026, 9, 1, tzinfo=UTC))
+    confirmed_to(path, ("cath-service",), datetime(2026, 9, 1, 6, 30, tzinfo=UTC))
+    retired = SourceCoverage(
+        organization="hmcts",
+        repository="retired-service",
+        source=EvidenceSource.PULL_REQUEST,
+        query_hash="superseded",
+        starts_at=datetime(2026, 4, 1, tzinfo=UTC),
+        ends_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    cache_pull_request_facts(path, retired, (), complete=True)
+    confirm_collection_coverage(
+        path,
+        "hmcts",
+        ("retired-service",),
+        {EvidenceSource.PULL_REQUEST: "superseded"},
+        datetime(2026, 5, 1, 6, 30, tzinfo=UTC),
+    )
+    with closing(connect(path)) as connection:
+        connection.execute(
+            "UPDATE source_coverage SET accessed_at = ? WHERE query_hash = 'superseded'",
+            (datetime(2026, 5, 1, tzinfo=UTC).isoformat(),),
+        )
+        connection.commit()
+
+    assert prune_cache(path, datetime(2026, 6, 1, tzinfo=UTC)) == 1
+
+    with closing(connect(path)) as connection:
+        assert connection.execute("SELECT repository, query_hash FROM confirmed_coverage").fetchall() == [
+            ("cath-service", "testhash"),
+        ]
 
 
 def test_prune_cache_translates_sqlite_failures(tmp_path: Path) -> None:

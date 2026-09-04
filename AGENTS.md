@@ -62,6 +62,9 @@ webpack builder before Next 16 tolerated.
 - Give every function and method a concise docstring. Comments explain only non-obvious reasons or constraints.
 - Test with pytest using fixtures and meaningful edge cases. Keep tests mirrored to the source layout.
 - Follow DRY and SOLID without introducing abstractions that do not remove real complexity.
+- `storage.py` is SQLite today and moves to PostgreSQL later, so write portable SQL: `INSERT ... ON CONFLICT ... DO
+  UPDATE` rather than SQLite's own `INSERT OR REPLACE`, and no unbounded `IN (...)` list — filter a repository set in
+  Python, since the estate runs to thousands of names.
 
 In `ui/`, the same rules in TypeScript, plus:
 

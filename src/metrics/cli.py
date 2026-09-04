@@ -32,6 +32,7 @@ from metrics.domain import (
     OpenPullRequestReport,
     PracticeEvidenceReport,
     ReportingWindow,
+    RepositoryInventory,
     SonarProjectMapping,
     StoredSonarMapping,
     TrendReport,
@@ -42,6 +43,7 @@ from metrics.evidence import (
     cached_repository_evidence,
     collected_repository_evidence,
     collected_through,
+    confirm_collection,
     metric_summaries,
     open_pull_request_report,
     practice_report,
@@ -197,6 +199,14 @@ def parse_arguments() -> Namespace:
     collect = commands.add_parser("collect", help="collect repository inventory")
     add_configuration_argument(collect)
     add_window_arguments(collect)
+    # Only `collect` takes it, because only `collect` confirms: `evidence --refresh` and a collecting
+    # `trend` write coverage as they work and have never moved the anchor, so there is nothing on
+    # either of them for a flag to hold.
+    collect.add_argument(
+        "--hold-anchor",
+        action="store_true",
+        help="collect and store as usual, but leave the reported window where the last completed run left it",
+    )
     prune = commands.add_parser("prune", help="delete cached intervals that have not been used recently")
     add_configuration_argument(prune)
     prune.add_argument("--days", type=int, default=30, help="delete cached intervals unused for this many days")
@@ -271,11 +281,13 @@ def requested_window(configuration: Configuration, options: Namespace, reference
 def offline_anchor(configuration: Configuration, reference: datetime) -> datetime:
     """Resolve the midnight a run reporting from the caches ends its window at, and say where it is.
 
-    THE LAST COLLECTION'S EDGE RATHER THAN TODAY'S MIDNIGHT: a collection records coverage only up to
-    the stable edge of the run that wrote it, so the day after one, every repository is short of
-    coverage by the right-hand edge alone and a window ending at today's midnight reports the whole
-    cohort as unavailable. Ending where the caches end means the same command run the day after a
-    collection prints the same figures it printed the day the collection landed.
+    THE LAST COMPLETED COLLECTION'S CONFIRMED EDGE RATHER THAN TODAY'S MIDNIGHT: a collection records
+    coverage only up to the stable edge of the run that wrote it, so the day after one, every
+    repository is short of coverage by the right-hand edge alone and a window ending at today's
+    midnight reports the whole cohort as unavailable. Ending at the confirmed edge means the same
+    command run the day after a collection prints the same figures it printed the day the collection
+    landed — and, because only a finished run confirms, prints them unchanged throughout the next
+    collection rather than blanking the estate the moment one starts.
 
     `collect` and `evidence --refresh` do not come through here: they are the runs that reach GitHub,
     and an anchor behind now would ask them to collect less than they can.
@@ -296,15 +308,22 @@ def offline_anchor(configuration: Configuration, reference: datetime) -> datetim
 
 
 def report_anchored_at(anchor: datetime, reference: datetime) -> None:
-    """Say a report ends where the caches end rather than at today's midnight.
+    """Say a report ends at the edge the last completed collection confirmed, not at today's midnight.
 
     Called only where the anchor IS the end of what was reported: `--to` names its own end, and
     saying the caches decided it would be a plain untruth. Said at all because the window a report
     carries is otherwise the only clue that its figures are as at a collection rather than as at
     today — and on a run redirected to a file, not even that is on the terminal.
+
+    The CONFIRMED edge rather than "the midnight the caches cover to", because those are not the same
+    instant: after `collect --hold-anchor`, and while a `collect` is in flight, the caches cover past
+    the anchor this line names.
     """
     if anchor < midnight(reference):
-        logging.info("Reporting to %s, the midnight the caches cover to, rather than to today's", f"{anchor:%Y-%m-%d}")
+        logging.info(
+            "Reporting to %s, the midnight the last completed collection confirmed, rather than to today's",
+            f"{anchor:%Y-%m-%d}",
+        )
 
 
 def unusable_request(configured: tuple[str, ...], options: Namespace) -> str | None:
@@ -663,6 +682,60 @@ def log_call_summary(outcomes: Mapping[CallOutcome, int], repositories: int) -> 
     )
 
 
+def anchor_collected_estate(
+    configuration: Configuration,
+    inventory: RepositoryInventory,
+    options: Namespace,
+    reference: datetime,
+) -> None:
+    """Confirm what the finished run covers, unless it was told to leave the anchor where it is.
+
+    Called at the END of a collection, after everything it collected is stored, because a
+    confirmation is the one thing that tells a finished run from a run still going. It is inside the
+    run's `try` rather than its `finally` for the same reason: a run that dies part way, or that
+    could not store what it fetched, confirms nothing and the reported window stays where the last
+    completed run left it.
+
+    Every configured repository is confirmed, including the ones that failed. What each one gets is
+    its own ACTUAL cached edge — see `confirm_collection_coverage` — so a repository this run never
+    reached re-confirms the edge it already had, and a run whose repositories mostly refused cannot
+    carry the estate's anchor forward on their behalf.
+
+    BOTH SPELLINGS OF EVERY NAME ARE CONFIRMED, the configured one and the one GitHub answered with.
+    The window phase writes `source_coverage` under GitHub's name, which is what a repository
+    renamed or recased since `hmcts.yml` was written is followed by, so confirming the configured
+    spelling alone would leave that repository's coverage unconfirmed for ever — voting live in the
+    anchor's mode on every run in flight, which is the one vote this table exists to freeze. The
+    configured name is kept as well because a repository whose collection FAILED has no inventory
+    item to take GitHub's name from, and its old edge still needs re-confirming.
+
+    `--hold-anchor` skips the confirmation alone: the run still collects and still stores, so an
+    ad-hoc collection over part of the estate leaves the dashboard reporting the window it was
+    already reporting. The line is logged either way, because where the anchor ended up is worth
+    saying out loud on a run that held it as much as on one that moved it.
+    """
+    if not options.hold_anchor:
+        collected = configured_repositories(configuration) + tuple(
+            item.repository.name for item in inventory.repositories
+        )
+        confirm_collection(configuration, collected, reference)
+    edge = collected_through(configuration)
+    if edge is None:
+        # Its own line rather than "confirmed to nothing yet": the run that gets here is the one
+        # whose repositories all refused, and there is nothing for it to have confirmed.
+        logging.info("The caches hold no coverage for offline reports to anchor at")
+    elif options.hold_anchor:
+        logging.info(
+            "Held the reporting anchor at %s, the edge the last completed collection confirmed",
+            f"{edge:%Y-%m-%dT%H:%MZ}",
+        )
+    else:
+        logging.info(
+            "Confirmed this run's collection coverage; offline reports now anchor at %s",
+            f"{edge:%Y-%m-%dT%H:%MZ}",
+        )
+
+
 def collect_evidence(configuration: Configuration, options: Namespace) -> int:
     """Fill the cache for one collection window and report what was fetched or reused.
 
@@ -674,6 +747,10 @@ def collect_evidence(configuration: Configuration, options: Namespace) -> int:
     latest-only state it replaces. That is the only way a past open count is ever reportable —
     GitHub answers for now and nothing else — so the alert series a trend shows holds exactly the
     instants at which a collection actually ran, and a missed run is a permanent gap in it.
+
+    A run that reaches its end also confirms what the estate is covered to, which is what moves the
+    window every offline report anchors at: `anchor_collected_estate` holds that rule, including what
+    `--hold-anchor` does to it.
     """
     reference = datetime.now(UTC)
     try:
@@ -704,6 +781,7 @@ def collect_evidence(configuration: Configuration, options: Namespace) -> int:
             )
             record_repository_state(configuration.database, inventory)
             appended = record_alert_observations(observation_database(configuration.database), inventory)
+            anchor_collected_estate(configuration, inventory, options, reference)
         except StorageError as exception:
             logging.error("Storage failed: %s", exception)
             return 1

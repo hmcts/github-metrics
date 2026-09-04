@@ -7,6 +7,7 @@ in the series for ever. They therefore live in a second SQLite file beside the c
 "delete the cache" stays a safe operation. See architecture.md, "Storage rule".
 """
 
+from collections.abc import Iterable, Mapping
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -102,6 +103,15 @@ def initialize(connection: Connection) -> None:
             accessed_at TEXT NOT NULL,
             PRIMARY KEY (organization, repository, source, query_hash, starts_at),
             CHECK (ends_at > starts_at)
+        );
+        CREATE TABLE IF NOT EXISTS confirmed_coverage (
+            organization TEXT NOT NULL,
+            repository TEXT NOT NULL,
+            source TEXT NOT NULL,
+            query_hash TEXT NOT NULL,
+            ends_at TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL,
+            PRIMARY KEY (organization, repository, source, query_hash)
         );
         CREATE TABLE IF NOT EXISTS pull_request_facts (
             organization TEXT NOT NULL,
@@ -351,47 +361,169 @@ def find_missing_cached_coverage(
         raise StorageError(message) from exception
 
 
+def confirm_collection_coverage(
+    path: Path,
+    organization: str,
+    repositories: Iterable[str],
+    signatures: Mapping[EvidenceSource, str],
+    confirmed_at: datetime,
+) -> None:
+    """Snapshot the coverage edge each named repository holds, as one finished run's confirmation.
+
+    CALLED AT THE END OF A RUN, NEVER AT THE START. `source_coverage` moves as a run works, so a row
+    count over it cannot tell a run that finished from one still going or one that died; a row here
+    exists only because a run reached its end. `prevailing_cached_coverage` takes the estate's anchor
+    over this table for that reason, so starting a collection moves nothing.
+
+    IT COPIES EACH REPOSITORY'S ACTUAL CACHED EDGE, NOT THE WINDOW THE RUN ASKED FOR. A run whose
+    repository failed — rate-limited, permission denied, or never reached before an ad-hoc run was
+    scoped away from it — leaves that repository's `source_coverage` where it was, so this
+    re-confirms the OLD edge and the repository stays behind the anchor rather than being vouched
+    for at an instant nothing was collected to. A run therefore cannot carry the estate's anchor
+    forward on behalf of a repository it did not actually collect.
+
+    A named repository with no coverage rows at all contributes nothing: `MAX(ends_at)` is grouped,
+    so a repository the cache has never held is absent from the result rather than present with a
+    null edge. Repositories are filtered in Python, not through an `IN (...)` list, because the
+    estate runs to thousands of names and the cache moves to PostgreSQL later.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        named = set(repositories)
+        stamp = confirmed_at.astimezone(UTC).isoformat()
+        with closing(connect(path)) as connection, connection:
+            prepare(connection)
+            rows = [
+                (organization, repository, source.value, query_hash, edge, stamp)
+                for source, query_hash in signatures.items()
+                for repository, edge in connection.execute(
+                    """
+                    SELECT repository, MAX(ends_at)
+                    FROM source_coverage
+                    WHERE organization = ? AND source = ? AND query_hash = ?
+                    GROUP BY repository
+                    """,
+                    (organization, source.value, query_hash),
+                ).fetchall()
+                if repository in named
+            ]
+            # `ON CONFLICT ... DO UPDATE` rather than `INSERT OR REPLACE`, which is SQLite's own
+            # spelling and not standard SQL — the cache moves to PostgreSQL later. One transaction,
+            # so a reporting read sees one run's confirmation whole or not at all.
+            connection.executemany(
+                """
+                INSERT INTO confirmed_coverage (organization, repository, source, query_hash, ends_at, confirmed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (organization, repository, source, query_hash)
+                DO UPDATE SET ends_at = excluded.ends_at, confirmed_at = excluded.confirmed_at
+                """,
+                rows,
+            )
+    except (Error, OSError) as exception:
+        message = f"could not update collection cache: {exception}"
+        raise StorageError(message) from exception
+
+
+PREVAILING_EDGE = """
+    SELECT COALESCE(confirmed.ends_at, live.edge)
+    FROM (
+        SELECT repository, MAX(ends_at) AS edge
+        FROM source_coverage
+        WHERE organization = ? AND source = ? AND query_hash = ?
+        GROUP BY repository
+    ) AS live
+    LEFT JOIN confirmed_coverage AS confirmed
+        ON confirmed.organization = ?
+       AND confirmed.source = ?
+       AND confirmed.query_hash = ?
+       AND confirmed.repository = live.repository
+    GROUP BY COALESCE(confirmed.ends_at, live.edge)
+    ORDER BY COUNT(*) DESC, COALESCE(confirmed.ends_at, live.edge) DESC
+    LIMIT 1
+"""
+"""The modal edge over one row per covered repository: its confirmed edge, or its live one if none.
+
+EVERY COVERED REPOSITORY GETS A VOTE, AND THE FALLBACK IS PER REPOSITORY RATHER THAN PER SIGNATURE.
+The confirmation is preferred wherever there is one, so a run in flight moves nothing; a repository
+with no confirmation votes with the edge its own coverage reaches, so the estate still has an anchor
+before any run has finished. Reading the whole table for the fallback instead — preferring
+confirmations only once the signature has any at all — would let the FIRST run to finish be the
+entire electorate: one repository of a thousand confirmed at a new edge would be 100% of the
+confirmed rows and would carry the anchor there, taking the other 999 out of every span. That is the
+whole-estate blanking this anchor exists to stop, and the cache in service when this shipped holds
+exactly that state.
+
+The fallback covers two cases and self-heals out of both, repository by repository, at the first
+completed run that reaches each one. The first is a cache written before confirmations existed. The
+second is a signature whose first run has not finished, where the alternative is reporting nothing
+at all from coverage that is already there. Under a FRESH signature a repository the in-progress run
+has not reached yet has no coverage row, so it has nothing to report at any anchor and no vote.
+
+`live` is the driving side, so a confirmation whose coverage has gone stops voting. `prune_cache`
+deletes those together anyway; this makes the surviving-coverage rule the query's own.
+
+The inner `GROUP BY` is what `confirmed_coverage` does not need: `source_coverage` holds an interval
+per repository per run, so a repository's own edge is the latest of them. Stored text rather than
+parsed instants throughout, because `record_source_coverage` normalises every instant to a UTC
+`isoformat()`, so the text is fixed-width through the seconds and both `MAX` and the `ORDER BY` sort
+chronologically.
+"""
+
+
 def prevailing_cached_coverage(
     path: Path,
     organization: str,
     source: EvidenceSource,
     query_hash: str,
 ) -> datetime | None:
-    """Return the instant most of one organisation's cached coverage reaches, or `None` for none.
+    """Return the instant most of one organisation's confirmed coverage reaches, or `None` for none.
 
-    The anchor an offline report ends its windows at. `fill_cached_source` records coverage up to the
-    stable edge of the run that wrote it, so a repository's own edge is the edge of the last run that
-    reached it, and `None` here means nothing has been collected under this signature at all.
+    The anchor an offline report ends its windows at. THE EDGE THE LAST COMPLETED RUN CONFIRMED, over
+    `confirmed_coverage` rather than over live `source_coverage`, so that only a run which reached its
+    end moves it. ONCE A REPOSITORY IS CONFIRMED, an in-progress `collect` moves its vote nothing, and
+    neither does a `collect` that dies part way, `evidence --refresh --repository x`, or a collecting
+    `trend`: all four write `source_coverage` as they work, and none of them writes a confirmation.
+    Where the confirmation is missing the fallback below votes live instead, and those four do move
+    the anchor once the rows they re-stamp are the majority — the residual is stated there. `None`
+    means the cache holds no coverage at all under this signature.
 
     THE EDGE MOST REPOSITORIES ARE AT, NOT THE GREATEST ONE ANY OF THEM REACHED, and not the edge
     every one of them shares. Both extremes blank the estate from one repository:
       - The edge every repository shares hands the window to the worst straggler — one repository
         missed for a month would drag a thousand others' window back a month to hide one gap.
-      - The greatest edge hands it to whichever repository ran last on its own. `evidence --refresh
-        --repository x`, a collecting `metrics trend`, or a `collect` that died part-way records
-        coverage to TODAY'S midnight for the repositories it touched, and an anchor there leaves
-        every repository the run did not reach short of coverage by that day alone — the whole-estate
-        `unavailable` this anchor exists to stop.
-    The modal edge is the one the last WHOLE run left behind, so neither a straggler nor a MINORITY
-    of repositories collected ahead of the rest moves it. A `collect` that dies past HALFWAY does
-    move it, and the repositories it never reached then report as unavailable — the residual case,
-    accepted knowingly, because a row count cannot tell a finished run from a majority of one. A
-    repository BEHIND the edge reports as unavailable at the window, which is the existing meaning of
-    that field and the honest answer; one AHEAD of it still reports, because
-    `record_source_coverage` coalesces its newer interval into the stored one, so its coverage spans
-    the anchor and no gap is found there.
+      - The greatest edge hands it to whichever repository was collected last on its own, leaving
+        every repository that run did not reach short of coverage by that day alone — the
+        whole-estate `unavailable` this anchor exists to stop.
+    `confirm_collection_coverage` writes one row per repository, holding the edge that repository is
+    ACTUALLY covered to, so a run that failed on a repository re-confirms that repository's old edge
+    and the mode stays where the estate is. A repository BEHIND the edge reports as unavailable at
+    the window, which is the existing meaning of that field and the honest answer; one AHEAD of it
+    still reports, because `record_source_coverage` coalesces its newer interval into the stored one,
+    so its coverage spans the anchor and no gap is found there. A run over a SUBSET of the estate
+    that finishes still confirms only what it collected, so it carries the mode forward only when its
+    subset is the majority of the covered estate — which `--hold-anchor` is there to prevent.
+
+    ONE VOTE PER COVERED REPOSITORY, whether or not a run has confirmed it: `PREVAILING_EDGE` falls
+    back to a repository's own live edge only for a repository with no confirmation, so that the
+    first run to finish cannot be the whole electorate — see there for why that matters. A repository
+    with no coverage at all has nothing to report at any anchor and no vote. THE RESIDUAL IS THAT AN
+    UNCONFIRMED MAJORITY VOTES LIVE: while the repositories a run covers hold no confirmation nothing
+    records where they were, so re-stamping the majority of the covered estate carries the anchor
+    forward on the run's own live rows — as the run works, on a run that dies past halfway, and under
+    `--hold-anchor` alike. That is the state of the cache in service when this shipped, and it
+    self-heals repository by repository at the first completed run that reaches each one.
 
     The count is over whatever rows the cache holds, INCLUDING repositories no longer configured,
-    whose coverage survives until `prune_cache` removes it. A de-configured cohort larger than the
-    configured one would therefore win the mode with its older edge.
+    whose coverage and confirmations survive until `prune_cache` removes them. A de-configured cohort
+    larger than the configured one would therefore win the mode with its older edge.
 
     TIES GO TO THE LATER EDGE: with no edge in the majority there is nothing to tell a cohort moving
     forward from one lagging behind, so the answer stays what it was before the mode was counted.
 
-    `query_hash` IS PART OF THE FILTER because `source_coverage` accumulates superseded signatures —
-    the working cache holds seven pull-request signatures and two commit ones from older builds.
-    Their rows are not coverage this build can report from, and one of them reaching further ahead
-    would set an anchor nothing current covers.
+    `query_hash` IS PART OF THE FILTER because both tables accumulate superseded signatures — the
+    working cache holds seven pull-request signatures and two commit ones from older builds. Their
+    rows are not coverage this build can report from, and one of them reaching further ahead would
+    set an anchor nothing current covers.
 
     `accessed_at` is left alone: reading the edge is not a use of any interval, and stamping it here
     would keep dead signatures alive against `prune_cache` for ever. A cache that is not there yet is
@@ -404,30 +536,14 @@ def prevailing_cached_coverage(
     try:
         with closing(connect(path)) as connection, connection:
             prepare(connection)
-            # Comparing stored text rather than parsed instants: `record_source_coverage` normalises
-            # every instant to a UTC `isoformat()`, so the text is fixed-width through the seconds
-            # and both MAX and the ORDER BY sort chronologically.
-            row = connection.execute(
-                """
-                SELECT edge
-                FROM (
-                    SELECT MAX(ends_at) AS edge
-                    FROM source_coverage
-                    WHERE organization = ? AND source = ? AND query_hash = ?
-                    GROUP BY repository
-                )
-                GROUP BY edge
-                ORDER BY COUNT(*) DESC, edge DESC
-                LIMIT 1
-                """,
-                (organization, source.value, query_hash),
-            ).fetchone()
+            parameters = (organization, source.value, query_hash)
+            row = connection.execute(PREVAILING_EDGE, parameters + parameters).fetchone()
             # Grouped, so no matching row is no row at all rather than one row holding NULL. The
             # parse sits inside the guard with the query: a row this build cannot READ and a row it
             # cannot PARSE are the same failure to every caller, each of which degrades a
             # `StorageError` to "nothing collected", while a bare `ValueError` escaping from here
             # would take down the service's warm-up and every offline command with it.
-            return None if row is None else datetime.fromisoformat(row[0])
+            return None if row is None else datetime.fromisoformat(str(row[0]))
     except (Error, OSError, ValueError) as exception:
         message = f"could not read collection cache: {exception}"
         raise StorageError(message) from exception
@@ -494,7 +610,16 @@ def load_cached_direct_commit_facts(path: Path, coverage: SourceCoverage) -> tup
 
 
 def prune_cache(path: Path, unused_since: datetime) -> int:
-    """Delete cached intervals unused since an instant, and any facts they left behind."""
+    """Delete cached intervals unused since an instant, and any facts and confirmations they leave.
+
+    A confirmation outlives the coverage it vouched for unless it is cleared here, and
+    `prevailing_cached_coverage` counts every row it finds — so a retired query signature or a
+    de-configured repository would go on voting for its old edge, and a cohort of them larger than
+    the live estate would win the mode. Confirmations go with their coverage for that reason.
+
+    The COUNT IS OF INTERVALS ONLY, which is what `prune --days N` reports to the operator: facts and
+    confirmations are consequences of an interval going, not separate things pruned.
+    """
     try:
         with closing(connect(path)) as connection, connection:
             prepare(connection)
@@ -502,6 +627,18 @@ def prune_cache(path: Path, unused_since: datetime) -> int:
                 "DELETE FROM source_coverage WHERE accessed_at < ?",
                 (unused_since.astimezone(UTC).isoformat(),),
             ).rowcount
+            connection.execute(
+                """
+                DELETE FROM confirmed_coverage
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM source_coverage
+                    WHERE source_coverage.organization = confirmed_coverage.organization
+                      AND source_coverage.repository = confirmed_coverage.repository
+                      AND source_coverage.source = confirmed_coverage.source
+                      AND source_coverage.query_hash = confirmed_coverage.query_hash
+                )
+                """,
+            )
             for table in ("pull_request_facts", "direct_commit_facts"):
                 connection.execute(
                     # The table name is not user input: it comes from this literal tuple of fact tables.

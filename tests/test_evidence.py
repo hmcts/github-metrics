@@ -91,6 +91,7 @@ from metrics.evidence import (
     cohort_summary,
     collected_repository_evidence,
     collected_through,
+    confirm_collection,
     maintenance_windows,
     metric_summaries,
     offline_practice_report,
@@ -1648,6 +1649,30 @@ def test_collected_through_ignores_a_superseded_signature(tmp_path: Path) -> Non
     )
 
     assert collected_through(settings) == datetime(2026, 8, 8, tzinfo=UTC)
+
+
+def test_collected_through_anchors_at_what_a_finished_run_confirmed(tmp_path: Path) -> None:
+    """Move the reported anchor when a run confirms, and leave it alone while one is in flight.
+
+    `confirm_collection` resolves the live signature of each source, so the rows it writes are the
+    rows `collected_through` counts. Until it runs, the coverage a collection has already written is
+    just a run in progress and the anchor stays where the last completed run left it.
+    """
+    settings = configuration(tmp_path)
+    cache_pull_request_facts(settings.database, pull_request_coverage(window(7)), (), complete=True)
+    cache_direct_commit_facts(settings.database, commit_coverage(window(7)), (), complete=True)
+    confirm_collection(settings, ("cath-service",), datetime(2026, 8, 8, 6, 30, tzinfo=UTC))
+    later = {"ends_at": datetime(2026, 9, 1, tzinfo=UTC)}
+    cache_pull_request_facts(
+        settings.database, pull_request_coverage(window(7)).model_copy(update=later), (), complete=True
+    )
+    cache_direct_commit_facts(settings.database, commit_coverage(window(7)).model_copy(update=later), (), complete=True)
+
+    assert collected_through(settings) == datetime(2026, 8, 8, tzinfo=UTC)
+
+    confirm_collection(settings, ("cath-service",), datetime(2026, 9, 1, 6, 30, tzinfo=UTC))
+
+    assert collected_through(settings) == datetime(2026, 9, 1, tzinfo=UTC)
 
 
 def test_collected_through_reports_an_unreadable_cache_as_nothing_collected(

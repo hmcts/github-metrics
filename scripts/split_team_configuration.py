@@ -19,6 +19,20 @@ REPORT AGAINST THE UNSPLIT FILE, as the last line above does. A part is a work l
 collection and not a cohort: reporting one would describe 400 repositories as though they were the
 organisation, and every team total would be taken over whichever teams that part happens to hold.
 
+RUN THE PARTS BACK TO BACK, IN ORDER, AND WITHOUT `--hold-anchor`. A part run that finishes confirms
+coverage for its own repositories only, and the estate's reporting anchor is the edge most of it is
+confirmed to — so the anchor steps forward part way through the sequence, once the parts already
+collected are the majority, and the repositories in the parts still to run report as `unavailable` at
+every span until theirs lands. The gap is the time between those two runs, which is why the sequence
+should be tight; there is no option that avoids it, because nothing confirms an estate it did not
+collect.
+
+NOT `--hold-anchor` HERE, despite the temptation. It is for an ad-hoc run over a handful of
+repositories. Holding a part leaves that part's repositories on the confirmations they already had,
+so holding most of the estate freezes the anchor for good: the final part's 400 confirmations cannot
+outvote the 1463 the held runs left behind, and the next cycle cannot either. `docs/architecture.md`
+has the ruling.
+
 WHAT A PART HOLDS. Whole teams, in the order the source file lists them, packed up to `--size`
 repositories. A team larger than `--size` on its own is sliced across consecutive parts, keeping its
 identifier and display name on each slice; nothing else is ever divided, so a part boundary falls
@@ -181,6 +195,30 @@ def part_document(document: Mapping[str, Any], part: Part) -> dict[str, Any]:
     return narrowed
 
 
+def anchor_note(total: int) -> tuple[str, ...]:
+    """Say to run the parts back to back and to keep `--hold-anchor` off them, or nothing for one part.
+
+    The estate's reporting anchor is the edge most of it is confirmed to, and a part confirms its own
+    repositories only — so the anchor steps forward once the parts already collected are the
+    majority, and the parts still to run report as `unavailable` until theirs lands. `--hold-anchor`
+    makes that worse rather than better: held repositories keep the confirmations they had, so
+    holding most of the estate leaves the anchor where it is for good.
+
+    A SINGLE PART GETS NO NOTE. It is the whole cohort, collected by one run, so the sequence the
+    note is about does not exist.
+    """
+    if total == 1:
+        return ()
+    return (
+        "# RUN THE PARTS BACK TO BACK AND WITHOUT --hold-anchor. A part confirms its own repositories",
+        "# only, so the reporting anchor steps forward once the parts collected so far are the",
+        "# majority, and the parts still to run report as unavailable at every span until theirs",
+        "# lands. Holding a part instead freezes the anchor: held repositories keep the confirmations",
+        "# they already had. docs/architecture.md has the ruling.",
+        "#",
+    )
+
+
 def header(source: Path, part: Part, position: int, total: int) -> str:
     """Write the comment block at the top of one part, saying what it holds and how to run it."""
     teams = len(part.teams)
@@ -193,6 +231,7 @@ def header(source: Path, part: Part, position: int, total: int) -> str:
             "#",
             f"#   uv run metrics collect --config config.yml --config {part.path.name} --from DATE --to DATE",
             "#",
+            *anchor_note(total),
             f"# Report against {source.name} and not against a part: the caches these runs fill are keyed",
             "# by repository, so the whole cohort reads back from them once every part is collected.",
             "#",

@@ -50,7 +50,7 @@ from metrics.domain import (
     StoredSonarMapping,
     WindowProvenance,
 )
-from metrics.evidence import RepositoryEvidence
+from metrics.evidence import RepositoryEvidence, collected_through, confirm_collection
 from metrics.storage import (
     StorageError,
     cache_direct_commit_facts,
@@ -827,8 +827,10 @@ def test_collect_exits_incomplete_when_one_repository_of_three_could_not_be_read
 def test_collect_exits_one_and_still_says_why_when_nothing_could_be_collected(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Separate nothing-collected from partly-collected, and report the reasons either way."""
+    caplog.set_level(logging.INFO)
     configuration_path = population_configuration_path(tmp_path)
     with (
         patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
@@ -845,6 +847,392 @@ def test_collect_exits_one_and_still_says_why_when_nothing_could_be_collected(
     assert output["status"] == "failed"
     assert output["repositories"] == []
     assert len(output["failures"]) == 3
+    # The run reached its end, so it confirmed — over an estate covered to nothing, which is what it
+    # says rather than claiming to have confirmed coverage to "nothing yet".
+    assert "The caches hold no coverage for offline reports to anchor at" in caplog.text
+
+
+LAST_CONFIRMED_EDGE = datetime(2026, 8, 30, tzinfo=UTC)
+"""The edge the last completed run confirmed, five days before `COLLECTION_INSTANT`'s midnight."""
+
+COLLECTED_TO = COLLECTION_INSTANT - timedelta(hours=6)
+"""The edge a collection at `COLLECTION_INSTANT` records coverage to.
+
+Not that midnight: only the stable side of a window records coverage, and the stable side stops at
+`mutable_edge` — six configured hours back from the instant the run started.
+"""
+
+
+def confirmed_collection(configuration_path: Path, edge: datetime, *repositories: str) -> None:
+    """Leave behind the coverage AND the confirmation a completed collection would have written.
+
+    `record_collection` alone is a run in progress as far as the anchor is concerned, so a test about
+    where a finished run leaves the anchor has to leave a finished run's confirmation behind too.
+    """
+    record_collection(configuration_path, edge, *repositories)
+    confirm_collection(load_configuration(configuration_path), repositories, edge)
+
+
+def adhoc_configuration_path(tmp_path: Path) -> Path:
+    """Configure one repository of `population_configuration_path`'s three, as an ad-hoc run does."""
+    path = tmp_path / "adhoc.yaml"
+    path.write_text(
+        """\
+version: 1
+organization: hmcts
+database: metrics.sqlite3
+teams:
+  - identifier: divorce
+    display_name: Divorce
+    repositories:
+      - nfdiv-case-api
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def reported_anchor(configuration_path: Path) -> datetime | None:
+    """Read the instant every offline report would anchor its window at, as the dashboard reads it."""
+    return collected_through(load_configuration(configuration_path))
+
+
+def cached_edge(configuration_path: Path) -> datetime:
+    """Read how far the live coverage rows reach, whatever any run has confirmed about them."""
+    with closing(connect(configuration_path.parent / "metrics.sqlite3")) as connection:
+        edge = connection.execute("SELECT MAX(ends_at) FROM source_coverage").fetchone()[0]
+    return datetime.fromisoformat(str(edge))
+
+
+def test_a_completed_collection_moves_the_reported_anchor_to_what_it_confirmed(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    frozen_collection_clock: None,
+) -> None:
+    """Carry the anchor forward when the run reaches its end, and say where it landed."""
+    caplog.set_level(logging.INFO)
+    confirmed_collection(configuration_path, LAST_CONFIRMED_EDGE, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert reported_anchor(configuration_path) == COLLECTED_TO
+    assert f"offline reports now anchor at {COLLECTED_TO:%Y-%m-%dT%H:%MZ}" in caplog.text
+
+
+def test_a_repository_renamed_since_the_configuration_was_written_is_still_confirmed(
+    configuration_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Confirm the name GitHub answered with as well as the one the configuration file holds.
+
+    The window phase writes coverage under GitHub's name, which is how a repository renamed or
+    recased since `hmcts.yml` was written is followed. Confirming the configured spelling alone
+    would leave that repository's coverage unconfirmed for ever, voting live on every run in flight
+    — the one vote the confirmation exists to freeze.
+    """
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("NFDiv-Case-API")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert reported_anchor(configuration_path) == COLLECTED_TO
+    # A run in flight re-stamps the coverage rows under GitHub's name a day on. The confirmation the
+    # finished run left against THAT name is what holds the reported window where it was.
+    record_collection(configuration_path, COLLECTED_TO + timedelta(days=1), "NFDiv-Case-API")
+    assert cached_edge(configuration_path) == COLLECTED_TO + timedelta(days=1)
+    assert reported_anchor(configuration_path) == COLLECTED_TO
+
+
+def test_hold_anchor_collects_and_stores_but_leaves_the_reported_window_where_it_was(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    frozen_collection_clock: None,
+) -> None:
+    """Skip the confirmation alone, so an ad-hoc top-up cannot move what the dashboard reports.
+
+    Everything else the run does it still does: the report is written, and the coverage it fetched is
+    in the cache for the next completed run to confirm.
+    """
+    caplog.set_level(logging.INFO)
+    confirmed_collection(configuration_path, LAST_CONFIRMED_EDGE, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path), "--hold-anchor"]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+    assert cached_edge(configuration_path) == COLLECTED_TO
+    assert json.loads(capsys.readouterr().out)["repositories"][0]["repository"]["name"] == "nfdiv-case-api"
+    assert f"Held the reporting anchor at {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
+
+
+def test_a_collection_that_dies_part_way_leaves_the_reported_anchor_where_it_was(
+    configuration_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Confirm nothing when the run does not reach its end, however much coverage it wrote first.
+
+    The confirmation is inside the run's `try` rather than its `finally` for exactly this: a run
+    killed at the terminal has moved `source_coverage` for the repositories it got through, and
+    confirming that would anchor the estate at an edge most of it was never collected to.
+    """
+    confirmed_collection(configuration_path, LAST_CONFIRMED_EDGE, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+        patch("metrics.cli.record_repository_state", side_effect=KeyboardInterrupt),
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        with pytest.raises(KeyboardInterrupt):
+            main()
+
+    assert cached_edge(configuration_path) == COLLECTED_TO
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+
+
+def test_a_collection_whose_repositories_mostly_failed_does_not_carry_the_anchor_forward(
+    tmp_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Re-confirm a refused repository's old edge, so the mode stays where the estate really is.
+
+    The run finishes, so it confirms; what it confirms for the two repositories GitHub refused is
+    the edge they already had, because that is all they are covered to.
+    """
+    configuration_path = population_configuration_path(tmp_path)
+    confirmed_collection(
+        configuration_path,
+        LAST_CONFIRMED_EDGE,
+        "nfdiv-case-api",
+        "opal-common-lib",
+        "opal-logging-service",
+    )
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = [
+            *collectable_repository_responses("nfdiv-case-api"),
+            inaccessible_repository_response(),
+            inaccessible_repository_response(),
+        ]
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == INCOMPLETE_RUN
+
+    assert cached_edge(configuration_path) == COLLECTED_TO
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+
+
+def test_a_completed_collection_over_part_of_the_estate_leaves_the_estate_s_anchor_alone(
+    tmp_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Confirm only the repositories the run was configured for, so a subset cannot win the mode.
+
+    The ad-hoc run against one repository of three is the case that made the anchor unusable before
+    confirmations: it is a whole, successful run, and what keeps the estate's window still is that it
+    vouches for its own repository and for nothing else.
+    """
+    configuration_path = population_configuration_path(tmp_path)
+    confirmed_collection(
+        configuration_path,
+        LAST_CONFIRMED_EDGE,
+        "nfdiv-case-api",
+        "opal-common-lib",
+        "opal-logging-service",
+    )
+    adhoc = adhoc_configuration_path(tmp_path)
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(adhoc)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert cached_edge(configuration_path) == COLLECTED_TO
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+
+
+def test_hold_anchor_holds_on_a_cache_no_run_has_confirmed_yet(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    frozen_collection_clock: None,
+) -> None:
+    """Hold the window on the cache in service when confirmations shipped: coverage and no rows here.
+
+    `record_collection` alone is that cache. The flag has to work on it and not only once a full run
+    has confirmed the estate, because the first thing an operator does after a deploy is an ad-hoc
+    run. What holds the window is that the two repositories this run leaves alone vote with their own
+    live edge, so the one it moves is outvoted.
+    """
+    caplog.set_level(logging.INFO)
+    configuration_path = population_configuration_path(tmp_path)
+    record_collection(
+        configuration_path,
+        LAST_CONFIRMED_EDGE,
+        "nfdiv-case-api",
+        "opal-common-lib",
+        "opal-logging-service",
+    )
+    adhoc = adhoc_configuration_path(tmp_path)
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(adhoc), "--hold-anchor"]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert cached_edge(configuration_path) == COLLECTED_TO
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+    assert f"Held the reporting anchor at {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
+
+
+def test_a_completed_collection_over_most_of_the_estate_does_carry_the_anchor_forward(
+    tmp_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Move the anchor when the finished run's repositories are the majority — the accepted residual.
+
+    Documented in `docs/architecture.md` as what remains after confirmations: the mode counts
+    repositories, so a run over two of three that finishes without `--hold-anchor` carries the estate
+    forward and the third reports as unavailable until a run reaches it. `--hold-anchor` is the
+    mechanism for that case, which is why it is the operator's call and not an inference from a count.
+    """
+    configuration_path = population_configuration_path(tmp_path)
+    confirmed_collection(
+        configuration_path,
+        LAST_CONFIRMED_EDGE,
+        "nfdiv-case-api",
+        "opal-common-lib",
+        "opal-logging-service",
+    )
+    majority = tmp_path / "majority.yaml"
+    majority.write_text(
+        """\
+version: 1
+organization: hmcts
+database: metrics.sqlite3
+teams:
+  - identifier: opal
+    display_name: Opal
+    repositories:
+      - opal-common-lib
+      - opal-logging-service
+""",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(majority)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = [
+            *collectable_repository_responses("opal-common-lib"),
+            *collectable_repository_responses("opal-logging-service"),
+        ]
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 0
+
+    assert reported_anchor(configuration_path) == COLLECTED_TO
+
+
+def test_a_run_that_cannot_store_its_inventory_confirms_nothing(
+    configuration_path: Path,
+    frozen_collection_clock: None,
+) -> None:
+    """Leave the anchor alone when storing what the run collected failed.
+
+    The confirmation sits AFTER `record_repository_state` for this: a run that could not store its
+    inventory did not do what it reported doing, so it must not go on to vouch for the estate. Moving
+    the confirmation above the store would break that with no other test noticing.
+    """
+    confirmed_collection(configuration_path, LAST_CONFIRMED_EDGE, "nfdiv-case-api")
+
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+        patch("metrics.cli.record_repository_state", side_effect=StorageError("disk full")),
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 1
+
+    assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
+
+
+def test_a_confirmation_that_cannot_be_written_ends_the_run_at_one(
+    configuration_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    frozen_collection_clock: None,
+) -> None:
+    """Report a cache the confirmation cannot be written to as the storage failure it is.
+
+    A run whose confirmation was lost reported an anchor it did not move, so it exits non-zero with
+    the reason and without a report, exactly as a run that could not store its inventory does.
+    """
+    with (
+        patch("sys.argv", ["metrics", "collect", "--config", str(configuration_path)]),
+        patch.dict("os.environ", {"GH_TOKEN": "secret"}, clear=True),
+        patch("metrics.cli.Session") as session_class,
+        patch("metrics.cli.confirm_collection", side_effect=StorageError("cache is read-only")),
+    ):
+        session = session_class.return_value.__enter__.return_value
+        session.get.side_effect = collectable_repository_responses("nfdiv-case-api")
+        session.post.side_effect = empty_window_responses()
+
+        assert main() == 1
+
+    assert "Storage failed: cache is read-only" in caplog.text
+    assert capsys.readouterr().out == ""
 
 
 def pair_configuration_path(tmp_path: Path) -> Path:
@@ -3051,7 +3439,7 @@ def test_evidence_says_which_collection_its_figures_are_as_at(
 
     assert f"The last collection reaches {edge:%Y-%m-%dT00:00Z}" in caplog.text
     assert "further behind than the configured 8-day cadence" in caplog.text
-    assert f"Reporting to {edge:%Y-%m-%d}, the midnight the caches cover to" in caplog.text
+    assert f"Reporting to {edge:%Y-%m-%d}, the midnight the last completed collection confirmed" in caplog.text
 
 
 def test_a_window_given_an_explicit_end_is_not_reported_as_the_collections(
@@ -3080,7 +3468,7 @@ def test_a_window_given_an_explicit_end_is_not_reported_as_the_collections(
 
     assert json.loads(capsys.readouterr().out)["repositories"][0]["ends_at"] == "2026-06-01T00:00:00Z"
     assert "further behind than the configured 8-day cadence" in caplog.text
-    assert "the midnight the caches cover to" not in caplog.text
+    assert "the midnight the last completed collection confirmed" not in caplog.text
 
 
 def test_the_configured_cadence_is_what_the_stale_collection_warning_measures(
@@ -3129,7 +3517,7 @@ def test_evidence_reports_from_today_and_says_nothing_was_collected(
     report = json.loads(capsys.readouterr().out)
     assert report["repositories"][0]["ends_at"] == f"{midnight(datetime.now(UTC)):%Y-%m-%dT00:00:00Z}"
     assert "The last collection has not happened" in caplog.text
-    assert "the midnight the caches cover to" not in caplog.text
+    assert "the midnight the last completed collection confirmed" not in caplog.text
 
 
 @pytest.mark.parametrize(
