@@ -240,7 +240,7 @@ export default async function RepositoryPage({
 
       {hasPeriods(series) ? <TrendSection series={series} cut={windows.trend_periods} /> : null}
 
-      <Section heading="Findings" detail="in the report’s own order, never ranked by person">
+      <Section heading="Findings" detail="by rule, then alphabetical by contributor">
         {findings.length === 0 ? (
           <EmptyState message="No practice rule fired on this repository at this span." />
         ) : (

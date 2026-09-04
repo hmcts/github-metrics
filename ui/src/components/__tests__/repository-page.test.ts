@@ -454,7 +454,7 @@ describe('the repository page’s absences and lists', () => {
     expect(markup).not.toContain('Opened in window');
   });
 
-  it('draws the findings and the contributors it was sent, in the report’s own order', async () => {
+  it('draws the findings and the contributors it was sent, in the order the service sent them', async () => {
     const findings: PracticeFinding[] = [
       {
         rule: 'unreviewed-merge',

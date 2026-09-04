@@ -6,10 +6,10 @@ import { withWeeks } from '@/lib/weeks';
 /**
  * What the practice rules found in one repository's window, and the merges behind each finding.
  *
- * IN THE REPORT'S OWN ORDER, with no sortable headers. A finding names a person, so ordering the
- * table by occurrences would produce a list of people ranked by how often a rule fired on their
- * work — the personal ranking the scope boundaries exclude — and it would do it by default, before
- * anyone chose to look at it that way.
+ * ROWS ARRIVE BY RULE, THEN ALPHABETICAL BY CONTRIBUTOR, and the table keeps that order and offers
+ * no sortable headers. A finding names a person, so ordering by occurrences would produce a list of
+ * people ranked by how often a rule fired on their work: the personal ranking the scope boundaries
+ * exclude, and it would appear by default, before anyone chose to look at it that way.
  *
  * Every occurrence links to the pull request it was found in. A rule that fires on six merges is an
  * assertion until the six merges are reachable; the links are what make a finding arguable, and a
