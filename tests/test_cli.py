@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -61,6 +61,30 @@ from metrics.storage import (
     record_sonar_mapping,
 )
 from metrics.window import midnight
+
+COLLECTION_INSTANT = datetime(2026, 9, 4, 4, 0, tzinfo=UTC)
+"""The frozen instant `collect` reads its clock at under `frozen_collection_clock`.
+
+Four hours past midnight, so the instant sits INSIDE the six-hour mutable edge: `mutable_edge`
+clamps to `min(ends_at, reference - mutable_hours)`, and a window ending at midnight of the
+reference day only has an edge left to refresh while the run starts less than six hours after it.
+"""
+
+
+@pytest.fixture
+def frozen_collection_clock() -> Iterator[None]:
+    """Pin `collect`'s clock so the size of the mutable edge stops depending on the time of day.
+
+    The window ends at midnight of the day the run starts, so a real clock makes the edge
+    `reference - 6h` clamp to `ends_at` from 06:00 UTC onwards — collapsing it to nothing and
+    dropping the search and history call that refresh it. Every count these tests pin therefore
+    moved by two calls per repository at 06:00 and back at midnight, which read as an unrelated
+    flake rather than as the wall clock it was.
+    """
+    clock = MagicMock(wraps=datetime)
+    clock.now.return_value = COLLECTION_INSTANT
+    with patch("metrics.cli.datetime", clock):
+        yield
 
 
 @pytest.fixture
@@ -366,6 +390,7 @@ def test_collect_requires_credentials(configuration_path: Path, caplog: pytest.L
 def test_collect_reports_current_state_and_what_the_window_fetched(
     configuration_path: Path,
     capsys: pytest.CaptureFixture[str],
+    frozen_collection_clock: None,
 ) -> None:
     """Report current repository state and collection provenance, never a metric value."""
     with (
@@ -445,11 +470,14 @@ def test_collect_reports_current_state_and_what_the_window_fetched(
     }
     # One repository's whole run, both phases: eight current-state calls — the repository, the
     # bundled standards query, its rules, its protection, one page per alert family and the bundled
-    # open-pull-request query — and four GraphQL queries for the window — a pull-request search over
-    # the stable interval and another over the mutable edge, the commit history, and one check
-    # rollup for the single direct commit it returned.
+    # open-pull-request query — and six GraphQL queries for the window. Those six are four
+    # pull-request searches, because `date_shards` cuts the 90-day window into 30-day slices and the
+    # mutable edge is a fourth slice of its own, plus one commit-history page for the stable side and
+    # one for the edge. There is NO separate check-rollup call: `commit_history_query` reads the bare
+    # `statusCheckRollup { state }` scalar inline, which is the round trip per direct commit it was
+    # written to remove.
     assert output["costs"] == [
-        {"repository": "nfdiv-case-api", "requests": 12, "elapsed_seconds": ANY},
+        {"repository": "nfdiv-case-api", "requests": 14, "elapsed_seconds": ANY},
     ]
     assert "observations" not in json.dumps(output)
     assert datetime.fromisoformat(output["ends_at"]) - datetime.fromisoformat(output["starts_at"]) == timedelta(
@@ -946,6 +974,7 @@ def test_the_call_summary_ranks_a_graphql_refusal_with_the_refusals_it_is_one_of
 def test_collect_summarises_every_call_by_status_outcome_and_endpoint(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    frozen_collection_clock: None,
 ) -> None:
     """Total a whole run's calls into one line per kind, worst first, whatever it spent them on.
 
@@ -978,7 +1007,7 @@ def test_collect_summarises_every_call_by_status_outcome_and_endpoint(
         ["2", "404", "refused", f"GET {repository}/branches/{{branch}}/protection"],
         ["2", "403", "refused", f"GET {repository}/secret-scanning/alerts{alerts}"],
         ["2", "403", "disabled", f"GET {repository}/dependabot/alerts{alerts}"],
-        ["12", "200", "ok", "POST https://api.github.com/graphql"],
+        ["16", "200", "ok", "POST https://api.github.com/graphql"],
         ["2", "200", "ok", f"GET {repository}"],
         ["2", "200", "ok", f"GET {repository}/code-scanning/alerts{alerts}"],
         ["2", "200", "ok", f"GET {repository}/rules/branches/{{branch}}?per_page=100"],
@@ -988,6 +1017,7 @@ def test_collect_summarises_every_call_by_status_outcome_and_endpoint(
 def test_collect_summarises_the_calls_of_a_run_that_could_not_store_what_it_collected(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    frozen_collection_clock: None,
 ) -> None:
     """Report what a failed run spent: it writes no report, so this is the only account of its calls."""
     caplog.set_level(logging.INFO)
@@ -1013,7 +1043,7 @@ def test_collect_summarises_the_calls_of_a_run_that_could_not_store_what_it_coll
     # account of them at all, and this run's report never reaches stdout to be read instead.
     counts = [int(line.split()[0]) for line in lines[1:]]
     assert len(counts) == 7
-    assert sum(counts) == 24
+    assert sum(counts) == 28
 
 
 def test_prune_reports_removed_intervals(configuration_path: Path, caplog: pytest.LogCaptureFixture) -> None:
