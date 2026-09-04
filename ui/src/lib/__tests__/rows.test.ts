@@ -20,12 +20,16 @@ import { RAG_STATES, state } from '@/lib/rag';
 import {
   ESTATE_FILTERS,
   FILTER_PARAMETERS,
+  PRODUCTION_PARAMETER,
+  PRODUCTION_VALUE,
   answerOrder,
   codeownersPresent,
   filterRepositories,
   matchesRepository,
   orderRepositories,
   parseFilters,
+  parseProduction,
+  productionCount,
   type FilterParameter,
 } from '@/lib/rows';
 import type { RepositoryRow } from '@/lib/types';
@@ -40,6 +44,10 @@ function row(fields: Partial<RepositoryRow> & { repository: string }): Repositor
  * The gate figures, the policy's verdict and the Sonar measures are here so a filter can be checked
  * against the donut that draws the same dimension: an estate where every row is unmeasured would
  * agree with any classifier at all.
+ *
+ * All three production answers are represented, which is what the toggle's rule needs: two
+ * repositories the list names, one it was read and does not name, and one whose list could not be
+ * read at all — the row that has to be left out rather than guessed either way.
  */
 const ROWS: RepositoryRow[] = [
   row({
@@ -52,6 +60,7 @@ const ROWS: RepositoryRow[] = [
     unreviewed_substantial: 'above',
     sonar_coverage: 12.5,
     sonar_security_issues: 4,
+    production: true,
   }),
   row({
     repository: 'hmcts/api',
@@ -64,6 +73,7 @@ const ROWS: RepositoryRow[] = [
     sonar_coverage: 95,
     sonar_security_issues: 0,
     sonar_security_hotspots: 0,
+    production: true,
   }),
   row({
     repository: 'hmcts/tools',
@@ -74,6 +84,7 @@ const ROWS: RepositoryRow[] = [
     unreviewed_substantial: 'within',
     sonar_coverage: 85,
     sonar_security_rating: { value: 4 },
+    production: false,
   }),
   row({ repository: 'hmcts/legacy', team: 'platform', detail: 'no window was collected' }),
 ];
@@ -266,6 +277,89 @@ describe('filterRepositories', () => {
         );
       }
     }
+  });
+});
+
+describe('parseProduction', () => {
+  it('names a parameter of its own, outside the six the donuts write', () => {
+    expect(PRODUCTION_PARAMETER).toBe('production');
+    expect(FILTER_PARAMETERS).not.toContain(PRODUCTION_PARAMETER);
+    expect(ESTATE_FILTERS.map((filter) => filter.parameter)).not.toContain(PRODUCTION_PARAMETER);
+  });
+
+  it('reads the value the toggle writes as on, and everything else as off', () => {
+    expect(parseProduction(() => PRODUCTION_VALUE)).toBe(true);
+    expect(parseProduction(() => null)).toBe(false);
+    // Not truthiness: one spelling, so a hand-typed `?production=0` does not read as a yes.
+    expect(parseProduction(() => '0')).toBe(false);
+    expect(parseProduction(() => '')).toBe(false);
+    expect(parseProduction(() => 'yes')).toBe(false);
+  });
+
+  it('reads its own parameter and no other, so a chip’s value cannot turn it on', () => {
+    const query: Record<string, string> = { label: PRODUCTION_VALUE };
+    expect(parseProduction((parameter) => query[parameter] ?? null)).toBe(false);
+    query[PRODUCTION_PARAMETER] = PRODUCTION_VALUE;
+    expect(parseProduction((parameter) => query[parameter] ?? null)).toBe(true);
+  });
+});
+
+describe('filterRepositories with the production toggle', () => {
+  it('holds only the repositories the list names when the toggle is on', () => {
+    expect(filterRepositories(ROWS, '', {}, true).map((entry) => entry.repository)).toEqual([
+      'hmcts/web',
+      'hmcts/api',
+    ]);
+  });
+
+  it('leaves the whole estate alone when the toggle is off, and by default', () => {
+    expect(filterRepositories(ROWS, '', {}, false)).toHaveLength(ROWS.length);
+    expect(filterRepositories(ROWS, '', {})).toHaveLength(ROWS.length);
+  });
+
+  it('excludes a repository whose answer could not be read rather than guessing it either way', () => {
+    // `hmcts/tools` was read and is not a production service; `hmcts/legacy` carries no answer at
+    // all. Neither is in the filtered list, and the second is the one a `false` default would have
+    // silently made a decision about.
+    const found = filterRepositories(ROWS, '', {}, true).map((entry) => entry.repository);
+    expect(found).not.toContain('hmcts/tools');
+    expect(found).not.toContain('hmcts/legacy');
+  });
+
+  it('ANDs with the term and with every dimension', () => {
+    expect(filterRepositories(ROWS, 'api', {}, true).map((entry) => entry.repository)).toEqual([
+      'hmcts/api',
+    ]);
+    expect(
+      filterRepositories(ROWS, '', { label: 'green' }, true).map((entry) => entry.repository),
+    ).toEqual(['hmcts/api']);
+    // A dimension the production repositories do not satisfy is an empty table, not an ignored one.
+    expect(filterRepositories(ROWS, '', { checks: 'none' }, true)).toEqual([
+      ROWS.find((entry) => entry.repository === 'hmcts/web'),
+    ]);
+    expect(filterRepositories(ROWS, 'tools', { label: 'green' }, true)).toEqual([]);
+  });
+});
+
+describe('productionCount', () => {
+  it('counts the production repositories the reader can currently see', () => {
+    expect(productionCount(ROWS, '', {})).toBe(2);
+  });
+
+  it('counts neither a repository read as non-production nor one with no answer', () => {
+    expect(productionCount([ROWS[2] as RepositoryRow, ROWS[3] as RepositoryRow], '', {})).toBe(0);
+  });
+
+  it('narrows with the term and the other dimensions, which is what makes the figure move', () => {
+    expect(productionCount(ROWS, 'api', {})).toBe(1);
+    expect(productionCount(ROWS, '', { label: 'green' })).toBe(1);
+    expect(productionCount(ROWS, '', { label: 'none' })).toBe(0);
+  });
+
+  it('excludes its own dimension, so the count says what turning the toggle on would leave', () => {
+    // The count is read while the toggle is on as well as off, and it has to be the same figure:
+    // one that counted its own filter would print the number already on screen.
+    expect(productionCount(ROWS, '', {})).toBe(filterRepositories(ROWS, '', {}, true).length);
   });
 });
 

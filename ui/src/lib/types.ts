@@ -457,6 +457,15 @@ export interface RepositoryRow {
   sonar_security_issues?: number;
   sonar_security_hotspots?: number;
   detail?: string;
+  /**
+   * Whether the organisation's production approvals list holds this repository.
+   *
+   * The one field here that is not read from the window at all, and it follows the same rule as
+   * every count above it: ABSENT MEANS NO LIST COULD BE READ, and `false` means the list was read
+   * and does not name this repository. Both render no badge — there is no non-production badge —
+   * but the filter and its count can only be honest about the difference if the field keeps it.
+   */
+  production?: boolean;
 }
 
 /**
@@ -478,6 +487,14 @@ export interface RepositoryDetail {
   evidence?: RepositoryPracticeEvidence;
   contributors: ContributorRow[];
   detail?: string;
+  /**
+   * Whether this repository deploys to production, under `RepositoryRow.production`'s rule.
+   *
+   * The service answers it on BOTH branches, the unavailable one included: whether a repository
+   * deploys to production is not a fact about the reporting window, so a span with no evidence for
+   * it still knows this. The header is built before the no-evidence branch for that reason.
+   */
+  production?: boolean;
 }
 
 /**
@@ -503,6 +520,15 @@ export interface ActorRow {
 export interface ActorDetail {
   actor: ActorReadiness;
   teams: Record<string, string>;
+  /**
+   * Which of THIS PERSON'S repositories deploy to production, and nothing else.
+   *
+   * It sits beside `teams` for `teams`' own reason: it is accounting the contract's `ActorReadiness`
+   * cannot state, and the contract model is passed through unchanged. ABSENT MEANS NO LIST COULD BE
+   * READ, where an empty list means the list was read and none of this person's repositories is on
+   * it — the distinction `RepositoryRow.production` keeps, in a list's shape.
+   */
+  production?: string[];
 }
 
 export interface TeamActorRow {

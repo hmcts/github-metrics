@@ -60,6 +60,7 @@ from metrics.domain import (
     UnreviewedSubstantialOutcome,
     WindowProvenance,
 )
+from metrics.production import PRODUCTION_LIST_URL
 from metrics.service import (
     DEFAULT_BUNDLE_AGE_SECONDS,
     DEFAULT_PERIOD_DAYS,
@@ -67,6 +68,7 @@ from metrics.service import (
     MAXIMUM_HELD_SERIES,
     MAXIMUM_PERIODS,
     NOT_ASSESSED,
+    PRODUCTION_RETRY_FLOOR,
     WEEKS_OPTIONS,
     ReportBundle,
     RepositoryDetail,
@@ -91,6 +93,13 @@ MAXIMUM_AGE = timedelta(seconds=DEFAULT_BUNDLE_AGE_SECONDS)
 
 WARM_INTERVAL = timedelta(seconds=DEFAULT_WARM_INTERVAL_SECONDS)
 """How often the warmer wakes in a test, which is also the margin it refreshes within."""
+
+PRODUCTION_PAIRS = frozenset({("hmcts", "cath-service"), ("hmcts", "civil-service")})
+"""What the stubbed fetch answers with: two of the three configured repositories, and not the third.
+
+Two rather than all three, so a test cannot pass by treating every configured repository as
+production, and casefolded as the real parser returns them.
+"""
 
 
 def waited_for(condition: Callable[[], bool], timeout: float = 5.0) -> bool:
@@ -464,12 +473,82 @@ class Series:
         return [(repository, request.period_days, request.periods) for repository, request in self.calls]
 
 
+@dataclass
+class Fetcher:
+    """Stand in for the production list fetch, recording every URL it was asked for.
+
+    `answer` is what the next fetch returns, and `None` is how the real fetcher reports every
+    failure it knows of — a network error, a non-200, and a body that will not parse alike.
+    """
+
+    answer: frozenset[tuple[str, str]] | None = PRODUCTION_PAIRS
+    calls: list[str] = field(default_factory=list)
+
+    def __call__(self, url: str) -> frozenset[tuple[str, str]] | None:
+        """Record the URL asked for and answer with whatever the test set."""
+        self.calls.append(url)
+        return self.answer
+
+
+class Announcing:
+    """Stand in for the production list's lock, saying when a second thread has arrived at it.
+
+    `WindowCache.approvals` is a plain lock rather than a registry, so the concurrency test cannot
+    count holders the way the span tests count them through `LockRegistry`. This announces the one
+    thing that test has to wait for: somebody reached the lock while it was held, and is about to
+    block on it. Without the signal the test would pass on the interleaving it is not testing — the
+    second read arriving after the first had already stored — and prove nothing.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waiting = threading.Event()
+
+    def __enter__(self) -> None:
+        """Take the lock, announcing first if somebody else is already holding it."""
+        if self.lock.locked():
+            self.waiting.set()
+        self.lock.acquire()
+
+    def __exit__(self, *details: object) -> None:
+        """Release the lock, whatever the caller's block did."""
+        _ = details
+        self.lock.release()
+
+
 @pytest.fixture
 def loader(monkeypatch: pytest.MonkeyPatch) -> Loader:
     """Serve every window from the fixture report, so no test touches a database."""
     replacement = Loader()
     monkeypatch.setattr("metrics.service.offline_practice_report", replacement)
     return replacement
+
+
+@pytest.fixture(autouse=True)
+def approvals(monkeypatch: pytest.MonkeyPatch) -> Fetcher:
+    """Answer every production list fetch from memory, so no test reaches the content host.
+
+    Autoused rather than requested, because `Configuration.production_list_url` defaults to a live
+    HMCTS URL: any test that warms a cache would otherwise fetch it, and a suite that passed or
+    failed on somebody else's uptime would be testing the wrong thing.
+    """
+    replacement = Fetcher()
+    monkeypatch.setattr("metrics.service.fetch_production_repositories", replacement)
+    return replacement
+
+
+def age_production_list(cache: WindowCache, by: timedelta) -> None:
+    """Age the held production list in place, so what a refresh depends on is the list's own age."""
+    held = cache.production
+    assert held is not None
+    cache.production = replace(held, built_at=held.built_at - by)
+
+
+def age_production_failure(cache: WindowCache, by: timedelta) -> None:
+    """Age the remembered fetch failure, so a test can reach the far side of the retry floor."""
+    failed_at = cache.production_failed_at
+    assert failed_at is not None
+    cache.production_failed_at = failed_at - by
 
 
 @pytest.fixture
@@ -907,6 +986,248 @@ def test_two_warms_of_a_cold_span_build_it_once_between_them(
 
     assert len(loader.windows) == 1
     assert sorted(warmed) == [False, True]
+
+
+def test_a_first_read_of_the_production_list_fetches_it(tmp_path: Path, approvals: Fetcher) -> None:
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    assert cache.production_list() == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_a_second_read_inside_the_margin_serves_the_list_already_held(tmp_path: Path, approvals: Fetcher) -> None:
+    """Read what is held rather than refetching, so a page view is not a request to another host."""
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    first = cache.production_list(WARM_INTERVAL)
+
+    assert cache.production_list(WARM_INTERVAL) == first
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_a_production_list_that_would_expire_before_the_next_wake_is_refetched(
+    tmp_path: Path,
+    approvals: Fetcher,
+) -> None:
+    """Refresh inside the margin, exactly as a span is, so a reader never waits on the content host.
+
+    The list aged here is one a reader would still be served as it stands — and that is the point:
+    by the warmer's next wake it would have expired, and whoever asked then would have waited for a
+    fetch. Age is the whole rule, because there is no local stamp that moves when the document does.
+    """
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    cache.production_list(WARM_INTERVAL)
+    # A second inside the margin rather than outside it: still usable, and not usable for long.
+    age_production_list(cache, MAXIMUM_AGE - WARM_INTERVAL + timedelta(seconds=1))
+    approvals.answer = frozenset({("hmcts", "other-service")})
+
+    assert cache.production_list(WARM_INTERVAL) == frozenset({("hmcts", "other-service")})
+    assert approvals.calls == [PRODUCTION_LIST_URL, PRODUCTION_LIST_URL]
+
+
+def test_a_production_list_a_second_outside_the_margin_is_left_alone(tmp_path: Path, approvals: Fetcher) -> None:
+    """Refresh INSIDE the margin and no further, so the margin is a horizon rather than a direction.
+
+    The mirror of the test above, one second the other side of the same edge. Without it the margin
+    could be widened to the whole lifetime with every other test still green, and the service would
+    refetch the document on every wake — 288 requests a day to a host that owes this project nothing.
+    """
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    cache.production_list(WARM_INTERVAL)
+    age_production_list(cache, MAXIMUM_AGE - WARM_INTERVAL - timedelta(seconds=1))
+
+    assert cache.production_list(WARM_INTERVAL) == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_a_refresh_that_fails_keeps_the_list_last_read_and_says_so(
+    tmp_path: Path,
+    approvals: Fetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cost the badges nothing for a transient failure, and leave the failure visible in the log.
+
+    A content host's 502 must not clear 250 badges, so what was last read stands. The warning is
+    what makes a list that has been failing all day something other than a silent absence.
+    """
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    cache.production_list()
+    age_production_list(cache, MAXIMUM_AGE * 2)
+    approvals.answer = None
+
+    assert cache.production_list() == PRODUCTION_PAIRS
+    assert cache.production is not None
+    assert "Could not refresh the production list" in caplog.text
+
+
+def test_a_cache_that_has_never_read_the_list_says_nobody_could(
+    tmp_path: Path,
+    approvals: Fetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Answer `None` rather than an empty set: an unread list is not an estate with no production."""
+    approvals.answer = None
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    assert cache.production_list() is None
+    assert cache.production is None
+    assert "Could not refresh the production list" in caplog.text
+
+
+def test_a_read_after_a_failed_fetch_asks_the_host_nothing_for_the_retry_floor(
+    tmp_path: Path,
+    approvals: Fetcher,
+) -> None:
+    """Cost a page NOTHING while the content host is down, which is the whole promise of the fetch.
+
+    A reader reads with no margin, so a cache holding nothing usable would otherwise attempt a GET
+    for every request and wait out its timeout under the list's lock: an unreachable host would stall
+    every page view rather than clear the badges. The failure is remembered instead, and the wake
+    that arrives long after `PRODUCTION_RETRY_FLOOR` is what retries.
+    """
+    approvals.answer = None
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    assert [cache.production_list(), cache.production_list(), cache.production_list()] == [None] * 3
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_a_failure_older_than_the_retry_floor_is_tried_again(tmp_path: Path, approvals: Fetcher) -> None:
+    """Remember a failure for the floor and no longer, so a host that comes back is noticed.
+
+    The mirror of the test above: without this the floor could be widened to the life of the process
+    and every other test would stay green, while a transient 502 cleared the badges until a restart.
+    """
+    approvals.answer = None
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    assert cache.production_list() is None
+    age_production_failure(cache, PRODUCTION_RETRY_FLOOR + timedelta(seconds=1))
+    approvals.answer = PRODUCTION_PAIRS
+
+    assert cache.production_list() == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL, PRODUCTION_LIST_URL]
+
+
+def test_a_failed_refresh_inside_the_retry_floor_still_serves_the_list_last_read(
+    tmp_path: Path,
+    approvals: Fetcher,
+) -> None:
+    """Keep serving what was read before the failure, rather than the absence of a retry."""
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    cache.production_list()
+    age_production_list(cache, MAXIMUM_AGE * 2)
+    approvals.answer = None
+    assert cache.production_list() == PRODUCTION_PAIRS
+
+    assert cache.production_list() == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL, PRODUCTION_LIST_URL]
+
+
+def test_a_configuration_naming_no_list_never_fetches_one(tmp_path: Path, approvals: Fetcher) -> None:
+    """Fetch nothing at all, which is what an organisation publishing no such list is asking for."""
+    cache = WindowCache(configuration(tmp_path, production_list_url=None), MAXIMUM_AGE)
+
+    assert cache.production_list(WARM_INTERVAL) is None
+    assert approvals.calls == []
+
+
+def test_a_list_read_before_the_url_was_unset_is_served_unchanged(tmp_path: Path, approvals: Fetcher) -> None:
+    """Return what is held rather than clearing it: no URL is a reason not to fetch, not to forget."""
+    settings = configuration(tmp_path)
+    cache = WindowCache(settings, MAXIMUM_AGE)
+    cache.production_list()
+
+    cache.configuration = settings.model_copy(update={"production_list_url": None})
+
+    assert cache.production_list() == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_two_reads_of_a_cold_production_list_fetch_it_once_between_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approvals: Fetcher,
+) -> None:
+    """Check inside the lock as `bundle` does, so a read landing on a fetch waits for it.
+
+    The shape this arrives in is a reader's first page view and the warmer's wake landing on it. The
+    one that gets to the lock second must come away with what the first fetched rather than asking
+    the content host the same question a second time.
+    """
+    entered = threading.Event()
+    released = threading.Event()
+
+    def blocking(url: str) -> frozenset[tuple[str, str]] | None:
+        entered.set()
+        released.wait(timeout=5)
+        return approvals(url)
+
+    monkeypatch.setattr("metrics.service.fetch_production_repositories", blocking)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+    announcing = Announcing()
+    cache.approvals = cast("threading.Lock", announcing)
+    read: list[frozenset[tuple[str, str]] | None] = []
+    threads = [threading.Thread(target=lambda: read.append(cache.production_list())) for _ in range(2)]
+
+    threads[0].start()
+    assert entered.wait(timeout=5)
+    threads[1].start()
+    assert waited_for(announcing.waiting.is_set)
+    released.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert read == [PRODUCTION_PAIRS, PRODUCTION_PAIRS]
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_the_warmer_refreshes_the_production_list_beside_the_spans(
+    tmp_path: Path,
+    loader: Loader,
+    approvals: Fetcher,
+) -> None:
+    """Move the list on `--warm-interval`, which is what puts it on the refresh cadence at all.
+
+    Nothing else refreshes it: it is not collected, so without this wake it would be as old as the
+    first request that happened to read it.
+    """
+    _ = loader
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    warm_spans(cache, (4,), WARM_INTERVAL)
+
+    assert sorted(cache.bundles) == [4]
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+    # Held rather than refetched, so what the warmer left behind is what a reader is served.
+    assert cache.production_list(WARM_INTERVAL) == PRODUCTION_PAIRS
+    assert approvals.calls == [PRODUCTION_LIST_URL]
+
+
+def test_a_production_list_refresh_that_raises_costs_a_log_line_rather_than_the_warmer(
+    tmp_path: Path,
+    loader: Loader,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Survive whatever the fetch does that it was not written to survive.
+
+    `fetch_production_repositories` answers every failure it knows of with `None`, so anything that
+    reaches the warmer is something nobody anticipated — which is exactly the sort of thing that
+    would otherwise take the thread and leave a service that looks warm and is not.
+    """
+    _ = loader
+
+    def failing(url: str) -> frozenset[tuple[str, str]] | None:
+        message = f"the content host hung up on {url}"
+        raise OSError(message)
+
+    monkeypatch.setattr("metrics.service.fetch_production_repositories", failing)
+    cache = WindowCache(configuration(tmp_path), MAXIMUM_AGE)
+
+    warm_spans(cache, (4,), WARM_INTERVAL)
+
+    assert sorted(cache.bundles) == [4]
+    assert "Could not refresh the production list" in caplog.text
+    assert "OSError" in caplog.text
 
 
 def test_the_warmer_builds_every_span_on_offer_and_leaves_a_built_one_alone(
@@ -1456,6 +1777,130 @@ def test_a_repository_the_window_cannot_cover_states_none_of_the_six_security_fa
     assert "sonar_security_rating" not in row
     assert "sonar_security_issues" not in row
     assert "sonar_security_hotspots" not in row
+
+
+def test_a_listed_repository_says_whether_it_deploys_to_production(client: TestClient) -> None:
+    """Answer `false` for a repository the list does not name, which is an answer and not an absence."""
+    rows = {item["repository"]: item for item in client.get("/repositories").json()}
+
+    assert rows["cath-service"]["production"] is True
+    assert rows["civil-service"]["production"] is True
+    assert rows["other-service"]["production"] is False
+
+
+def test_a_repository_detail_and_a_teams_rows_carry_the_production_answer(client: TestClient) -> None:
+    """Serve the same answer wherever a badge is drawn, so one page cannot disagree with another."""
+    detail = client.get("/repositories/cath-service").json()
+    rows = {item["repository"]: item for item in client.get("/teams/crime").json()["repositories"]}
+
+    assert detail["production"] is True
+    assert rows["cath-service"]["production"] is True
+    assert rows["other-service"]["production"] is False
+
+
+def test_a_repository_the_window_cannot_report_still_carries_its_production_answer(
+    tmp_path: Path,
+    loader: Loader,
+    approvals: Fetcher,
+) -> None:
+    """Answer for a repository with no evidence block: deploying to production is not a fact about a window.
+
+    The repository chosen here is the one the fixture report cannot cover, and it is the only one the
+    list names — so a row or a detail that resolved the answer out of the evidence block, or skipped
+    the unavailable branch, would say `false` while the list says otherwise.
+    """
+    _ = loader
+    approvals.answer = frozenset({("hmcts", "other-service")})
+    settings = configuration(tmp_path)
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+        row = {item["repository"]: item for item in connected.get("/repositories").json()}["other-service"]
+        detail = connected.get("/repositories/other-service").json()
+
+    assert row["production"] is True
+    assert row["detail"].startswith("cached pull_request evidence does not cover")
+    assert detail["production"] is True
+    assert "evidence" not in detail
+
+
+def test_an_unread_production_list_omits_the_field_from_every_response(
+    client: TestClient,
+    approvals: Fetcher,
+) -> None:
+    """Omit the key rather than serving `false`: nobody could say, and a `false` would be a claim.
+
+    All four responses, because the field reaches a reader through each of them and one that
+    defaulted it would put a badgeless estate on one page and an honest silence on the others.
+    """
+    approvals.answer = None
+
+    rows = client.get("/repositories").json()
+    detail = client.get("/repositories/cath-service").json()
+    team = client.get("/teams/crime").json()
+    actor = client.get("/actors/Alice").json()
+
+    assert [row["repository"] for row in rows if "production" not in row] == [
+        "civil-service",
+        "cath-service",
+        "other-service",
+    ]
+    assert "production" not in detail
+    assert all("production" not in row for row in team["repositories"])
+    assert "production" not in actor
+
+
+def test_the_production_match_is_case_insensitive_on_both_halves_of_the_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approvals: Fetcher,
+) -> None:
+    """Fold both halves, because the document folds neither and GitHub cares about neither.
+
+    The live list holds one `HMCTS/…` URL among 200-odd lowercase `hmcts` ones, and a configuration
+    is free to spell its organisation and its repositories however the reader recognises them. A
+    comparison that folded only the fetched side would drop this repository's badge.
+    """
+    settings = Configuration.model_validate(
+        {
+            "version": 1,
+            "organization": "HMCTS",
+            "database": tmp_path / "metrics.sqlite3",
+            "teams": [{"identifier": "crime", "display_name": "Crime", "repositories": ["CATH-Service"]}],
+        },
+    )
+    report = PracticeEvidenceReport(
+        organization="HMCTS",
+        repositories=(practice_evidence("CATH-Service", "crime"),),
+        unavailable=(),
+        actors=(),
+    )
+    monkeypatch.setattr("metrics.service.offline_practice_report", lambda _configuration, _window: report)
+    approvals.answer = frozenset({("hmcts", "cath-service")})
+
+    with TestClient(create_app(settings, WindowCache(settings, MAXIMUM_AGE))) as connected:
+        rows = connected.get("/repositories").json()
+
+    assert [(row["repository"], row["production"]) for row in rows] == [("CATH-Service", True)]
+
+
+def test_an_actor_lists_which_of_their_own_repositories_deploy_to_production(
+    client: TestClient,
+    approvals: Fetcher,
+) -> None:
+    """Name the person's own production repositories and no others: the page badges the rows it draws.
+
+    One of Alice's two repositories is on the list and neither of bob's is, so a response carrying
+    the organisation's whole list, or every repository the person contributed to, fails here.
+    """
+    approvals.answer = frozenset({("hmcts", "civil-service")})
+
+    alice = client.get("/actors/Alice").json()
+    bob = client.get("/actors/bob").json()
+
+    assert [row["repository"] for row in alice["actor"]["repositories"]] == ["cath-service", "civil-service"]
+    assert alice["production"] == ["civil-service"]
+    # Read and empty rather than absent: the list was read, and bob works in nothing it names.
+    assert bob["production"] == []
 
 
 def test_a_repository_reports_its_whole_evidence_block(client: TestClient) -> None:

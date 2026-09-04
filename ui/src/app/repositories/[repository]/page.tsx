@@ -75,6 +75,9 @@ export default async function RepositoryPage({
       kind="repository"
       name={detail.repository}
       label={evidence?.assessment?.label}
+      // Not read from the window, so it survives the unavailable branch below: a repository this
+      // span cannot report is still or is still not a production service.
+      production={detail.production}
       action={<NavWeekSelector options={windows.options} active={weeks} />}
       context={
         <>

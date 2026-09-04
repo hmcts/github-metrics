@@ -77,6 +77,25 @@ insists on it — a typo would otherwise read as "no project configured", indist
 entry — and no key may be empty, because an override silently meaning "unresolved" would read as a decision somebody
 made. See [SonarCloud](#sonarcloud-quality-evidence) below for how a repository is mapped when no override is given.
 
+`production_list_url` is where the list of repositories **approved to deploy to production** is published. It defaults
+to HMCTS's [`environment-approvals.yml`](https://github.com/hmcts/cnp-jenkins-config/blob/master/environment-approvals.yml) —
+the document the deployment pipeline reads to decide whether a repository may be promoted to an environment at all, and
+whose `prod:` sequence is what puts a `Production` badge on a row. The default is stated as a policy default to argue
+with rather than as a fact about every organisation, as `cohort.excluded_authors` and `traceability.reference_patterns`
+are; `null` turns the fetch off, which is what an organisation with no such list wants.
+
+The fetch is **unauthenticated and made by the service**, not by `collect`. The file is public and a token sent to a raw
+content host would be a leak buying nothing, so `metrics-serve` carries no credential to it. It refreshes on
+`--warm-interval` alongside the window bundles rather than waiting for a collection, because the list is one
+organisation-wide document about current state and not evidence about any reporting window — see
+[Dashboard](#dashboard) and the dated decision in [`docs/architecture.md`](docs/architecture.md). A list that has never
+been read leaves the field **absent**, so the repository carries no badge and is not counted as a negative either:
+"not approved for production" and "nobody could say" are different answers, and an unreadable list must not be
+published as the first. Once a list has been read, a later failure costs nothing — the last good list is kept and the
+failure is logged at WARNING. A failure is also remembered for a minute before another fetch is attempted, so a host
+the service cannot reach at all — a closed egress, a firewall with no route — costs the badges and not the pages;
+where egress is closed for good, set `production_list_url: null` and nothing is fetched.
+
 ### Splitting the configuration across several files
 
 **`--config` may be given more than once**, and the files are read in the order written and parsed as one document.
@@ -1377,8 +1396,10 @@ Security alert observations
 ## Dashboard
 
 The same evidence, read in a browser instead of a terminal. Two processes: `metrics-serve` holds the report and
-answers JSON, and a Next.js app in `ui/` renders it. Neither contacts GitHub — the service reads the two SQLite
-files a `collect` run wrote and nothing else — so the whole loop runs without a credential.
+answers JSON, and a Next.js app in `ui/` renders it. Neither carries a credential, so the whole loop runs without
+one: every figure on every page comes from the two SQLite files a `collect` run wrote. The service reaches the
+network for exactly one thing, added 2026-09-04 — an unauthenticated GET of the public production approvals list
+(`production_list_url`, below), which decides a badge rather than a figure and can be turned off.
 
 ```bash
 uv run metrics collect --config metrics.example.yaml --from 2026-05-01 --to 2026-09-01
@@ -1451,7 +1472,9 @@ Six more landed the same day, for the security donut and the two governance colu
 `sonar_reported` is the one field on the row that is **`False` rather than absent** where there is nothing to report: a
 reportable repository whose project never resolved, or whose measures could not be read, reads `False`, because the
 column it feeds answers "is there Sonar information here" and "no Sonar" has to stay apart from "no report". Only the
-unreportable branch leaves it absent, as it leaves every field but the repository, its team and the reason absent.
+unreportable branch leaves it absent, as it leaves every field but the repository, its team, its `production` answer
+and the reason absent — `production` is not a fact about the window, so an unreportable row still states it (see
+below).
 
 `security` carries `SecurityAlertEvidence` whole rather than flattening its three alert families into scalars. The
 per-family `open`/`by_severity`/`detail` is what a band needs: a family with nothing open and one GitHub refused are
@@ -1488,6 +1511,35 @@ is disabled, the cohort is below `minimum_merges` and its behavioural conditions
 substantial merge to be a denominator. It never means nothing was found. That last case is the one place the field and
 the condition read differently rather than grading differently: with no substantial merge there is nothing to forgive,
 so the condition is clear while the field stays absent, because an unmeasured window must not be projected as a pass.
+
+`production` landed on 2026-09-04 and is the one field on a row that comes from neither cache. The service fetches
+`production_list_url` itself and matches the row against it case-insensitively on both the organisation and the
+repository name — the real document holds `HMCTS/adoption-shared-infrastructure` among 200-odd lowercase `hmcts`
+entries, so a case-sensitive match would drop that repository's badge. It is `true` for a repository the list holds,
+`false` for a configured repository the list was read and does not hold, and **absent when no list could be read at
+all**, which is also what a `production_list_url` of `null` leaves on every row. It never defaults to `false`. The same
+field is on `/repositories/{repository}`, where it is set on the unavailable branch too — whether a repository deploys
+to production is not a fact about the reporting window, so a span with no evidence still knows it — and
+`/actors/{login}` carries `production` as the subset of that person's own repositories the list holds, sitting beside
+`teams` for `teams`' reason: it is accounting the contract's `ActorReadiness` cannot state. The list moves on the
+warmer's cadence rather than a collection's: the wake before it would expire refetches it, exactly as a span's bundle
+is rebuilt, so `--max-bundle-age` bounds how old a badge can be and `--warm-interval` is what keeps a reader from
+ever waiting on the fetch. A fetch that fails keeps the last good list and is retried a minute later at the earliest,
+so a content host that is down costs the badges rather than the pages.
+
+On the pages, that field is a royal-blue `Production` badge in a column immediately right of Readiness — on the
+repositories list, the team page and the contributor page — and the same badge beside the readiness label in a
+repository's own header. The repositories filter bar is now always shown, with a permanent `Production` toggle at its
+head: it narrows the table to production rows, carries a count of how many the reader's other filters leave, and has
+no dismiss control, since it is the bar's own control rather than one of the six dismissible donut chips. A repository
+whose answer could not be read is excluded by the toggle rather than assumed either way, and no badge is drawn for a
+`false` and an absent answer alike — there is no non-production badge. See
+[`ui/README.md`](ui/README.md#pages).
+
+**`metrics evidence` carries no production column, deliberately.** The fetch lives in the service, so an offline text
+report has nothing to print — and inventing a second source at collect time so that it could would make the production
+list a per-repository collected fact, which is not what it is. The badge is a dashboard feature; the text report's
+columns are what a `collect` run wrote.
 
 An `/actors` row is a `login`, the number of `repositories` that login appears in, and `labels` — the **distinct**
 readiness labels of the repositories the report counts for them, best first, which since 2026-09-02 is what the
@@ -1541,6 +1593,8 @@ CONFIG=config.yml docker compose up --build
 ```
 
 Collection stays on the host, because it is the step that needs a credential and the one that has to be scheduled.
+The `api` container needs outbound HTTPS for one thing only — the production approvals list — and works without it:
+the badges go absent and every figure stands. Set `production_list_url: null` where egress is closed for good.
 `CONFIG` names a file in this directory — `config.yml` by default — mounted read-only at `/app/config.yml`, and
 `./.metrics` is mounted read-write, so the configuration's `database` must resolve inside `.metrics` or the service
 starts with nothing to serve.

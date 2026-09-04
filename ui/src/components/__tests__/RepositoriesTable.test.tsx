@@ -19,6 +19,7 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RepositoriesTable } from '@/components/RepositoriesTable';
+import { PRODUCTION_TOGGLE_ACTIVE, PRODUCTION_TOGGLE_INACTIVE } from '@/lib/production';
 import type { RepositoryRow } from '@/lib/types';
 
 let replaced: string[] = [];
@@ -55,6 +56,9 @@ const ROWS: RepositoryRow[] = [
     // A second dimension the donuts filter on, so two parameters in the URL can be seen to AND
     // rather than to overwrite one another: `web` requires no approval and `docs` requires two.
     required_approving_reviews: 0,
+    // The only production service here, so the toggle's count is one and the row it leaves is
+    // known: `docs` was read and is not one, and `api`'s answer is absent entirely.
+    production: true,
   },
   {
     repository: 'api',
@@ -75,6 +79,7 @@ const ROWS: RepositoryRow[] = [
     codeowners_files: 0,
     sonar_reported: true,
     required_approving_reviews: 2,
+    production: false,
   },
 ];
 
@@ -106,6 +111,21 @@ function answers(repository: string): (string | undefined)[] {
     .slice(1)
     .find((row) => within(row).getAllByRole('cell')[1]?.textContent?.startsWith(repository));
   return governanceCells(entry as HTMLElement).map((cell) => cell?.textContent);
+}
+
+/**
+ * One row's Production cell, found under the header rather than at a fixed position.
+ *
+ * By name for `governanceCells`' reason: a column inserted to its left would otherwise leave these
+ * assertions reading the readiness label beside it, and agreeing with itself.
+ */
+function productionCell(repository: string): HTMLElement | undefined {
+  const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
+  const entry = screen
+    .getAllByRole('row')
+    .slice(1)
+    .find((row) => within(row).getAllByRole('cell')[1]?.textContent?.startsWith(repository));
+  return within(entry as HTMLElement).getAllByRole('cell')[headers.indexOf('Production')];
 }
 
 /** Every CODEOWNERS and Sonar cell in the table, whatever each of them answers. */
@@ -154,6 +174,8 @@ describe('RepositoriesTable sorting', () => {
     expect(sortBy('Repository')).toEqual(['api', 'docs', 'web']);
     // `api` has no grade, and an ungraded repository is not an answer to "which is worst".
     expect(sortBy('Readiness')).toEqual(['docs', 'web', 'api']);
+    // No below Yes, and `api`, whose list could not be read, last rather than counted as either.
+    expect(sortBy('Production')).toEqual(['docs', 'web', 'api']);
     expect(sortBy('Merged')).toEqual(['web', 'docs', 'api']);
     expect(sortBy('Direct commits')).toEqual(['docs', 'web', 'api']);
     expect(sortBy('Open')).toEqual(['web', 'docs', 'api']);
@@ -209,13 +231,14 @@ describe('RepositoriesTable sorting', () => {
 });
 
 describe('RepositoriesTable columns', () => {
-  it('heads the ten columns in order, the two governance answers after Stale', () => {
+  it('heads the eleven columns in order, Production right of Readiness', () => {
     mount();
 
     expect(screen.getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual([
       'Team',
       'Repository',
       'Readiness',
+      'Production',
       'Merged',
       'Direct commits',
       'Open',
@@ -262,11 +285,39 @@ describe('RepositoriesTable columns', () => {
   });
 });
 
-describe('RepositoriesTable filter chips', () => {
-  it('shows no chip row at all when the URL carries no filter', () => {
+describe('RepositoriesTable production column', () => {
+  it('badges a production repository and leaves every other cell empty', () => {
     mount();
 
-    expect(screen.queryByRole('group', { name: 'Active filters' })).toBeNull();
+    expect(productionCell('web')?.textContent).toBe('Production');
+    // A repository the list was read for and does not name, and one whose list could not be read
+    // at all: both cells are empty, because there is no non-production badge to draw.
+    expect(productionCell('docs')?.textContent).toBe('');
+    expect(productionCell('api')?.textContent).toBe('');
+  });
+
+  it('holds an unread answer back from both ends of its own sort', () => {
+    mount();
+
+    sortBy('Production');
+    expect(sortBy('Production')).toEqual(['web', 'docs', 'api']);
+    expect(announced('Production')).toBe('descending');
+  });
+
+  it('grades nothing in the column: production is an attribute, not a verdict', () => {
+    mount();
+
+    for (const repository of ['web', 'docs', 'api']) {
+      expect(productionCell(repository)?.outerHTML).not.toMatch(/emerald|amber|rose|rag-/);
+    }
+  });
+});
+
+describe('RepositoriesTable filter chips', () => {
+  it('keeps the bar and shows no chip on it when the URL carries no filter', () => {
+    mount();
+
+    expect(chips()).toEqual([]);
     expect(order()).toEqual(['docs', 'web', 'api']);
   });
 
@@ -281,7 +332,7 @@ describe('RepositoriesTable filter chips', () => {
     url('weeks=12&label=purple');
     mount();
 
-    expect(screen.queryByRole('group', { name: 'Active filters' })).toBeNull();
+    expect(chips()).toEqual([]);
     expect(order()).toEqual(['docs', 'web', 'api']);
   });
 
@@ -332,14 +383,115 @@ describe('RepositoriesTable filter chips', () => {
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.getByText(/No repository matches this filter/)).toBeTruthy();
   });
+
+  it('names the production toggle among the things an empty table can be cleared of', () => {
+    url('weeks=12&repository=nothing-here');
+    mount();
+
+    expect(screen.getByText(/Clear the term, the Production toggle, or a filter/)).toBeTruthy();
+  });
 });
 
-/** What each chip reads, in the order the row puts them. */
+describe('RepositoriesTable production toggle', () => {
+  it('is the first thing in the bar, before any chip', () => {
+    url('weeks=12&label=green');
+    mount();
+
+    expect(bar().children[0]).toBe(toggle());
+    expect(chips()).toEqual(['Readiness: Ready']);
+  });
+
+  it('carries the count of the production repositories a reader could turn it on for', () => {
+    mount();
+
+    expect(toggle().textContent).toBe('Production1');
+    expect(within(toggle()).getByText('1').className).toContain('tabular-nums');
+  });
+
+  it('counts within the term and the other dimensions, but not within itself', () => {
+    url('weeks=12&repository=docs');
+    mount();
+
+    // `docs` is the one row the term leaves and it is not a production service, so the toggle
+    // offers nothing — and says so rather than printing the estate's total.
+    expect(toggle().textContent).toBe('Production0');
+  });
+
+  it('reads the same count while it is on, which is what excluding its own filter buys', () => {
+    url('weeks=12&production=true');
+    mount();
+
+    expect(toggle().textContent).toBe('Production1');
+  });
+
+  it('is greyed and unpressed while off, and royal and pressed while on', () => {
+    mount();
+
+    expect(toggle().getAttribute('aria-pressed')).toBe('false');
+    for (const name of PRODUCTION_TOGGLE_INACTIVE.split(' ')) {
+      expect(toggle().className).toContain(name);
+    }
+
+    cleanup();
+    url('weeks=12&production=true');
+    mount();
+
+    expect(toggle().getAttribute('aria-pressed')).toBe('true');
+    for (const name of PRODUCTION_TOGGLE_ACTIVE.split(' ')) {
+      expect(toggle().className).toContain(name);
+    }
+  });
+
+  it('has no way to remove it: it is a control, not a chip', () => {
+    url('weeks=12&production=true');
+    mount();
+
+    expect(screen.queryByRole('button', { name: /Remove Production/ })).toBeNull();
+    // The chips' × is an `svg` inside the chip. The toggle holds a dot and two words and no icon,
+    // so there is nothing on it a reader could read as a dismissal.
+    expect(toggle().innerHTML).not.toContain('<svg');
+    expect(within(bar()).getAllByRole('button')).toEqual([toggle()]);
+  });
+
+  it('holds only the production repositories while it is on', () => {
+    url('weeks=12&production=true');
+    mount();
+
+    expect(order()).toEqual(['web']);
+  });
+
+  it('writes its parameter on the click, keeping the span, the term and an active chip', () => {
+    url('weeks=26&repository=e&label=red');
+    mount();
+
+    fireEvent.click(toggle());
+
+    expect(replaced).toEqual(['/repositories?weeks=26&repository=e&label=red&production=true']);
+  });
+
+  it('clears the parameter on the second click, dropping it rather than emptying it', () => {
+    url('weeks=26&repository=e&label=red&production=true');
+    mount();
+
+    fireEvent.click(toggle());
+
+    expect(replaced).toEqual(['/repositories?weeks=26&repository=e&label=red']);
+  });
+});
+
+/** The filter bar, which is always drawn: it holds the Production toggle whether or not a chip is. */
+function bar(): HTMLElement {
+  return screen.getByRole('group', { name: 'Repository filters' });
+}
+
+/** What each chip reads, in the order the bar puts them — the toggle first, so past it. */
 function chips(): string[] {
-  return Array.from(
-    screen.getByRole('group', { name: 'Active filters' }).children,
-    (chip) => chip.textContent ?? '',
-  );
+  return Array.from(bar().children, (chip) => chip.textContent ?? '').slice(1);
+}
+
+/** The Production toggle, found the way a reader does: by the word on it. */
+function toggle(): HTMLElement {
+  return within(bar()).getByRole('button', { name: /Production/ });
 }
 
 /** One chip's dismiss control, found by the dimension it drops. */

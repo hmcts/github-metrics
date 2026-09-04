@@ -14,6 +14,7 @@ from metrics.config import (
     repository_owners,
 )
 from metrics.domain import FindingSeverity
+from metrics.production import PRODUCTION_LIST_URL
 
 
 @pytest.fixture
@@ -427,6 +428,29 @@ def test_load_configuration_prefers_an_explicit_sonar_organisation(configuration
     assert configuration.sonar_organization_name == "hmcts-sonar"
 
 
+def test_load_configuration_defaults_the_production_list_to_the_published_hmcts_document(
+    configuration_path: Path,
+) -> None:
+    """Carry the policy default, so the common case does not restate a URL nobody chose."""
+    assert load_configuration(configuration_path).production_list_url == PRODUCTION_LIST_URL
+
+
+def test_load_configuration_prefers_an_explicit_production_list_url(configuration_path: Path) -> None:
+    """Let an organisation publish its approvals somewhere else: the default is one to argue with."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write("production_list_url: https://example.invalid/approvals.yml\n")
+
+    assert load_configuration(configuration_path).production_list_url == "https://example.invalid/approvals.yml"
+
+
+def test_load_configuration_disables_the_production_list_when_it_is_null(configuration_path: Path) -> None:
+    """Turn the fetch off for an organisation with no such list, rather than fetching HMCTS's."""
+    with configuration_path.open("a", encoding="utf-8") as configuration_file:
+        configuration_file.write("production_list_url: null\n")
+
+    assert load_configuration(configuration_path).production_list_url is None
+
+
 def test_load_configuration_loads_a_sonar_project_override(configuration_path: Path) -> None:
     """Carry the answer of last resort for a repository whose project the map cannot settle."""
     with configuration_path.open("a", encoding="utf-8") as configuration_file:
@@ -556,6 +580,10 @@ def test_the_shipped_example_configuration_loads_and_carries_every_documented_ke
     assert configuration.enablement == {"example-service": datetime(2026, 6, 1, tzinfo=UTC)}
     assert configuration.sonar_organization_name == "hmcts"
     assert configuration.sonar_projects == {"example-service": "example-service"}
+    # Restated in the example rather than left to the default, so this is the one assertion that
+    # catches the two drifting apart: the file would otherwise go on documenting an URL the code no
+    # longer reads, and a reader copying it would pin the old one.
+    assert configuration.production_list_url == PRODUCTION_LIST_URL
 
 
 @pytest.fixture

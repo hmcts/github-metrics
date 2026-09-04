@@ -1,12 +1,19 @@
 """Serve stored evidence over HTTP, so a browser can read what `metrics evidence` prints.
 
-READ-ONLY AND OFFLINE ALWAYS. Every response is assembled by `evidence.offline_practice_report` from
-the SQLite caches a `metrics collect` run wrote, and nothing here can reach GitHub: there is no
-client, no session and no credential anywhere in this module. A window nobody has collected reports
-itself through the report's own `unavailable` entries rather than as thinner data, which is the whole
-reason the open pull-request state was made cacheable first. See architecture.md, "Scope boundaries",
-for the dated reversal that admitted a service and a UI at all, and the boundaries it left standing:
-no personal rankings, no cross-repository averaging, no combined team verdict, score or ordering.
+READ-ONLY, AND CREDENTIAL-FREE ALWAYS. There is no GitHub API client, no session and no token
+anywhere in this module, and EVERY EVIDENCE RESPONSE is assembled by `evidence.offline_practice_report`
+from the SQLite caches a `metrics collect` run wrote. A window nobody has collected reports itself
+through the report's own `unavailable` entries rather than as thinner data, which is the whole reason
+the open pull-request state was made cacheable first. See architecture.md, "Scope boundaries", for the
+dated reversal that admitted a service and a UI at all, and the boundaries it left standing: no
+personal rankings, no cross-repository averaging, no combined team verdict, score or ordering.
+
+THE ONE THING THIS MODULE FETCHES is the public production approvals list (`metrics.production`), and
+it is a NARROW, DATED EXCEPTION to the offline invariant rather than a door left open — see
+architecture.md, "Scope boundaries", 2026-09-04. It carries no credential, it names no reporting
+window, and it is a classification of repositories rather than evidence about anything the report
+measures, so a fetch that fails costs a badge rather than a figure: the field goes absent and every
+count on the page is the count it would have been. Nothing else here may contact anything.
 
 Its own entry point, `metrics-serve`, rather than a `metrics` subcommand — it shares no argument with
 the collection commands, and `cli.py` is edited heavily elsewhere.
@@ -56,6 +63,7 @@ from metrics.domain import (
     actor_labels,
 )
 from metrics.evidence import collected_through, offline_practice_report
+from metrics.production import fetch_production_repositories
 from metrics.storage import StorageError, observation_database
 from metrics.trend import SeriesRequest, repository_trend
 from metrics.window import collected_anchor, collection_is_stale, period_windows
@@ -118,6 +126,22 @@ optional and, left out, asks for every whole period since enablement, which for 
 repository at a short `period_days` is hundreds of cache loads under that cut's build lock. A request
 that resolves above this count is refused with the count it asked for, so the caller names a cut
 rather than being handed a truncated one under the name of the whole history.
+"""
+
+PRODUCTION_RETRY_FLOOR = timedelta(seconds=60)
+"""How long a FAILED production list fetch is left alone before another is attempted.
+
+Without this, an unreachable content host costs the pages rather than the badges — which is the one
+thing the fetch was admitted to this module on the promise of not doing. A reader reads the list with
+no margin, so every request to `/repositories`, `/teams/{team}` and the two detail routes would find
+nothing held, attempt its own GET, and wait out `metrics.production.REQUEST_TIMEOUT` behind the one
+lock the list keeps: a firewall with no route to `raw.githubusercontent.com` would turn every page
+view into a 30-second stall, serialised, on a thread pool the rest of the routes share.
+
+Deliberately well BELOW `DEFAULT_WARM_INTERVAL_SECONDS`, so what this suppresses is only the request
+path retrying a known-bad fetch — never the warmer's wake, which is what is meant to retry it and
+which arrives long after this floor has passed. A failure therefore costs at most one attempt a
+minute, and recovery from a transient one is still a wake away rather than an hour.
 """
 
 MAXIMUM_HELD_SERIES = 32
@@ -222,6 +246,13 @@ class RepositoryRow(EvidenceModel):
     into scalars, because the per-family `open`/`by_severity`/`detail` is what a band needs — a
     family with nothing open and one GitHub refused are different answers, and only the block itself
     keeps them apart.
+
+    `production` is the one field here that is not read from the window at all: it says whether the
+    organisation's production approvals list holds this repository, and it follows the same rule
+    every count above it does. ABSENT MEANS NO LIST COULD BE READ, and is NOT `false` — a repository
+    the list does not name is not approved to deploy to production, while an unreadable list has
+    said nothing about any repository, and a service that answered `false` for both would report an
+    estate with no production services as confidently as it reports the truth.
     """
 
     repository: str
@@ -242,6 +273,7 @@ class RepositoryRow(EvidenceModel):
     sonar_security_rating: SonarRating | None = None
     sonar_security_issues: NonNegativeInt | None = None
     sonar_security_hotspots: NonNegativeInt | None = None
+    production: bool | None = None
     detail: str | None = None
 
 
@@ -272,14 +304,21 @@ class RepositoryDetail(EvidenceModel):
     The block is the DOMAIN model the contract emits, unflattened: a detail page shows the assessment,
     the gate, the four open pull-request counts, the alert families, CODEOWNERS, maintenance, Sonar,
     the nine metric summaries and the findings, and re-modelling any of that here would be a second
-    place for it to drift. Only the two things the block cannot state are added — the owning team for
-    a repository that could not be reported, and the contributor rows the actor section holds.
+    place for it to drift. Only the three things the block cannot state are added — the owning team
+    for a repository that could not be reported, the contributor rows the actor section holds, and
+    whether the repository is approved to deploy to production.
+
+    `production` is ABSENT WHERE NO LIST COULD BE READ and is NOT `false`, the rule `RepositoryRow`
+    states for it and for every count beside it. It is set on BOTH BRANCHES, the unavailable one
+    included: whether a repository deploys to production is not a fact about the reporting window,
+    so a span with no evidence to report still knows the answer and still shows the badge.
     """
 
     repository: str
     team: str
     evidence: RepositoryPracticeEvidence | None = None
     contributors: tuple[ContributorRow, ...] = ()
+    production: bool | None = None
     detail: str | None = None
 
     @model_validator(mode="after")
@@ -314,10 +353,17 @@ class ActorDetail(EvidenceModel):
     `actor` is the domain model unchanged, so the page reads the same per-repository rows the JSON
     carries — labels LISTED per repository and combined nowhere. `teams` is accounting the row cannot
     state on its own, so a repository link can carry its team without a second request.
+
+    `production` sits beside `teams` for `teams`' own reason: it names which of THIS PERSON'S
+    repositories deploy to production, which is accounting the contract's `ActorReadiness` cannot
+    state, and the contract model is passed through unchanged rather than gaining a field. It is
+    ABSENT where no list could be read and EMPTY where the list was read and names none of them,
+    which are different answers for the reason `RepositoryRow.production` gives.
     """
 
     actor: ActorReadiness
     teams: dict[str, str]
+    production: tuple[str, ...] | None = None
 
 
 class TeamActorRow(EvidenceModel):
@@ -446,6 +492,21 @@ class ReportBundle(CachedBuild):
     unavailable: Mapping[str, str]
     actors: Mapping[str, ActorReadiness]
     contributors: Mapping[str, tuple[ContributorRow, ...]]
+
+
+@dataclass(frozen=True)
+class ProductionList:
+    """Hold the production repository pairs last read, and the instant they were read at.
+
+    NOT a `CachedBuild`, and deliberately: every other thing this cache holds is rebuilt when the
+    source stamp moves or when it ages out, and this one has no source stamp to compare against — the
+    source is a document on another host, and nothing local moves when it changes. Age is therefore
+    the whole rule, and the field is its own type rather than a `CachedBuild` carrying a stamp that
+    could only ever be empty.
+    """
+
+    built_at: datetime
+    repositories: frozenset[tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -614,6 +675,11 @@ class WindowCache:
 
     The eviction order of `self.series` is the one piece of state that belongs to no single key, so
     it keeps a lock of its own that `retain` and the least-recently-read reordering both run under.
+
+    The production list is a single held value rather than one per key, so it keeps a lock of its own
+    for the same reason and for one more: it is the only thing here whose refresh reaches the network,
+    and a fetch behind a span's build lock would put a reader waiting for a bundle behind a content
+    host's timeout.
     """
 
     def __init__(self, configuration: Configuration, maximum_age: timedelta) -> None:
@@ -622,8 +688,11 @@ class WindowCache:
         self.builds: LockRegistry[int] = LockRegistry()
         self.cuts: LockRegistry[SeriesKey] = LockRegistry()
         self.eviction = threading.Lock()
+        self.approvals = threading.Lock()
         self.bundles: dict[int, ReportBundle] = {}
         self.series: dict[SeriesKey, TrendBundle] = {}
+        self.production: ProductionList | None = None
+        self.production_failed_at: datetime | None = None
 
     def usable(self, built: CachedBuild, stamp: SourceStamp, reference: datetime) -> bool:
         """Decide whether something held still describes the caches it was built from."""
@@ -680,6 +749,61 @@ class WindowCache:
         """Say whether the bundle held for one span will still be usable at the given instant."""
         held = self.bundles.get(weeks)
         return held is not None and self.usable(held, stamp, horizon)
+
+    def production_list(self, margin: timedelta = timedelta(0)) -> frozenset[tuple[str, str]] | None:
+        """Return the production repositories, refetching one that will not outlive the margin.
+
+        Read exactly as `bundle` and `warm` read a span, and for their reasons: the held value is
+        checked outside every lock, checked again inside it so a request that waited comes away with
+        what the other thread fetched, and refreshed a MARGIN ahead of expiry so the warmer's wake
+        renews it before a reader could meet a stale one. Age is the whole rule here — there is no
+        source stamp, because the source is a document on another host.
+
+        A FAILED REFRESH KEEPS THE LAST GOOD LIST. A content host's transient 502 must cost the
+        badges nothing, so only a cache that has never once read the list answers `None`, and the
+        failure is logged at warning level so a list that has been failing all day is visible in the
+        log rather than only in the missing badges.
+
+        A FAILURE IS ALSO REMEMBERED FOR `PRODUCTION_RETRY_FLOOR`, and that is what keeps a failing
+        fetch off the request path: a reader reads with NO MARGIN, so without it every request would
+        find nothing usable held and wait out the fetch's whole timeout for itself, behind this one
+        lock. The floor is checked inside the lock only — once a failure is held the lock is
+        uncontended, and a reader arriving while a fetch is in flight waits for its answer either
+        way.
+
+        Configured with no URL, the held value is returned without fetching — which for a service
+        that has never fetched is `None`, and an absent field on every row is what a configuration
+        naming no list is saying.
+        """
+        url = self.configuration.production_list_url
+        held = self.production
+        if url is None:
+            return None if held is None else held.repositories
+        reference = datetime.now(UTC)
+        if held is not None and self.current(held, reference + margin):
+            return held.repositories
+        with self.approvals:
+            held = self.production
+            if held is not None and self.current(held, reference + margin):
+                return held.repositories
+            if self.failing(reference):
+                return None if held is None else held.repositories
+            fetched = fetch_production_repositories(url)
+            if fetched is None:
+                self.production_failed_at = reference
+                logging.warning("Could not refresh the production list from %s; keeping what was last read", url)
+                return None if held is None else held.repositories
+            self.production = ProductionList(built_at=reference, repositories=fetched)
+            return fetched
+
+    def current(self, held: ProductionList, horizon: datetime) -> bool:
+        """Say whether a fetched production list will still be young enough at the given instant."""
+        return horizon - held.built_at <= self.maximum_age
+
+    def failing(self, reference: datetime) -> bool:
+        """Say whether the last production list fetch failed too recently to be worth repeating."""
+        failed_at = self.production_failed_at
+        return failed_at is not None and reference - failed_at <= PRODUCTION_RETRY_FLOOR
 
     def trend(self, repository: str, period_days: int, periods: int | None) -> RepositoryTrend:
         """Return one repository's series for one cut of it, building it if none is held.
@@ -748,6 +872,11 @@ def warm_spans(cache: WindowCache, spans: Iterable[int], margin: timedelta) -> N
     A build that raises costs a log line rather than the warmer: a cache file that cannot be read
     now is a repository state that may be readable at the next wake, and a thread that died on it
     would take every later refresh with it — leaving a service that looks warm and is not.
+
+    The production list is refreshed here too, on the same wake and with the same margin, which is
+    what puts it on `--warm-interval` rather than on a collection's cadence. AFTER the spans, because
+    it is the one refresh that reaches another host: a content host taking its whole timeout to
+    answer must not hold up the bundles a reader is actually waiting for.
     """
     for weeks in spans:
         try:
@@ -759,6 +888,13 @@ def warm_spans(cache: WindowCache, spans: Iterable[int], margin: timedelta) -> N
         else:
             if refreshed:
                 logging.info("Warmed the %s-week window", weeks)
+    try:
+        cache.production_list(margin)
+    # Blind for the reason above, and doubly so here: `fetch_production_repositories` answers every
+    # failure it knows of with `None`, so anything reaching this is something nobody anticipated —
+    # which is exactly what must not be allowed to take the warmer's thread down with it.
+    except Exception:
+        logging.warning("Could not refresh the production list", exc_info=True)
 
 
 def keep_warm(cache: WindowCache, spans: Iterable[int], interval: timedelta, stopping: threading.Event) -> None:
@@ -836,11 +972,41 @@ def readable_gate(report: MergeGateReport) -> MergeGateEvidence | None:
     return gate
 
 
-def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
+def deploys_to_production(
+    bundle: ReportBundle,
+    repository: str,
+    production: frozenset[tuple[str, str]] | None,
+) -> bool | None:
+    """Say whether one repository is on the production list, or nothing where none could be read.
+
+    `None` IN IS `None` OUT, and that is the whole reason this is a function rather than a `in`
+    against a set the caller defaulted to empty: an unread list has said nothing about this
+    repository, and an empty one has said it deploys nothing.
+
+    Matched on the CASEFOLDED pair, because `parse_repository_url` folds what it reads and GitHub
+    owner and repository names are case-insensitive: the live document holds one `HMCTS/…` URL among
+    200-odd lowercase ones, and a case-sensitive match would drop that repository's badge alone. The
+    organisation is the report's, which is the configured one `offline_practice_report` carried into
+    it.
+    """
+    if production is None:
+        return None
+    return (bundle.report.organization.casefold(), repository.casefold()) in production
+
+
+def repository_row(
+    bundle: ReportBundle,
+    repository: str,
+    production: frozenset[tuple[str, str]] | None,
+) -> RepositoryRow:
     """Summarise one repository for a list, saying why instead when the window has no evidence.
 
     The two branches partition the configured repositories exactly: `offline_practice_report` reports
     each one either as evidence or as unavailable, so a repository is in one map or the other.
+
+    `production` is answered on both of them, because it is not a fact about the window: a repository
+    this span cannot report is still or is still not a production service, and passing `None` through
+    is how the row says nobody could tell.
     """
     evidence = bundle.repositories.get(repository)
     if evidence is None:
@@ -849,6 +1015,7 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
         return RepositoryRow(
             repository=repository,
             team=bundle.owners[repository],
+            production=deploys_to_production(bundle, repository, production),
             detail=bundle.unavailable[repository],
         )
     summary = evidence.open_pull_requests.summary
@@ -892,16 +1059,26 @@ def repository_row(bundle: ReportBundle, repository: str) -> RepositoryRow:
         sonar_security_rating=None if measures is None else measures.security_rating,
         sonar_security_issues=None if measures is None else measures.security_issues,
         sonar_security_hotspots=None if measures is None else measures.security_hotspots,
+        production=deploys_to_production(bundle, repository, production),
     )
 
 
-def repository_detail(bundle: ReportBundle, repository: str) -> RepositoryDetail:
-    """Carry one repository's evidence block and contributors, or the reason the window has none."""
+def repository_detail(
+    bundle: ReportBundle,
+    repository: str,
+    production: frozenset[tuple[str, str]] | None,
+) -> RepositoryDetail:
+    """Carry one repository's evidence block and contributors, or the reason the window has none.
+
+    The production answer is on both branches, as it is on the row and for the row's reason: the
+    header carrying the badge is built before the page reaches the no-evidence branch.
+    """
     evidence = bundle.repositories.get(repository)
     if evidence is None:
         return RepositoryDetail(
             repository=repository,
             team=bundle.owners[repository],
+            production=deploys_to_production(bundle, repository, production),
             detail=bundle.unavailable[repository],
         )
     return RepositoryDetail(
@@ -909,6 +1086,7 @@ def repository_detail(bundle: ReportBundle, repository: str) -> RepositoryDetail
         team=evidence.team,
         evidence=evidence,
         contributors=bundle.contributors.get(repository, ()),
+        production=deploys_to_production(bundle, repository, production),
     )
 
 
@@ -950,13 +1128,17 @@ def team_row(bundle: ReportBundle, team: str) -> TeamRow:
     )
 
 
-def team_detail(bundle: ReportBundle, team: str) -> TeamDetail:
+def team_detail(
+    bundle: ReportBundle,
+    team: str,
+    production: frozenset[tuple[str, str]] | None,
+) -> TeamDetail:
     """Carry one team's repository rows, its contributors, and the same counts the list shows."""
     repositories = bundle.teams[team]
     reported = reported_repositories(bundle, repositories)
     return TeamDetail(
         team=team,
-        repositories=tuple(repository_row(bundle, repository) for repository in repositories),
+        repositories=tuple(repository_row(bundle, repository, production) for repository in repositories),
         actors=team_actors(bundle, repositories),
         unavailable=len(repositories) - len(reported),
         labels=label_counts(reported),
@@ -1012,17 +1194,24 @@ def serve_overview(bundle: Bundle) -> OverviewSummary:
     return overview_summary(bundle)
 
 
-def serve_repositories(bundle: Bundle) -> tuple[RepositoryRow, ...]:
-    """List every configured repository in the reporting order, unreportable ones included."""
-    return tuple(repository_row(bundle, repository) for repository in bundle.owners)
+def serve_repositories(state: State, bundle: Bundle) -> tuple[RepositoryRow, ...]:
+    """List every configured repository in the reporting order, unreportable ones included.
+
+    The production list is read from the CACHE rather than off the bundle, so a row's badge is as
+    fresh as the last refresh instead of as old as the span's last assembly: the two move on
+    intervals of their own, and a bundle a reader is served for the rest of the hour would otherwise
+    freeze the list at whatever it was when the span was built.
+    """
+    production = state.cache.production_list()
+    return tuple(repository_row(bundle, repository, production) for repository in bundle.owners)
 
 
-def serve_repository(repository: str, bundle: Bundle) -> RepositoryDetail:
+def serve_repository(repository: str, state: State, bundle: Bundle) -> RepositoryDetail:
     """Report one repository's whole evidence block, or why this window has none for it."""
     if repository not in bundle.owners:
         detail = f"repository is not configured: {repository}"
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=detail)
-    return repository_detail(bundle, repository)
+    return repository_detail(bundle, repository, state.cache.production_list())
 
 
 def serve_trend(
@@ -1104,15 +1293,25 @@ def serve_actors(bundle: Bundle) -> tuple[ActorRow, ...]:
     )
 
 
-def serve_actor(login: str, bundle: Bundle) -> ActorDetail:
-    """Report one person's repositories, matched case-insensitively and spelled as the report spells it."""
+def serve_actor(login: str, state: State, bundle: Bundle) -> ActorDetail:
+    """Report one person's repositories, matched case-insensitively and spelled as the report spells it.
+
+    `production` names the person's own production repositories and nothing else: the page badges the
+    rows it draws, and the whole organisation's list is neither its business nor its payload.
+    """
     actor = bundle.actors.get(login.casefold())
     if actor is None:
         detail = f"nobody by that login contributed to a reported repository: {login}"
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=detail)
+    production = state.cache.production_list()
     return ActorDetail(
         actor=actor,
         teams={row.repository: bundle.owners[row.repository] for row in actor.repositories},
+        production=None
+        if production is None
+        else tuple(
+            row.repository for row in actor.repositories if deploys_to_production(bundle, row.repository, production)
+        ),
     )
 
 
@@ -1121,12 +1320,12 @@ def serve_teams(bundle: Bundle) -> tuple[TeamRow, ...]:
     return tuple(team_row(bundle, team) for team in bundle.teams)
 
 
-def serve_team(team: str, bundle: Bundle) -> TeamDetail:
+def serve_team(team: str, state: State, bundle: Bundle) -> TeamDetail:
     """Report one team's repositories and contributors."""
     if team not in bundle.teams:
         detail = f"team is not configured: {team}"
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=detail)
-    return team_detail(bundle, team)
+    return team_detail(bundle, team, state.cache.production_list())
 
 
 def window_warming(

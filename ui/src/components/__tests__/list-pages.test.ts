@@ -396,15 +396,15 @@ describe('the three list routes', () => {
   /**
    * The chips the table reports its filters with, as the words a reader sees on each one.
    *
-   * Read out of the chip group alone rather than off the page, because every word a chip prints is
+   * Read out of the filter bar alone rather than off the page, because every word a chip prints is
    * also in the donut heading and the legend entry it came from — an assertion against the whole
-   * markup passes just as well when no chip was rendered at all.
+   * markup passes just as well when no chip was rendered at all. The bar itself is always drawn now
+   * that it holds the Production toggle, so failing to find it is a broken render and not an
+   * unfiltered one.
    */
   function chips(markup: string): string[] {
-    const opened = markup.indexOf('aria-label="Active filters"');
-    if (opened === -1) {
-      return [];
-    }
+    const opened = markup.indexOf('aria-label="Repository filters"');
+    expect(opened).toBeGreaterThan(-1);
     const group = markup.slice(opened, markup.indexOf('</div>', opened));
     return [
       ...group.matchAll(

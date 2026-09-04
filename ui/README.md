@@ -114,8 +114,9 @@ one page but not the other would be two different controls drawn identically.
 **The five readiness buttons above the table are gone, replaced by chips** the same day. The table owns no filter
 control of its own now beyond its search box: the donuts set the filters and the row where the buttons sat reports what
 they are set to, one chip per active dimension reading `{TITLE}: {Label}` with the slice's own colour and an × that
-drops that parameter alone — the span, the search term and the other chips all survive it. Nothing renders there when
-no filter is set. A fixed row of buttons could only offer one dimension; six dimensions that stack need a row that says
+drops that parameter alone — the span, the search term and the other chips all survive it. That row was empty when no
+filter was set until 2026-09-04, when the Production toggle below made it permanent. A fixed row of buttons could only
+offer one dimension; six dimensions that stack need a row that says
 which are on, and a reader who has clicked three donuts can see all three and remove the one they did not mean. The
 chip dot takes its colour as an inline `backgroundColor` from `RAG_HEX` or the band's `mark`, for the reason the wedges
 do: those palettes are hex values a Tailwind class cannot reach.
@@ -149,8 +150,27 @@ what `SortHeader`'s `align` prop is for, and it carries the `pr-3` that stops Op
 Findings touching each other. Neither is coloured: no figure in this table carries a tone, and
 neither answer is a grade — a repository with no CODEOWNERS file may be owned perfectly well by a rule the collector
 cannot see. `RepositoriesTable` is shared, so both columns appear on `/teams/[team]` as well, and the table there reads
-Team, Repository, Readiness, Merged, Direct commits, Open, Stale, CODEOWNERS, Sonar, Findings exactly as `/repositories`
-does.
+Team, Repository, Readiness, Production, Merged, Direct commits, Open, Stale, CODEOWNERS, Sonar, Findings exactly as
+`/repositories` does.
+
+**A Production column sits immediately right of Readiness** from 2026-09-04, on `/repositories`, `/teams/[team]` and
+the contributor page's own table, and the badge appears beside the readiness label in a repository's header. The cell is
+`ProductionBadge` and nothing else, so a non-production repository's cell is empty: there is no non-production badge, and
+a `false` answer and one no list could be read for look the same to a reader, which is intended. The estate table's
+column sorts through a three-valued order function in the shape of `answerOrder`, so an unread answer is held back from
+both ends as every other column holds one. The contributor table has no sortable headers and gains none — its order is
+the contract's own contributions-descending — and it is fed by `ActorDetail.production`, the subset of that person's
+repositories the list holds.
+
+**The Production toggle is the first thing in the filter bar, and the bar is now always drawn.** It is a `button` with
+`aria-pressed`, a royal dot, the word and a `tabular-nums` count — the shape the five readiness buttons had before the
+chips replaced them — royal blue when active, greyed when not, and with no × of any kind: it is the bar's own control
+rather than a filter somebody set, so there is nothing to dismiss. It is kept out of `ESTATE_FILTERS` for exactly that
+reason, since every member of that list raises a dismissible chip. It writes one parameter, `production=true`, ANDs with
+the term and the six dimensions, and matches only rows whose answer is `true` — a repository nobody could read an answer
+for is excluded rather than assumed either way. Its count is taken with the production dimension itself excluded, the
+rule the old readiness bar counted by: a count that included its own filter would read the same number before a click
+and after it, which says nothing.
 
 **The three lists were one page until 2026-09-02**, with the nav pointing at `#repositories`, `#actors` and `#teams`
 anchors down it. They are routes now, so a link names what it lands on and a reader loads the third of the estate they
@@ -250,9 +270,10 @@ proportional face.
 
 ### Colour
 
-Two palettes, one file: `tailwind.config.ts` names `rag-red #f87171`, `rag-amber #fbbf24`, `rag-green #4ade80`,
-`rag-green-strong #16a34a`, `rag-none #64748b` and `accent #818cf8`. Two modules resolve them, and the split is which
-of them is judging.
+Three palettes, one file: `tailwind.config.ts` names `rag-red #f87171`, `rag-amber #fbbf24`, `rag-green #4ade80`,
+`rag-green-strong #16a34a`, `rag-none #64748b`, `accent #818cf8` and, from 2026-09-04, `royal #4169e1` with the three
+shades a badge in it needs — `royal-surface #131d3f` for the fill, `royal-border #2d3f87` for the edge and
+`royal-text #a5b8f4` for the word. Three modules resolve them, and the split is which of them is judging.
 
 `rag-green-strong` is a chart mark and nothing else: no class reads it, and the one band it fills — a merge gate
 requiring two or more approving reviews — is better than the green beside it rather than a fifth verdict. It is named
@@ -260,6 +281,15 @@ in the config all the same, so the colours the site draws with are one list.
 
 `src/lib/rag.ts` carries the report's own judgement — the four readiness LABELS. `borderClass` for the `border-l-4`
 colour bar, `RAG_LABEL` for the word, `RAG_HEX` for chart marks where a class cannot reach.
+
+`src/lib/production.ts` carries the one attribute that is judged by nothing: whether a repository is approved to deploy
+to production. The word, the badge classes, the filter toggle's two states, the dot and `PRODUCTION_HEX` are all there,
+so no component holds a `royal-*` utility or a hex of its own. **The royal blue is deliberately outside the `rag`
+group**: a production service is not thereby better or worse than one that is not, it is a different kind of thing, and
+a colour sitting under `rag` would be offered to any component reaching in there for a grade. It is not `tone.ts`
+either — that file decides A FIGURE'S colour from a threshold table, and this is not a figure. The badge keeps a border
+for `RAGLabel`'s reason: a fill without an edge is the first thing a monochrome print flattens into the surface behind
+it.
 
 `src/lib/tone.ts` carries the four presentation tones — `good`, `warn`, `bad`, `neutral` — over figures the report
 states without grading. **This reverses the rule that colour on a page is the readiness label and nothing else,

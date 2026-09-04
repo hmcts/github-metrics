@@ -15,6 +15,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import RepositoryPage from '@/app/repositories/[repository]/page';
+import { PRODUCTION_BADGE } from '@/lib/production';
 import type {
   ContributorRow,
   PracticeFinding,
@@ -292,6 +293,44 @@ describe('repository page layout', () => {
 
     expect(markup).toContain('Readiness');
     expect(heading(markup, 'Behaviour')).toBeLessThan(heading(markup, 'Readiness'));
+  });
+});
+
+/**
+ * The production badge in the header, which is the one thing here not read from the window.
+ *
+ * It rides on the header rather than on a section, so it is drawn before the page branches on
+ * whether the span holds evidence: whether a repository deploys to production is not a fact about
+ * the reporting window, and a repository the caches cannot report still is or is not one.
+ */
+describe('the repository header’s production badge', () => {
+  it('badges a production repository beside its readiness label', async () => {
+    const markup = await renderDetail({
+      repository: 'api',
+      team: 'platform',
+      evidence: evidence(),
+      contributors: [],
+      production: true,
+    });
+
+    expect(markup).toContain(PRODUCTION_BADGE);
+    expect(markup.indexOf('Caution')).toBeLessThan(markup.indexOf(PRODUCTION_BADGE));
+  });
+
+  it('badges it on a span with no evidence too, which the header is built above', async () => {
+    const markup = await renderDetail({
+      repository: 'api',
+      team: 'platform',
+      contributors: [],
+      production: true,
+    });
+
+    expect(markup).toContain('This span holds no evidence for api.');
+    expect(markup).toContain(PRODUCTION_BADGE);
+  });
+
+  it('badges nothing for a repository the list does not name', async () => {
+    expect(await render()).not.toContain(PRODUCTION_BADGE);
   });
 });
 

@@ -1,4 +1,5 @@
 import clsx from 'clsx';
+import { ProductionBadge } from '@/components/ProductionBadge';
 import { RAGLabel } from '@/components/RAGCard';
 import { borderClass } from '@/lib/rag';
 import type { ReadinessLabel } from '@/lib/types';
@@ -24,6 +25,7 @@ export function EntityHeader({
   kind,
   name,
   label,
+  production,
   context,
   action,
 }: {
@@ -31,6 +33,14 @@ export function EntityHeader({
   name: string;
   /** Present only for a repository: contributors and teams are never graded. */
   label?: ReadinessLabel;
+  /**
+   * Whether this repository deploys to production, badged beside the label.
+   *
+   * Also a repository's alone, but unlike the label it is not a grade and not a fact about the
+   * window: the header carries it even where the span holds no evidence, which is why the page
+   * passes it in above the unavailable branch.
+   */
+  production?: boolean;
   context?: React.ReactNode;
   /** The header's own control — the week selector, which every page carries at the top right. */
   action?: React.ReactNode;
@@ -46,6 +56,8 @@ export function EntityHeader({
         <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">{kind}</span>
         <h1 className="font-mono text-xl text-slate-100 break-all">{name}</h1>
         {label ? <RAGLabel label={label} /> : null}
+        <ProductionBadge production={production} />
+
         {action ? <div className="ml-auto">{action}</div> : null}
       </div>
       {context ? (

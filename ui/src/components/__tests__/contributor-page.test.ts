@@ -17,6 +17,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ActorPage, { dynamic } from '@/app/contributors/[login]/page';
+import { PRODUCTION_BADGE } from '@/lib/production';
 import type { ActorDetail, ActorRepositoryReadiness, WindowOptions } from '@/lib/types';
 
 const WINDOWS: WindowOptions = {
@@ -73,11 +74,13 @@ let requested: string[] = [];
 function stubService(
   repositories: ActorRepositoryReadiness[] = REPOSITORIES,
   status = 200,
+  production?: string[],
 ): void {
   requested = [];
   const detail: ActorDetail = {
     actor: { actor_login: 'ada', repositories },
     teams: { api: 'platform', web: 'digital' },
+    production,
   };
   vi.stubGlobal(
     'fetch',
@@ -171,6 +174,26 @@ describe('the contributor page', () => {
     expect(markup).toContain('Behaviour in web');
     expect(markup.indexOf('Behaviour in api')).toBeLessThan(markup.indexOf('Behaviour in web'));
     expect(markup).not.toMatch(/average|overall score|rank/i);
+  });
+
+  /**
+   * The person's production list reaches the table, which is all this page does with it.
+   *
+   * Which repositories the list names is the service's answer and is tested there; what only the
+   * page can be asked is that it hands the field on rather than dropping it — a table with the
+   * column and no badges would look exactly like an estate with no production services.
+   */
+  it('passes the person’s production repositories into their table', async () => {
+    stubService(REPOSITORIES, 200, ['web']);
+    const markup = await render();
+
+    expect(markup.split(PRODUCTION_BADGE)).toHaveLength(2);
+    expect(markup.indexOf('/repositories/api')).toBeLessThan(markup.indexOf(PRODUCTION_BADGE));
+  });
+
+  it('badges nothing where the service could read no list at all', async () => {
+    stubService();
+    expect(await render()).not.toContain(PRODUCTION_BADGE);
   });
 
   it('says so where a repository observed no metric, rather than drawing an empty grid', async () => {

@@ -11,6 +11,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { ActorRepositoriesTable } from '@/components/ActorRepositoriesTable';
+import { PRODUCTION_BADGE } from '@/lib/production';
 import { RAG_BORDER } from '@/lib/rag';
 import type { ActorRepositoryReadiness } from '@/lib/types';
 
@@ -20,13 +21,19 @@ const ROWS: ActorRepositoryReadiness[] = [
   { repository: 'tools', contributions: 1, blocking: 0, metrics: [] },
 ];
 
-const markup = renderToStaticMarkup(
-  createElement(ActorRepositoriesTable, {
-    rows: ROWS,
-    teams: { api: 'platform', web: 'digital' },
-    weeks: 8,
-  }),
-);
+/** The table at whatever production answer the case is about, absent by default. */
+function render(production?: readonly string[]): string {
+  return renderToStaticMarkup(
+    createElement(ActorRepositoriesTable, {
+      rows: ROWS,
+      teams: { api: 'platform', web: 'digital' },
+      production,
+      weeks: 8,
+    }),
+  );
+}
+
+const markup = render();
 
 describe('ActorRepositoriesTable', () => {
   it('links each repository and its team, carrying the span onto both', () => {
@@ -50,6 +57,32 @@ describe('ActorRepositoriesTable', () => {
 
   it('says so where the service named no owning team, rather than inventing one', () => {
     expect(markup).toContain('no owning team was reported');
+  });
+
+  /**
+   * The Production column, directly right of Readiness and badged from the person's own list.
+   *
+   * The list is the person's, not the estate's: this table answers "which of the repositories THIS
+   * PERSON worked in deploy to production", so a repository they did not touch never reaches it.
+   */
+  it('heads Production directly right of Readiness, and no further column', () => {
+    expect(markup.indexOf('Readiness')).toBeLessThan(markup.indexOf('Production'));
+    expect(markup.indexOf('Production')).toBeLessThan(markup.indexOf('Contributions'));
+  });
+
+  it('badges only the repositories the list names, and nothing where there is no list', () => {
+    const badged = render(['web']);
+
+    // Exactly one badge, and in the `web` row: it falls between the two rows either side of it,
+    // whose repositories the list was read for and does not name.
+    expect(badged.split(PRODUCTION_BADGE)).toHaveLength(2);
+    expect(badged.indexOf('/repositories/api')).toBeLessThan(badged.indexOf(PRODUCTION_BADGE));
+    expect(badged.indexOf(PRODUCTION_BADGE)).toBeLessThan(badged.indexOf('/repositories/tools'));
+
+    // No list at all: the column stands and every cell in it is empty, which is what an unread
+    // answer looks like — the same as a negative one, and deliberately so.
+    expect(markup).toContain('Production');
+    expect(markup).not.toContain(PRODUCTION_BADGE);
   });
 
   it('re-reports the counts the contract carries, per repository', () => {

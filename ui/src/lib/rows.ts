@@ -134,6 +134,31 @@ export const FILTER_PARAMETERS: readonly FilterParameter[] = ESTATE_FILTERS.map(
   (filter) => filter.parameter,
 );
 
+/**
+ * The production filter's parameter, DELIBERATELY OUTSIDE `ESTATE_FILTERS`.
+ *
+ * Every entry in that list is a donut's dimension: it has options, each with a colour its own slice
+ * was drawn in, a band function that places a row in one of them, and — because of all that — a
+ * dismissible chip in the bar under the charts. Production has none of it. It is one two-state
+ * toggle over an attribute nothing graphs, and folding it into the list would give it a chip with an
+ * × on it, which is the one control it must not have: the toggle is part of the bar rather than
+ * something a reader has added to it.
+ */
+export const PRODUCTION_PARAMETER = 'production';
+
+/**
+ * The only value the toggle ever writes, and so the only one that reads back as on.
+ *
+ * A two-state control needs no vocabulary, but it does need one spelling: matching on anything
+ * truthy would make `?production=0` an odd way of saying yes.
+ */
+export const PRODUCTION_VALUE = 'true';
+
+/** Whether the production filter is on, read off the URL the same way the six dimensions are. */
+export function parseProduction(read: (parameter: string) => string | null): boolean {
+  return read(PRODUCTION_PARAMETER) === PRODUCTION_VALUE;
+}
+
 /** Which value each dimension is filtered to, where the dimension is filtered at all. */
 export type RepositoryFilters = Partial<Record<FilterParameter, string>>;
 
@@ -156,23 +181,49 @@ export function parseFilters(read: (parameter: string) => string | null): Reposi
 }
 
 /**
- * The rows a reader is looking at: the term, and every dimension they have filtered, all together.
+ * The rows a reader is looking at: the term, the production toggle, and every dimension they have
+ * filtered, all together.
  *
  * Dimensions AND, because that is what clicking a second donut means — the repositories that are
  * blocked AND enforce no review — and each is checked with its own donut's band function, so the
- * table under a wedge holds exactly the rows the wedge counted.
+ * table under a wedge holds exactly the rows the wedge counted. The production toggle ANDs with them
+ * for the same reason.
+ *
+ * A row whose production answer could not be read is EXCLUDED while the toggle is on, rather than
+ * kept on the chance that it is one. The toggle says "show me the production services", and a
+ * repository nobody could classify is not an answer to that — leaving it in would put rows under a
+ * count that did not count them, and letting it in as `false` would be the same guess in reverse.
  */
 export function filterRepositories(
   rows: readonly RepositoryRow[],
   term: string,
   filters: RepositoryFilters,
+  production = false,
 ): RepositoryRow[] {
   const active = ESTATE_FILTERS.filter((filter) => filters[filter.parameter] !== undefined);
   return rows.filter(
     (row) =>
       matchesRepository(row, term) &&
+      (!production || row.production === true) &&
       active.every((filter) => filter.band(row) === filters[filter.parameter]),
   );
+}
+
+/**
+ * How many production repositories the reader's OTHER filters leave, which is what the toggle counts.
+ *
+ * The production dimension itself is excluded from its own count — the rule the readiness bar
+ * counted by before the donuts replaced it, where the counts came off
+ * `filterRepositories(rows, term, null)`. A count that included its own filter would read `n` before
+ * the click and `n` after it, which tells a reader nothing: the number is there to say what turning
+ * the toggle on would leave.
+ */
+export function productionCount(
+  rows: readonly RepositoryRow[],
+  term: string,
+  filters: RepositoryFilters,
+): number {
+  return filterRepositories(rows, term, filters, true).length;
 }
 
 /**

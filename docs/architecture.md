@@ -536,6 +536,12 @@ one repository's cost splits across two rows in the same report.
 So `collect --from X --to Y` means: fetch windowed sources for `[X, Y)`, and refresh current-state
 sources as of now. The window does not apply to current state and never will.
 
+**The production approvals list is NEITHER KIND, and `collect` does not gather it (2026-09-04).** It
+is one organisation-wide classification document rather than a per-repository state or a window of
+history, it is fetched credential-free by the SERVICE and refreshed by the window warmer, and it is
+stored nowhere. See "Scope boundaries", 2026-09-04, for the whole ruling and for why it is not a
+third kind of collected source.
+
 **Open pull-request state is CURRENT STATE, stored latest-only beside the merge gate. REVERSED
 2026-09-01 at the user's instruction.** It was ruled a third kind — never cached, fetched fresh on
 every `evidence` run, the then-`--offline` path reporting a reason rather than a remembered or zeroed number — on
@@ -1350,6 +1356,34 @@ every page shows a warning bar, and the CLI logs a WARNING naming the last colle
   open pull-request state to become cacheable first — see "Source taxonomy" — and it is the reason the
   windows on offer are a fixed list rather than a free span: each is a whole report held in memory,
   keyed on a source stamp of both cache files so a collection landing mid-day is picked up.
+  THAT INVARIANT WAS NARROWED ON 2026-09-04, AT THE USER'S INSTRUCTION, AND THIS IS THE ONE
+  EXCEPTION TO IT. It read "there is no client, no session and no credential anywhere in this
+  module" and the service fetched nothing at all; it now reads that there is no credential and no
+  GitHub API client anywhere, that every EVIDENCE response is still assembled from the caches alone,
+  and that ONE credential-free GET of a public classification document is made by the service and
+  refreshed by the window warmer. That document is HMCTS's `environment-approvals.yml`, whose `prod:`
+  sequence is the only public statement of which repositories deploy to production, and it is what
+  puts a `Production` badge on a row (`metrics.production`, `WindowCache.production_list`).
+  IT IS NOT A CURRENT-STATE SOURCE AND `collect` DOES NOT GATHER IT. Everything `collect` writes is
+  per repository and is evidence about a reporting window; this is ONE organisation-wide document
+  stating a classification that belongs to no window, and the user asked for it to move on the
+  refresh interval — `--warm-interval`, 300 seconds by default — rather than wait for the next
+  collection, which is a cadence a cache keyed on a collection stamp cannot give it. It carries no
+  token: the file is on a public raw content host, where a credential would buy nothing and be a leak
+  with no benefit.
+  A FETCH THAT FAILS COSTS A BADGE RATHER THAN A FIGURE, AND IS REPORTED AS AN ABSENT FIELD RATHER
+  THAN AS `false`. The last good list is kept across a failed refresh, so a transient 502 costs
+  nothing at all, and a failure is remembered for `PRODUCTION_RETRY_FLOOR` so that a host with no
+  route to it is not asked again by every request that arrives: a reader reads the list with no
+  margin, and without that floor an unreachable host would spend a fetch timeout per page view and
+  cost the pages the badge was promised to cost instead. Only a service that has never once read the
+  list serves the field absent, and
+  `production_list_url: null` — for an organisation with no such list — is the same absence stated
+  deliberately. "Not approved for production" and "nobody could say" are different answers, and this
+  project's rule that unavailable data never becomes zero is what keeps them apart. `metrics
+  evidence` DELIBERATELY GAINS NO PRODUCTION COLUMN: the fetch lives in the service, so the text
+  report cannot state it, and inventing a second source at collect time so that it could would be a
+  larger change than the one asked for.
   THE SERVICE ALSO SERVES `/repositories/{repository}/trend`, added 2026-09-01, through
   `metrics.trend`'s offline path with `client=None` — the same series `metrics trend --offline`
   prints, and per repository only, so the "no organisation-level trend figure" ruling below stands

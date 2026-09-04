@@ -18,6 +18,7 @@ from pydantic import (
 )
 
 from metrics.domain import FindingSeverity
+from metrics.production import PRODUCTION_LIST_URL
 from metrics.window import parse_instant
 
 
@@ -284,6 +285,12 @@ class Configuration(ConfigurationModel):
     # The answer of last resort for a repository whose project the stored map cannot settle: an
     # explicit configured repository name to SonarCloud project key. See architecture.md.
     sonar_projects: dict[str, str] = Field(default_factory=dict)
+    # Where the list of repositories approved to deploy to production is published. The default is an
+    # HMCTS URL, stated here as a policy default to argue with rather than a fact about every
+    # organisation — `cohort.excluded_authors` and `traceability.reference_patterns` are defaulted the
+    # same way. `null` turns the fetch off, which is what an organisation with no such list wants: the
+    # field is then absent on every row and no repository carries a production badge.
+    production_list_url: str | None = PRODUCTION_LIST_URL
 
     @property
     def sonar_organization_name(self) -> str:

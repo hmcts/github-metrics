@@ -6,18 +6,29 @@ import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useState } from 'react';
 import { EmptyState } from '@/components/EmptyState';
+import { ProductionBadge } from '@/components/ProductionBadge';
 import { RAGLabel } from '@/components/RAGCard';
 import { SortHeader, type Align } from '@/components/SortHeader';
 import { filterTarget } from '@/lib/filter';
 import { ABSENT, figure } from '@/lib/format';
+import {
+  PRODUCTION_DOT,
+  PRODUCTION_LABEL,
+  PRODUCTION_TOGGLE_ACTIVE,
+  PRODUCTION_TOGGLE_INACTIVE,
+} from '@/lib/production';
 import { borderClass, severity } from '@/lib/rag';
 import {
   ESTATE_FILTERS,
+  PRODUCTION_PARAMETER,
+  PRODUCTION_VALUE,
   answerOrder,
   codeownersPresent,
   filterRepositories,
   orderRepositories,
   parseFilters,
+  parseProduction,
+  productionCount,
   type EstateFilter,
   type FilterOption,
 } from '@/lib/rows';
@@ -36,9 +47,12 @@ import { withWeeks } from '@/lib/weeks';
  * be reloaded and shared. Sorting stays in component state: it is how one reader is looking at the
  * list right now, not a fact about the window worth sending to somebody.
  *
- * The table owns no filter control of its own. The donuts above it are the controls, and this row
- * shows what they have been set to: one chip per filtered dimension, each dismissable on its own, so
- * a reader who has stacked three of them can see all three and drop the one they did not mean.
+ * The bar above the table is ALWAYS THERE, because it holds a control of its own: the Production
+ * toggle, first in the row and with no way to remove it. The donuts above it are the other controls,
+ * and the rest of the bar shows what they have been set to — one chip per filtered dimension, each
+ * dismissable on its own, so a reader who has stacked three of them can see all three and drop the
+ * one they did not mean. A bar that appeared and vanished with those chips read as a status line; a
+ * permanent one reads as the control it now is, with the chips as additions to it.
  */
 export const TERM_PARAMETER = 'repository';
 
@@ -55,6 +69,12 @@ const COLUMNS: readonly Column[] = [
   { key: 'team', label: 'Team', read: (row) => row.team },
   { key: 'repository', label: 'Repository', read: (row) => row.repository },
   { key: 'readiness', label: 'Readiness', read: (row) => severity(row.readiness) },
+  // Directly right of the label, because the two together are what a reader scans the list for:
+  // which services are graded how, and which of them deploy to production. It sorts on
+  // `answerOrder`, the same three-valued reader the governance columns use, so a repository whose
+  // answer could not be read is held back from BOTH ends — an unread answer is not the answer to
+  // "which are the production services" nor to "which are not".
+  { key: 'production', label: 'Production', read: (row) => answerOrder(row.production) },
   { key: 'merged', label: 'Merged', align: 'right', read: (row) => row.merged_pull_requests },
   { key: 'direct', label: 'Direct commits', align: 'right', read: (row) => row.direct_commits },
   { key: 'open', label: 'Open', align: 'right', read: (row) => row.currently_open },
@@ -93,9 +113,11 @@ export function RepositoriesTable({
 
   const term = searchParameters.get(TERM_PARAMETER) ?? '';
   const filters = parseFilters((parameter) => searchParameters.get(parameter));
-  const found = filterRepositories(rows, term, filters);
+  const production = parseProduction((parameter) => searchParameters.get(parameter));
+  const found = filterRepositories(rows, term, filters, production);
   const ordered = column === null ? orderRepositories(found) : sorted(found, column.read, direction);
   const chips = activeChips(filters);
+  const produced = productionCount(rows, term, filters);
 
   function sort(next: Column) {
     setDirection(nextDirection(column, next, direction));
@@ -111,39 +133,69 @@ export function RepositoriesTable({
     });
   }
 
+  function toggleProduction() {
+    // The same navigation the chips make, in the toggle's one value: on writes it, off is the
+    // parameter's absence rather than an empty value. `window.location.search` keeps the span, the
+    // term and every chip — this control owns one parameter and touches nothing else.
+    const chosen = production ? '' : PRODUCTION_VALUE;
+    router.replace(filterTarget(pathname, window.location.search, PRODUCTION_PARAMETER, chosen), {
+      scroll: false,
+    });
+  }
+
   return (
     <div className="space-y-3">
-      {chips.length > 0 ? (
-        <div className="flex flex-wrap gap-1.5" role="group" aria-label="Active filters">
-          {chips.map(({ filter, option }) => (
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label="Repository filters">
+        {/* The readiness bar's shape before the donuts replaced it: a dot, the word, and a count in
+            `tabular-nums` so the figure does not shift as it changes. `aria-pressed` rather than a
+            chip with an ×, because this is a state a reader turns on and off and not one they
+            arrived at by clicking a slice. */}
+        <button
+          type="button"
+          onClick={toggleProduction}
+          aria-pressed={production}
+          className={clsx(
+            'flex items-center gap-1.5 rounded px-2 py-1 text-xs transition-colors',
+            'focus:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500',
+            production ? PRODUCTION_TOGGLE_ACTIVE : PRODUCTION_TOGGLE_INACTIVE,
+          )}
+        >
+          <span
+            className={clsx('shrink-0 w-2 h-2 rounded-full', PRODUCTION_DOT)}
+            aria-hidden="true"
+          />
+          {PRODUCTION_LABEL}
+          <span className="tabular-nums text-slate-500">{produced}</span>
+        </button>
+
+        {chips.map(({ filter, option }) => (
+          <span
+            key={filter.parameter}
+            className="flex items-center gap-1.5 rounded bg-slate-800 py-1 pl-2 pr-1 text-xs text-slate-200"
+          >
             <span
-              key={filter.parameter}
-              className="flex items-center gap-1.5 rounded bg-slate-800 py-1 pl-2 pr-1 text-xs text-slate-200"
+              className="shrink-0 w-2 h-2 rounded-full"
+              style={{ backgroundColor: option.color }}
+              aria-hidden="true"
+            />
+            <span className="text-slate-400 uppercase tracking-wide">{`${filter.title}: `}</span>
+            {option.name}
+            <button
+              type="button"
+              onClick={() => clear(filter.parameter)}
+              aria-label={`Remove ${filter.title} filter`}
+              className="rounded text-slate-500 transition-colors hover:text-slate-200 focus:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
             >
-              <span
-                className="shrink-0 w-2 h-2 rounded-full"
-                style={{ backgroundColor: option.color }}
-                aria-hidden="true"
-              />
-              <span className="text-slate-400 uppercase tracking-wide">{`${filter.title}: `}</span>
-              {option.name}
-              <button
-                type="button"
-                onClick={() => clear(filter.parameter)}
-                aria-label={`Remove ${filter.title} filter`}
-                className="rounded text-slate-500 transition-colors hover:text-slate-200 focus:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
-              >
-                <X className="w-3.5 h-3.5" aria-hidden="true" />
-              </button>
-            </span>
-          ))}
-        </div>
-      ) : null}
+              <X className="w-3.5 h-3.5" aria-hidden="true" />
+            </button>
+          </span>
+        ))}
+      </div>
 
       {ordered.length === 0 ? (
         <EmptyState
           message="No repository matches this filter."
-          detail="Clear the term, or a filter above, to see the whole estate."
+          detail="Clear the term, the Production toggle, or a filter above, to see the whole estate."
         />
       ) : (
         // No border of its own: the table sits inside a `Section` panel that already draws one.
@@ -186,6 +238,11 @@ export function RepositoriesTable({
                   </td>
                   <td className="py-2 pr-3">
                     <RAGLabel label={row.readiness} />
+                  </td>
+                  {/* Empty for a repository the list does not name and for one it could not be read
+                      for alike: there is no non-production badge, which `ProductionBadge` states. */}
+                  <td className="py-2 pr-3">
+                    <ProductionBadge production={row.production} />
                   </td>
                   <Figure value={row.merged_pull_requests} />
                   <Figure value={row.direct_commits} />

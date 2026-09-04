@@ -37,11 +37,13 @@ import { MetricCard } from '@/components/MetricCard';
 import { Navigation } from '@/components/Navigation';
 import { WeekSpanButtons } from '@/components/NavWeekSelector';
 import { OrganisationHeader } from '@/components/OrganisationHeader';
+import { ProductionBadge } from '@/components/ProductionBadge';
 import { RAGCard, RAGLabel, RAGRow } from '@/components/RAGCard';
 import { Section } from '@/components/Section';
 import { SortHeader } from '@/components/SortHeader';
 import { TeamActorsTable } from '@/components/TeamActorsTable';
 import { TeamsList } from '@/components/TeamsList';
+import { PRODUCTION_BADGE, PRODUCTION_HEX, PRODUCTION_LABEL } from '@/lib/production';
 import { RAG_BORDER } from '@/lib/rag';
 import { people } from '@/lib/team';
 import { TONES, TONE_BORDER, TONE_VALUE } from '@/lib/tone';
@@ -274,6 +276,43 @@ describe('RAG presentation', () => {
   });
 });
 
+describe('ProductionBadge', () => {
+  it('states the attribute as a word in the configured palette', () => {
+    const markup = renderToStaticMarkup(createElement(ProductionBadge, { production: true }));
+    expect(markup).toContain(PRODUCTION_LABEL);
+    expect(markup).toContain(PRODUCTION_BADGE);
+  });
+
+  it('reads as a label rather than a chip: no dismiss control anywhere in it', () => {
+    const markup = renderToStaticMarkup(createElement(ProductionBadge, { production: true }));
+    expect(markup).not.toContain('button');
+    expect(markup).not.toContain('aria-label');
+    expect(markup).not.toContain('>×<');
+    expect(markup).not.toContain('Remove');
+  });
+
+  it('wears the same span as RAGLabel, so a header carrying both reads as one row', () => {
+    const production = renderToStaticMarkup(createElement(ProductionBadge, { production: true }));
+    const rag = renderToStaticMarkup(createElement(RAGLabel, { label: 'green' }));
+    const shape = 'inline-block rounded px-1.5 py-0.5 text-xs uppercase tracking-wide whitespace-nowrap';
+    expect(production).toContain(shape);
+    expect(rag).toContain(shape);
+  });
+
+  // There is no non-production badge, so the two answers the field keeps apart — "the list does not
+  // name it" and "no list could be read" — deliberately look identical here.
+  it('renders nothing at all for a false answer and for an absent one alike', () => {
+    expect(renderToStaticMarkup(createElement(ProductionBadge, { production: false }))).toBe('');
+    expect(renderToStaticMarkup(createElement(ProductionBadge, {}))).toBe('');
+  });
+
+  it('spends no hex of its own: the colour is the class from lib/production.ts', () => {
+    const markup = renderToStaticMarkup(createElement(ProductionBadge, { production: true }));
+    expect(markup).not.toContain(PRODUCTION_HEX);
+    expect(markup).not.toContain('#');
+  });
+});
+
 describe('AssessmentSection', () => {
   /** An assessment whose clear section holds one graded condition and one merely reported. */
   const assessment: ReadinessAssessment = {
@@ -335,6 +374,29 @@ describe('EntityHeader', () => {
     expect(markup).toContain('hmcts/api-service');
     expect(markup).toContain('Ready');
     expect(markup).toContain('/teams/platform?weeks=4');
+  });
+
+  it('badges a production repository directly after its label', () => {
+    const markup = renderToStaticMarkup(
+      createElement(EntityHeader, {
+        kind: 'repository',
+        name: 'hmcts/api-service',
+        label: 'green',
+        production: true,
+      }),
+    );
+    expect(markup).toContain(PRODUCTION_BADGE);
+    expect(markup.indexOf('Ready')).toBeLessThan(markup.indexOf(PRODUCTION_LABEL));
+  });
+
+  it('badges nothing where the repository is not one, or where no list was read', () => {
+    for (const production of [false, undefined]) {
+      const markup = renderToStaticMarkup(
+        createElement(EntityHeader, { kind: 'repository', name: 'api', label: 'green', production }),
+      );
+      expect(markup).not.toContain(PRODUCTION_BADGE);
+      expect(markup).not.toContain(PRODUCTION_LABEL);
+    }
   });
 
   it('grades nothing for a contributor or a team, and shows no trail of how you arrived', () => {
@@ -690,6 +752,7 @@ describe('the shared vocabulary', () => {
         createElement(DefinitionList, { values: [{ label: 'Protected', value: 'yes', tone: 'good' }] }),
       ),
       renderToStaticMarkup(createElement(EmptyState, { message: 'Nothing here.' })),
+      renderToStaticMarkup(createElement(ProductionBadge, { production: true })),
     ].join('');
     expect(markup).not.toMatch(/\p{Extended_Pictographic}/u);
   });

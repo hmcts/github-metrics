@@ -61,7 +61,12 @@ export default async function ActorPage({
             detail="Read this person at a longer span, or run metrics collect for the span being asked for."
           />
         ) : (
-          <ActorRepositoriesTable rows={actor.repositories} teams={detail.teams} weeks={weeks} />
+          <ActorRepositoriesTable
+            rows={actor.repositories}
+            teams={detail.teams}
+            production={detail.production}
+            weeks={weeks}
+          />
         )}
       </Section>
 

@@ -69,3 +69,11 @@ sonar_organization: hmcts
 # would read as a decision somebody made.
 sonar_projects:
   example-service: example-service
+# Where the list of repositories approved to deploy to production is published: HMCTS's
+# `environment-approvals.yml`, the document its deployment pipeline reads to decide whether a
+# repository may be promoted to an environment at all, whose `prod:` sequence is what puts a
+# `Production` badge on a row. The fetch is unauthenticated — the file is public and a token sent to a
+# raw content host would be a leak buying nothing — and it is made by the service, refreshing on
+# `--warm-interval` rather than on a collection. Set it to `null` to disable the fetch entirely; no
+# repository then carries a badge. The default below is HMCTS's and is only a default.
+production_list_url: https://raw.githubusercontent.com/hmcts/cnp-jenkins-config/refs/heads/master/environment-approvals.yml

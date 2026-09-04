@@ -22,6 +22,18 @@ const config: Config = {
           'green-strong': '#16a34a',
         },
         accent: '#818cf8',
+        // The production badge and its toggle, resolved by `lib/production.ts`. DELIBERATELY NOT IN
+        // THE `rag` GROUP: whether a repository deploys to production is an attribute of the
+        // repository, not one of the report's verdicts about it, and sitting under `rag` would offer
+        // it to any component reaching in there for a grade. The three shades are what a badge in
+        // this palette needs — a dark fill, a border that survives a monochrome print, and a word
+        // legible on the fill — with `DEFAULT` the royal blue itself, for the dot and for charts.
+        royal: {
+          DEFAULT: '#4169e1',
+          surface: '#131d3f',
+          border: '#2d3f87',
+          text: '#a5b8f4',
+        },
       },
     },
   },

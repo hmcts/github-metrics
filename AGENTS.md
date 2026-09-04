@@ -80,6 +80,10 @@ In `ui/`, the same rules in TypeScript, plus:
   there MAY band the same figure differently where they answer different questions about it — `securityBand` puts a
   Sonar security rating of C at High where `sonarRatingTone` puts it at amber — and each divergence is stated in a
   comment beside both. Do not reconcile one without reading it.
+- Colour splits three ways, and each module answers a different question: `rag.ts` the report's own verdict, `tone.ts`
+  a FIGURE's colour from a threshold table, and `production.ts` an ungraded attribute of a repository. An attribute
+  that is not a figure and carries no judgement gets a module of its own beside them rather than a fifth tone — see
+  [`ui/README.md`](ui/README.md#colour).
 - Every route segment carries a `loading.tsx` drawn from `ui/src/components/Skeleton.tsx`, so a cold bundle shows the
   page's bones rather than a blank screen. A new segment without one is unfinished.
 - Tests default to the `node` environment and render components through `react-dom/server`. A component whose
