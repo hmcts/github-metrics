@@ -355,7 +355,7 @@ def stored_merge_gate(stored: StoredState) -> MergeGateReport:
     """Report the merge gate the last collection stored, or state why there is none to report.
 
     A gate stored by a build predating a rule type reports that rule at its default, which is why
-    `metrics collect` must have run since the type was added; see README, "Readiness assessment".
+    `metrics collect` must have run since the type was added.
     """
     if stored.unreadable is not None:
         return MergeGateReport(detail=stored.unreadable)

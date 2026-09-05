@@ -721,19 +721,13 @@ def anchor_collected_estate(
         confirm_collection(configuration, collected, reference)
     edge = collected_through(configuration)
     if edge is None:
-        # Its own line rather than "confirmed to nothing yet": the run that gets here is the one
+        # Its own line rather than an anchor of "nothing yet": the run that gets here is the one
         # whose repositories all refused, and there is nothing for it to have confirmed.
-        logging.info("The caches hold no coverage for offline reports to anchor at")
+        logging.info("No end anchor: the caches hold no coverage for offline reports to anchor at")
     elif options.hold_anchor:
-        logging.info(
-            "Held the reporting anchor at %s, the edge the last completed collection confirmed",
-            f"{edge:%Y-%m-%dT%H:%MZ}",
-        )
+        logging.info("End anchor unchanged: %s", f"{edge:%Y-%m-%dT%H:%MZ}")
     else:
-        logging.info(
-            "Confirmed this run's collection coverage; offline reports now anchor at %s",
-            f"{edge:%Y-%m-%dT%H:%MZ}",
-        )
+        logging.info("New end anchor: %s", f"{edge:%Y-%m-%dT%H:%MZ}")
 
 
 def collect_evidence(configuration: Configuration, options: Namespace) -> int:

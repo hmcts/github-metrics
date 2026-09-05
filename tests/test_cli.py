@@ -849,7 +849,7 @@ def test_collect_exits_one_and_still_says_why_when_nothing_could_be_collected(
     assert len(output["failures"]) == 3
     # The run reached its end, so it confirmed — over an estate covered to nothing, which is what it
     # says rather than claiming to have confirmed coverage to "nothing yet".
-    assert "The caches hold no coverage for offline reports to anchor at" in caplog.text
+    assert "No end anchor: the caches hold no coverage for offline reports to anchor at" in caplog.text
 
 
 LAST_CONFIRMED_EDGE = datetime(2026, 8, 30, tzinfo=UTC)
@@ -925,7 +925,7 @@ def test_a_completed_collection_moves_the_reported_anchor_to_what_it_confirmed(
         assert main() == 0
 
     assert reported_anchor(configuration_path) == COLLECTED_TO
-    assert f"offline reports now anchor at {COLLECTED_TO:%Y-%m-%dT%H:%MZ}" in caplog.text
+    assert f"New end anchor: {COLLECTED_TO:%Y-%m-%dT%H:%MZ}" in caplog.text
 
 
 def test_a_repository_renamed_since_the_configuration_was_written_is_still_confirmed(
@@ -986,7 +986,7 @@ def test_hold_anchor_collects_and_stores_but_leaves_the_reported_window_where_it
     assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
     assert cached_edge(configuration_path) == COLLECTED_TO
     assert json.loads(capsys.readouterr().out)["repositories"][0]["repository"]["name"] == "nfdiv-case-api"
-    assert f"Held the reporting anchor at {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
+    assert f"End anchor unchanged: {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
 
 
 def test_a_collection_that_dies_part_way_leaves_the_reported_anchor_where_it_was(
@@ -1126,7 +1126,7 @@ def test_hold_anchor_holds_on_a_cache_no_run_has_confirmed_yet(
 
     assert cached_edge(configuration_path) == COLLECTED_TO
     assert reported_anchor(configuration_path) == LAST_CONFIRMED_EDGE
-    assert f"Held the reporting anchor at {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
+    assert f"End anchor unchanged: {LAST_CONFIRMED_EDGE:%Y-%m-%dT%H:%MZ}" in caplog.text
 
 
 def test_a_completed_collection_over_most_of_the_estate_does_carry_the_anchor_forward(
